@@ -2,6 +2,10 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Codex full-history recovery
+
+Fixed plain assistant messages in complete conversation history being treated as account-bound continuation, which caused `409` after a service restart. Text history can establish a new binding; unknown response IDs, encrypted state, tool outputs, and unavailable pinned accounts remain protected. Regression coverage includes restart recovery and unknown-state rejection; production streaming and non-streaming inference both returned `200`.
+
 ## API Manager console integration (based on v4.7.0)
 
 Removed the Settings About tab, presentation panel, donation dialog, and their dedicated state/version lookup. The remaining five settings tabs and save behavior are unchanged; repository license and documentation attribution remain.

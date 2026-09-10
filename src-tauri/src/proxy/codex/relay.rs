@@ -147,9 +147,11 @@ fn continuation(headers: &HeaderMap, body: &Value) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|items| {
                 items.iter().any(|item| {
+                    // Plain assistant history is self-contained; it does not require an
+                    // upstream account binding that may have been lost on restart.
                     item.get("role")
                         .and_then(Value::as_str)
-                        .is_some_and(|role| matches!(role, "assistant" | "tool"))
+                        .is_some_and(|role| role == "tool")
                         || item.get("encrypted_content").is_some()
                         || item
                             .get("type")
@@ -786,6 +788,82 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn full_text_history_can_rebind_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let tokens = auth::Tokens::from_auth_json(&json!({"tokens": {
+            "access_token": "access", "refresh_token": "refresh",
+            "id_token": "identity", "account_id": "workspace"
+        }}))
+        .unwrap();
+        let account = manager
+            .upsert_account(
+                &mut *manager.inner.lock().await,
+                tokens,
+                None,
+                &json!({}),
+                true,
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "session_id",
+            HeaderValue::from_static("existing-conversation"),
+        );
+        let caller = scope(&headers);
+        select_account(
+            &manager,
+            &headers,
+            &json!({"input": [
+                {"role": "user", "content": "Hello"}
+            ]}),
+            &caller,
+        )
+        .await
+        .unwrap();
+        drop(manager);
+
+        let restarted = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let selected = select_account(
+            &restarted,
+            &headers,
+            &json!({"input": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hello!"},
+                {"role": "user", "content": "Continue"}
+            ]}),
+            &caller,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected, account.id);
+    }
+
+    #[tokio::test]
+    async fn unbound_account_dependent_state_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let mut headers = HeaderMap::new();
+        for body in [
+            json!({"previous_response_id": "lost-response"}),
+            json!({"input": [{"role": "assistant", "encrypted_content": "opaque"}]}),
+            json!({"input": [{"type": "item_reference", "id": "lost-item"}]}),
+            json!({"input": [{"type": "compaction", "encrypted_content": "opaque"}]}),
+            json!({"input": [{"type": "function_call_output", "call_id": "lost-call", "output": "result"}]}),
+        ] {
+            let error = select_account(&manager, &headers, &body, &scope(&headers))
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+        }
+        headers.insert("x-codex-turn-state", HeaderValue::from_static("opaque"));
+        let error = select_account(&manager, &headers, &json!({}), &scope(&headers))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
