@@ -425,7 +425,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
@@ -621,14 +620,6 @@ pub fn run() {
             commands::get_antigravity_path,
             commands::get_antigravity_cli_path,
             commands::get_antigravity_args,
-            commands::check_for_updates,
-            commands::check_homebrew_installation,
-            commands::check_appimage_installation,
-            commands::brew_upgrade_cask,
-            commands::get_update_settings,
-            commands::save_update_settings,
-            commands::should_check_updates,
-            commands::update_last_check_time,
             commands::toggle_proxy_status,
             // Proxy service commands
             commands::proxy::start_proxy_service,

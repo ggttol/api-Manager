@@ -139,8 +139,6 @@ export interface AppConfig {
     antigravity_cli_executable?: string; // [NEW] 手动指定的 Antigravity CLI (agy) 路径
     antigravity_args?: string[]; // [NEW] Antigravity 启动参数
     auto_launch?: boolean; // 开机自动启动
-    auto_check_update?: boolean; // 自动检查更新
-    update_check_interval?: number; // 更新检查间隔（小时）
     accounts_page_size?: number; // 账号列表每页显示数量,默认 0 表示自动计算
     hidden_menu_items?: string[]; // 隐藏的菜单项路径列表
     scheduled_warmup: ScheduledWarmupConfig;

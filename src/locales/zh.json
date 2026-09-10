@@ -1,6 +1,6 @@
 {
   "codex": {
-    "title": "Codex",
+    "title": "Codex账号管理",
     "subtitle": "管理 ChatGPT 订阅账号，提供独立的原生 Responses 网关。",
     "server_badge": "服务端 / Web",
     "server_only": "Codex 订阅管理仅支持服务端 Web 界面。请在浏览器中打开已部署的 API Manager；这些操作不使用桌面 IPC。",
@@ -105,7 +105,7 @@
   },
   "nav": {
     "dashboard": "仪表盘",
-    "accounts": "账号管理",
+    "accounts": "谷歌账号管理",
     "proxy": "API 反代",
     "call_records": "流量日志",
     "token_stats": "Token 统计",
@@ -137,7 +137,7 @@
     "switch_to_malay": "切换到马来语",
     "switch_to_malay_short": "MY",
     "user_token": "用户 Token",
-    "apikey_fun": "中转站",
+    "api_guide": "API使用说明",
     "logout": "登出"
   },
   "dashboard": {

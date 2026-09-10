@@ -1,6 +1,6 @@
 {
   "codex": {
-    "title": "Codex",
+    "title": "Codex Accounts",
     "subtitle": "ChatGPT subscription accounts and a dedicated native Responses gateway.",
     "server_badge": "Server / Web",
     "server_only": "Codex subscription management is available in the server web interface only. Open your deployed API Manager in a browser; these actions do not use desktop IPC.",
@@ -108,7 +108,7 @@
   },
   "nav": {
     "dashboard": "Dashboard",
-    "accounts": "Accounts",
+    "accounts": "Google Accounts",
     "proxy": "API Proxy",
     "call_records": "Traffic Logs",
     "token_stats": "Token Stats",
@@ -140,7 +140,7 @@
     "switch_to_malay": "Switch to Malay",
     "switch_to_malay_short": "MY",
     "user_token": "User Tokens",
-    "apikey_fun": "Transit Station",
+    "api_guide": "API Guide",
     "logout": "Logout"
   },
   "dashboard": {

@@ -21,7 +21,6 @@ pub mod scheduler;
 pub mod security_db;
 pub mod token_stats;
 pub mod tray;
-pub mod update_checker;
 pub mod user_token_db;
 pub mod version;
 

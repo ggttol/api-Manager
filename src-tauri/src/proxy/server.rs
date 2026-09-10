@@ -882,14 +882,6 @@ impl AxumServer {
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
             .route("/system/data-dir", get(admin_get_data_dir_path))
-            .route("/system/updates/settings", get(admin_get_update_settings))
-            .route(
-                "/system/updates/check-status",
-                get(admin_should_check_updates),
-            )
-            .route("/system/updates/check", post(admin_check_for_updates))
-            .route("/system/updates/touch", post(admin_update_last_check_time))
-            .route("/system/updates/save", post(admin_save_update_settings))
             .route(
                 "/system/autostart/status",
                 get(admin_is_auto_launch_enabled),
@@ -2178,18 +2170,6 @@ async fn admin_update_user_token(
     Ok(StatusCode::OK)
 }
 
-async fn admin_should_check_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    let settings = crate::modules::update_checker::load_update_settings().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    let should = crate::modules::update_checker::should_check_for_updates(&settings);
-    Ok(Json(should))
-}
-
 async fn admin_get_antigravity_path() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
 {
     let path = crate::commands::get_antigravity_path(Some(true))
@@ -2492,52 +2472,6 @@ async fn admin_clear_token_stats() -> impl IntoResponse {
             logger::log_error(&format!("[API] 清除 Token 统计数据失败: {}", e));
             StatusCode::INTERNAL_SERVER_ERROR
         }
-    }
-}
-
-async fn admin_get_update_settings() -> impl IntoResponse {
-    // 從真實模組加載設置
-    match crate::modules::update_checker::load_update_settings() {
-        Ok(s) => Json(serde_json::to_value(s).unwrap_or_default()),
-        Err(_) => Json(serde_json::json!({
-            "auto_check": true,
-            "last_check_time": 0,
-            "check_interval_hours": 24
-        })),
-    }
-}
-
-async fn admin_check_for_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let info = crate::modules::update_checker::check_for_updates()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-    Ok(Json(info))
-}
-
-async fn admin_update_last_check_time(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::update_checker::update_last_check_time().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(StatusCode::OK)
-}
-
-async fn admin_save_update_settings(Json(settings): Json<serde_json::Value>) -> impl IntoResponse {
-    if let Ok(s) =
-        serde_json::from_value::<crate::modules::update_checker::UpdateSettings>(settings)
-    {
-        let _ = crate::modules::update_checker::save_update_settings(&s);
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_REQUEST
     }
 }
 

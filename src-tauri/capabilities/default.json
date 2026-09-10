@@ -26,7 +26,6 @@
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
     "window-state:default",
-    "updater:default",
     "process:allow-restart",
     "process:allow-exit"
   ]

@@ -103,8 +103,6 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
 
   // System
   'get_data_dir_path': { url: '/api/system/data-dir', method: 'GET' },
-  'get_update_settings': { url: '/api/system/updates/settings', method: 'GET' },
-  'save_update_settings': { url: '/api/system/updates/save', method: 'POST' },
   'is_auto_launch_enabled': { url: '/api/system/autostart/status', method: 'GET' },
   'toggle_auto_launch': { url: '/api/system/autostart/toggle', method: 'POST' },
   'get_http_api_settings': { url: '/api/system/http-api/settings', method: 'GET' },
@@ -117,11 +115,6 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'cloudflared_start': { url: '/api/proxy/cloudflared/start', method: 'POST' },
   'cloudflared_stop': { url: '/api/proxy/cloudflared/stop', method: 'POST' },
   'cloudflared_get_status': { url: '/api/proxy/cloudflared/status', method: 'GET' },
-
-  // Updates
-  'should_check_updates': { url: '/api/system/updates/check-status', method: 'GET' },
-  'check_for_updates': { url: '/api/system/updates/check', method: 'POST' },
-  'update_last_check_time': { url: '/api/system/updates/touch', method: 'POST' },
 
   // OAuth
   'prepare_oauth_url': { url: '/api/auth/url', method: 'GET' },

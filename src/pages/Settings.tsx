@@ -13,7 +13,6 @@ import { useDebugConsole } from '../stores/useDebugConsole';
 
 import { useTranslation } from 'react-i18next';
 import { isTauri } from '../utils/env';
-import { relaunch } from '@tauri-apps/plugin-process';
 
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
@@ -93,22 +92,6 @@ function Settings() {
     const [cachePaths, setCachePaths] = useState<string[]>([]);
     const [isClearingCache, setIsClearingCache] = useState(false);
 
-    // Update check state
-    const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
-    const [updateInfo, setUpdateInfo] = useState<{
-        hasUpdate: boolean;
-        latestVersion: string;
-        currentVersion: string;
-        downloadUrl: string;
-        source?: string;
-    } | null>(null);
-
-    // Homebrew Cask state
-    const [isBrewInstalled, setIsBrewInstalled] = useState(false);
-    const [isBrewUpgrading, setIsBrewUpgrading] = useState(false);
-    const [isBrewConfirmOpen, setIsBrewConfirmOpen] = useState(false);
-    const [isBrewSuccessOpen, setIsBrewSuccessOpen] = useState(false);
-
 
     useEffect(() => {
         loadConfig();
@@ -117,17 +100,6 @@ function Settings() {
         invoke<string>('get_data_dir_path')
             .then(path => setDataDirPath(path))
             .catch(err => console.error('Failed to get data dir:', err));
-
-        // 加载更新设置
-        invoke<{ auto_check: boolean; last_check_time: number; check_interval_hours: number }>('get_update_settings')
-            .then(settings => {
-                setFormData(prev => ({
-                    ...prev,
-                    auto_check_update: settings.auto_check,
-                    update_check_interval: settings.check_interval_hours
-                }));
-            })
-            .catch(err => console.error('Failed to load update settings:', err));
 
         // 获取真实的开机自启状态
         invoke<boolean>('is_auto_launch_enabled')
@@ -141,13 +113,6 @@ function Settings() {
             import('@tauri-apps/api/app').then(({ getVersion }) => {
                 getVersion().then(v => setAppVersion(v)).catch(() => {});
             });
-        }
-
-        // 检测是否通过 Homebrew Cask 安装 (仅 Tauri 环境)
-        if (isTauri()) {
-            invoke<boolean>('check_homebrew_installation')
-                .then(installed => setIsBrewInstalled(installed))
-                .catch(err => console.error('Failed to check Homebrew installation:', err));
         }
 
     }, [loadConfig]);
@@ -303,55 +268,6 @@ function Settings() {
             showToast(t('settings.advanced.antigravity_cli_path_detected', 'Detected CLI path updated'), 'success');
         } catch (error) {
             showToast(`${t('common.error')}: ${error}`, 'error');
-        }
-    };
-
-    const handleCheckUpdate = async () => {
-        setIsCheckingUpdate(true);
-        setUpdateInfo(null);
-        try {
-            const result = await invoke<{
-                has_update: boolean;
-                latest_version: string;
-                current_version: string;
-                download_url: string;
-                source?: string;
-            }>('check_for_updates');
-
-            setUpdateInfo({
-                hasUpdate: result.has_update,
-                latestVersion: result.latest_version,
-                currentVersion: result.current_version,
-                downloadUrl: result.download_url,
-                source: result.source,
-            });
-
-            if (result.has_update) {
-                const sourceMsg = result.source && result.source !== 'GitHub API' ? ` (via ${result.source})` : '';
-                showToast(t('settings.about.new_version_available', { version: result.latest_version }) + sourceMsg, 'info');
-            } else {
-                showToast(t('settings.about.latest_version'), 'success');
-            }
-        } catch (error) {
-            showToast(`${t('settings.about.update_check_failed')}: ${error}`, 'error');
-        } finally {
-            setIsCheckingUpdate(false);
-        }
-    };
-
-    const handleBrewUpgrade = async () => {
-        setIsBrewConfirmOpen(false);
-        setIsBrewUpgrading(true);
-        try {
-            await invoke<string>('brew_upgrade_cask');
-            setUpdateInfo(null);
-            setIsBrewSuccessOpen(true);
-        } catch (error) {
-            const errKey = String(error);
-            const errMsg = t(`settings.about.brew_error_${errKey}`, t('settings.about.brew_upgrade_failed'));
-            showToast(errMsg, 'error');
-        } finally {
-            setIsBrewUpgrading(false);
         }
     };
 
@@ -549,69 +465,6 @@ function Settings() {
                                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.auto_launch_desc')}</p>
                             </div>
 
-                            {/* 自动检查更新 */}
-                            <>
-                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
-                                    <div>
-                                        <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.general.auto_check_update')}</div>
-                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.general.auto_check_update_desc')}</p>
-                                    </div>
-                                    <label className="relative inline-flex items-center cursor-pointer">
-                                        <input
-                                            type="checkbox"
-                                            className="sr-only peer"
-                                            checked={formData.auto_check_update ?? true}
-                                            onChange={async (e) => {
-                                                const enabled = e.target.checked;
-                                                try {
-                                                    await invoke('save_update_settings', {
-                                                        settings: {
-                                                            auto_check: enabled,
-                                                            last_check_time: 0,
-                                                            check_interval_hours: formData.update_check_interval ?? 24
-                                                        }
-                                                    });
-                                                    setFormData({ ...formData, auto_check_update: enabled });
-                                                    showToast(enabled ? t('settings.general.auto_check_update_enabled') : t('settings.general.auto_check_update_disabled'), 'success');
-                                                } catch (error) {
-                                                    showToast(`${t('common.error')}: ${error}`, 'error');
-                                                }
-                                            }}
-                                        />
-                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
-                                    </label>
-                                </div>
-
-                                {/* 检查间隔 */}
-                                {formData.auto_check_update && (
-                                    <div className="ml-4">
-                                        <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.update_check_interval')}</label>
-                                        <input
-                                            type="number"
-                                            className="w-32 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
-                                            min="1"
-                                            max="168"
-                                            value={formData.update_check_interval ?? 24}
-                                            onChange={(e) => setFormData({ ...formData, update_check_interval: parseInt(e.target.value) })}
-                                            onBlur={async () => {
-                                                try {
-                                                    await invoke('save_update_settings', {
-                                                        settings: {
-                                                            auto_check: formData.auto_check_update ?? true,
-                                                            last_check_time: 0,
-                                                            check_interval_hours: formData.update_check_interval ?? 24
-                                                        }
-                                                    });
-                                                    showToast(t('settings.general.update_check_interval_saved'), 'success');
-                                                } catch (error) {
-                                                    showToast(`${t('common.error')}: ${error}`, 'error');
-                                                }
-                                            }}
-                                        />
-                                        <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.update_check_interval_desc')}</p>
-                                    </div>
-                                )}
-
                                 {/* 菜单显示设置 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-6 mt-6">
                                     <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.menu.title')}</h3>
@@ -627,6 +480,7 @@ function Settings() {
                                             { path: '/token-stats', label: t('nav.token_stats'), icon: BarChart3 },
                                             { path: '/user-token', label: t('nav.user_token', 'User Tokens'), icon: Users },
                                             { path: '/security', label: t('nav.security'), icon: Lock },
+                                            { path: '/api-guide', label: t('nav.api_guide'), icon: Globe },
                                             { path: '/settings', label: t('nav.settings'), icon: SettingsIcon },
                                         ].map((item) => {
                                             const hiddenItems = formData.hidden_menu_items || [];
@@ -706,7 +560,6 @@ function Settings() {
                                         {t('settings.menu.selected_items_note')}
                                     </p>
                                 </div>
-                            </>
                         </div>
                     )}
 
@@ -1404,14 +1257,14 @@ function Settings() {
                                     <div className="relative inline-block group">
                                         <div className="absolute inset-0 bg-blue-500/20 rounded-3xl blur-xl group-hover:blur-2xl transition-all duration-500"></div>
                                         <img
-                                            src="/icon.png"
-                                            alt="Antigravity Logo"
+                                            src="/icon.svg"
+                                            alt="API Manager Logo"
                                             className="relative w-24 h-24 rounded-3xl shadow-2xl transform group-hover:scale-105 transition-all duration-500 rotate-3 group-hover:rotate-6 object-cover bg-white dark:bg-black"
                                         />
                                     </div>
 
                                     <div>
-                                        <h3 className="text-3xl font-black text-gray-900 dark:text-base-content tracking-tight mb-2">{t('common.app_name', 'Antigravity Tools')}</h3>
+                                        <h3 className="text-3xl font-black text-gray-900 dark:text-base-content tracking-tight mb-2">{t('common.app_name', 'API Manager')}</h3>
                                         <div className="flex items-center justify-center gap-2 text-sm">
                                             v{appVersion}
                                             <span className="text-gray-400 dark:text-gray-600">•</span>
@@ -1507,61 +1360,6 @@ function Settings() {
                                     </div>
                                 </div>
 
-                                {/* Check for Updates */}
-                                <div className="flex flex-col items-center gap-3">
-                                    <button
-                                        onClick={handleCheckUpdate}
-                                        disabled={isCheckingUpdate}
-                                        className="px-6 py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white rounded-lg transition-all flex items-center gap-2 shadow-sm hover:shadow-md disabled:cursor-not-allowed"
-                                    >
-                                        <RefreshCw className={`w-4 h-4 ${isCheckingUpdate ? 'animate-spin' : ''}`} />
-                                        {isCheckingUpdate ? t('settings.about.checking_update') : t('settings.about.check_update')}
-                                    </button>
-
-                                    {/* Update Status */}
-                                    {updateInfo && !isCheckingUpdate && (
-                                        <div className="text-center">
-                                            {updateInfo.hasUpdate ? (
-                                                <div className="flex flex-col items-center gap-2">
-                                                    <div className="text-sm text-orange-600 dark:text-orange-400 font-medium">
-                                                        {t('settings.about.new_version_available', { version: updateInfo.latestVersion })}
-                                                    </div>
-                                                    <div className="flex items-center gap-2">
-                                                        {isBrewInstalled && (
-                                                            <button
-                                                                onClick={() => setIsBrewConfirmOpen(true)}
-                                                                disabled={isBrewUpgrading}
-                                                                className="px-4 py-1.5 bg-green-500 hover:bg-green-600 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white text-sm rounded-lg transition-colors flex items-center gap-1.5 disabled:cursor-not-allowed"
-                                                            >
-                                                                {isBrewUpgrading ? (
-                                                                    <>
-                                                                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                                                        {t('settings.about.brew_upgrading')}
-                                                                    </>
-                                                                ) : (
-                                                                    t('settings.about.brew_upgrade')
-                                                                )}
-                                                            </button>
-                                                        )}
-                                                        <a
-                                                            href={updateInfo.downloadUrl}
-                                                            target="_blank"
-                                                            rel="noreferrer"
-                                                            className="px-4 py-1.5 bg-orange-500 hover:bg-orange-600 text-white text-sm rounded-lg transition-colors flex items-center gap-1.5"
-                                                        >
-                                                            {t('settings.about.download_update')}
-                                                            <ExternalLink className="w-3.5 h-3.5" />
-                                                        </a>
-                                                    </div>
-                                                </div>
-                                            ) : (
-                                                <div className="text-sm text-green-600 dark:text-green-400 font-medium">
-                                                    ✓ {t('settings.about.latest_version')}
-                                                </div>
-                                            )}
-                                        </div>
-                                    )}
-                                </div>
                             </div>
 
                             <div className="text-center text-[10px] text-gray-300 dark:text-gray-600 mt-auto pb-2">
@@ -1620,72 +1418,6 @@ function Settings() {
                             </p>
                         </div>
                     </div>
-                </ModalDialog>
-
-                {/* Homebrew Upgrade Confirm Modal */}
-                <ModalDialog
-                    isOpen={isBrewConfirmOpen}
-                    title={t('settings.about.brew_confirm_title')}
-                    type="confirm"
-                    confirmText={t('settings.about.brew_confirm_btn')}
-                    cancelText={t('common.cancel')}
-                    onConfirm={handleBrewUpgrade}
-                    onCancel={() => setIsBrewConfirmOpen(false)}
-                >
-                    <div className="space-y-3">
-                        <p className="text-sm text-gray-600 dark:text-gray-400">
-                            {t('settings.about.brew_confirm_desc')}
-                        </p>
-                        <div className="bg-gray-50 dark:bg-base-200 rounded-lg p-3">
-                            <div className="flex items-center justify-between gap-2">
-                                <code className="text-xs text-gray-700 dark:text-gray-300 break-all">brew upgrade --cask antigravity-tools</code>
-                                <button
-                                    className="shrink-0 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 border border-gray-200 dark:border-base-300 rounded hover:bg-gray-100 dark:hover:bg-base-300 transition-colors"
-                                    onClick={() => {
-                                        navigator.clipboard.writeText('brew upgrade --cask antigravity-tools');
-                                        showToast(t('common.copied', 'Copied'), 'success');
-                                    }}
-                                >
-                                    {t('common.copy', 'Copy')}
-                                </button>
-                            </div>
-                        </div>
-                        <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-3">
-                            <p className="text-xs text-amber-700 dark:text-amber-400 mb-2">{t('settings.about.brew_quarantine_hint')}</p>
-                            <div className="flex items-center justify-between gap-2">
-                                <code className="text-xs text-amber-800 dark:text-amber-300 break-all">sudo xattr -rd com.apple.quarantine "/Applications/Antigravity Tools.app"</code>
-                                <button
-                                    className="shrink-0 px-2 py-1 text-xs text-amber-600 hover:text-amber-800 dark:text-amber-400 dark:hover:text-amber-200 border border-amber-200 dark:border-amber-700 rounded hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors"
-                                    onClick={() => {
-                                        navigator.clipboard.writeText('sudo xattr -rd com.apple.quarantine "/Applications/Antigravity Tools.app"');
-                                        showToast(t('common.copied', 'Copied'), 'success');
-                                    }}
-                                >
-                                    {t('common.copy', 'Copy')}
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </ModalDialog>
-
-                {/* Homebrew Upgrade Success Modal */}
-                <ModalDialog
-                    isOpen={isBrewSuccessOpen}
-                    title={t('settings.about.brew_success_title')}
-                    type="success"
-                    confirmText={t('settings.about.brew_restart_btn')}
-                    onConfirm={async () => {
-                        try {
-                            await relaunch();
-                        } catch {
-                            setIsBrewSuccessOpen(false);
-                            showToast(t('settings.about.brew_restart_failed'), 'error');
-                        }
-                    }}
-                >
-                    <p className="text-sm text-gray-600 dark:text-gray-400">
-                        {t('settings.about.brew_upgrade_success')}
-                    </p>
                 </ModalDialog>
 
                 {/* Support Modal */}
