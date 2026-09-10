@@ -470,7 +470,7 @@ async fn forward(
             })?;
     }
     let status = upstream.status();
-    let outbound_headers = response_headers(upstream.headers());
+    let mut outbound_headers = response_headers(upstream.headers());
     if !status.is_success() {
         let raw = auth::read_bounded(upstream, auth::JSON_LIMIT).await?;
         let mut error = serde_json::from_slice::<Value>(&raw).unwrap_or_else(|_| json!({"error": {
@@ -498,11 +498,13 @@ async fn forward(
             record.account.last_error = None;
         }
     }
-    let is_sse = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
+    let is_sse = is_sse_response(&upstream, compact);
+    if is_sse && !outbound_headers.contains_key(header::CONTENT_TYPE) {
+        outbound_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
     if !is_sse {
         let mut value: Value =
             serde_json::from_slice(&auth::read_bounded(upstream, MAX_COLLECTED).await?)
@@ -617,6 +619,18 @@ impl SseParser {
     }
 }
 
+fn is_sse_response(response: &reqwest::Response, compact: bool) -> bool {
+    // Responses is explicitly requested with stream=true. Some subscription edges omit
+    // Content-Type; retain that negotiated contract. Compact still defaults to JSON.
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map_or(!compact, |value| {
+            value.to_ascii_lowercase().starts_with("text/event-stream")
+        })
+}
+
 async fn collect_response(
     upstream: reqwest::Response,
     manager: &CodexManager,
@@ -705,7 +719,7 @@ mod tests {
         let app = axum::Router::new()
             .route("/complete", get(move || {
                 let event = event.clone();
-                async move { ([(header::CONTENT_TYPE, "text/event-stream")], event) }
+                async move { Response::new(Body::from(event)) }
             }))
             .route("/truncated", get(|| async {
                 ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"type\":\"response.output_text.delta\",\"delta\":\"unfinished\"}\n\n")
@@ -721,6 +735,9 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert!(!response.headers().contains_key(header::CONTENT_TYPE));
+        assert!(is_sse_response(&response, false));
+        assert!(!is_sse_response(&response, true));
         let (status, output) = collect_response(response, &manager, &[0; 32], "account-1")
             .await
             .unwrap();
