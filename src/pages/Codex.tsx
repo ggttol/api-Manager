@@ -32,6 +32,7 @@ type RateLimitWindow = {
     usedPercent: number;
     remainingPercent: number;
     resetAt: number | null;
+    windowSeconds: number;
 };
 type AccountQuota = {
     fiveHour: RateLimitWindow | null;
@@ -52,21 +53,26 @@ const objectValue = (value: unknown): Record<string, unknown> | null =>
 
 function rateLimitWindow(value: unknown): RateLimitWindow | null {
     const window = objectValue(value);
-    if (!window || typeof window.used_percent !== 'number') return null;
+    if (!window || typeof window.used_percent !== 'number' || typeof window.limit_window_seconds !== 'number') return null;
     const usedPercent = Math.min(100, Math.max(0, window.used_percent));
     return {
         usedPercent,
         remainingPercent: 100 - usedPercent,
         resetAt: typeof window.reset_at === 'number' ? window.reset_at : null,
+        windowSeconds: window.limit_window_seconds,
     };
 }
 
 function accountQuota(value: unknown): AccountQuota | null {
     const rateLimit = objectValue(objectValue(value)?.rate_limit);
     if (!rateLimit) return null;
+    const windows = [
+        rateLimitWindow(rateLimit.primary_window),
+        rateLimitWindow(rateLimit.secondary_window),
+    ].filter((window): window is RateLimitWindow => window !== null);
     const quota = {
-        fiveHour: rateLimitWindow(rateLimit.primary_window),
-        weekly: rateLimitWindow(rateLimit.secondary_window),
+        fiveHour: windows.find(window => window.windowSeconds === 5 * 60 * 60) ?? null,
+        weekly: windows.find(window => window.windowSeconds === 7 * 24 * 60 * 60) ?? null,
     };
     return quota.fiveHour || quota.weekly ? quota : null;
 }
@@ -445,31 +451,29 @@ export default function Codex() {
                 <div className="grid xl:grid-cols-2 gap-4 mt-4">
                     {accounts.accounts.map(account => {
                         const quota = accountQuotas[account.id];
+                        const quotaWindows = quota?.data ? [
+                            { key: 'five-hour', label: t('codex.five_hour_limit'), window: quota.data.fiveHour },
+                            { key: 'weekly', label: t('codex.weekly_limit'), window: quota.data.weekly },
+                        ].filter((item): item is { key: string; label: string; window: RateLimitWindow } => item.window !== null) : [];
                         return <article key={account.id} className="border border-gray-200 dark:border-base-300 rounded-xl p-4 min-w-0">
                         <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="font-semibold break-words">{account.label || account.email || account.id}</h3>{account.email && account.email !== account.label && <p className="text-sm text-gray-500 break-all">{account.email}</p>}</div><div className="flex flex-wrap gap-1">{accounts.active_account_id === account.id && <span className="badge badge-primary badge-outline gap-1"><Check size={12} />{t('codex.preferred')}</span>}<span className={`badge ${account.enabled ? 'badge-success badge-outline' : 'badge-ghost'}`}>{t(account.enabled ? 'common.enabled' : 'common.disabled')}</span></div></div>
                         <dl className="text-xs grid grid-cols-1 sm:grid-cols-2 gap-2 mt-4 text-gray-500 dark:text-gray-400"><div><dt>{t('codex.plan')}</dt><dd className="text-base-content mt-0.5">{account.plan_type || t('codex.not_available')}</dd></div><div><dt>{t('codex.expires')}</dt><dd className="text-base-content mt-0.5">{date(account.expires_at)}</dd></div><div><dt>{t('codex.last_used')}</dt><dd className="text-base-content mt-0.5">{date(account.last_used_at)}</dd></div></dl>
                         <div className="mt-4">
-                            {quota?.loading ? <div className="grid sm:grid-cols-2 gap-3" role="status">
+                            {quota?.loading ? <div role="status">
                                 <div className="h-24 animate-pulse rounded-lg bg-gray-100 dark:bg-base-200" />
-                                <div className="h-24 animate-pulse rounded-lg bg-gray-100 dark:bg-base-200" />
-                            </div> : quota?.data ? <div className="grid sm:grid-cols-2 gap-3">
-                                {([
-                                    [t('codex.five_hour_limit'), quota.data.fiveHour],
-                                    [t('codex.weekly_limit'), quota.data.weekly],
-                                ] as const).map(([label, window]) => <div key={label} className="rounded-lg border border-gray-100 bg-gray-50/70 p-3 dark:border-base-300 dark:bg-base-200/60">
+                            </div> : quota?.data ? <div className={`grid gap-3 ${quotaWindows.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1'}`}>
+                                {quotaWindows.map(({ key, label, window }) => <div key={key} className="rounded-lg border border-gray-100 bg-gray-50/70 p-3 dark:border-base-300 dark:bg-base-200/60">
                                     <div className="flex items-center justify-between gap-2 text-xs">
                                         <span className="font-medium text-gray-700 dark:text-gray-200">{label}</span>
-                                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">{window ? t('codex.remaining_percent', { percent: window.remainingPercent }) : t('codex.not_available')}</span>
+                                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">{t('codex.remaining_percent', { percent: window.remainingPercent })}</span>
                                     </div>
-                                    {window && <>
-                                        <div className="mt-2 h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-base-300" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.usedPercent}>
-                                            <div className="h-full rounded-full bg-blue-500 transition-[width]" style={{ width: `${window.usedPercent}%` }} />
-                                        </div>
-                                        <div className="mt-2 flex flex-wrap justify-between gap-x-2 gap-y-1 text-[11px] text-gray-500 dark:text-gray-400">
-                                            <span>{t('codex.used_percent', { percent: window.usedPercent })}</span>
-                                            <span>{window.resetAt ? t('codex.resets_at', { time: date(window.resetAt) }) : t('codex.reset_unknown')}</span>
-                                        </div>
-                                    </>}
+                                    <div className="mt-2 h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-base-300" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.usedPercent}>
+                                        <div className="h-full rounded-full bg-blue-500 transition-[width]" style={{ width: `${window.usedPercent}%` }} />
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap justify-between gap-x-2 gap-y-1 text-[11px] text-gray-500 dark:text-gray-400">
+                                        <span>{t('codex.used_percent', { percent: window.usedPercent })}</span>
+                                        <span>{window.resetAt ? t('codex.resets_at', { time: date(window.resetAt) }) : t('codex.reset_unknown')}</span>
+                                    </div>
                                 </div>)}
                             </div> : quota?.error ? <p className="text-xs text-error break-words">{t('codex.quota_load_failed')}</p> : null}
                         </div>
