@@ -28,11 +28,49 @@ type DeviceSession = {
     status: DeviceStatus;
     error?: string;
 };
+type RateLimitWindow = {
+    usedPercent: number;
+    remainingPercent: number;
+    resetAt: number | null;
+};
+type AccountQuota = {
+    fiveHour: RateLimitWindow | null;
+    weekly: RateLimitWindow | null;
+};
+type AccountQuotaState = {
+    loading: boolean;
+    data?: AccountQuota;
+    error?: string;
+};
 type Model = { id: string; name: string };
 const panel = 'bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 p-5';
 const controls = '[&_.btn]:rounded-lg [&_.btn]:border [&_.btn]:border-gray-200 [&_.btn]:px-3 [&_.btn]:transition-colors [&_.btn:disabled]:opacity-40 [&_.btn:disabled]:cursor-not-allowed [&_.btn-primary]:bg-blue-600 [&_.btn-primary]:text-white [&_.btn-primary]:border-blue-600 [&_.input]:rounded-lg [&_.input]:border [&_.input]:border-gray-300 [&_.input]:px-3 [&_.file-input]:rounded-lg [&_.file-input]:border [&_.file-input]:border-gray-300 [&_.select]:rounded-lg [&_.select]:border [&_.select]:border-gray-300 [&_.select]:px-3 dark:[&_.btn]:border-gray-600 dark:[&_.input]:border-gray-600 dark:[&_.file-input]:border-gray-600 dark:[&_.select]:border-gray-600';
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 const aborted = (error: unknown) => error instanceof DOMException && error.name === 'AbortError';
+const objectValue = (value: unknown): Record<string, unknown> | null =>
+    value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+
+function rateLimitWindow(value: unknown): RateLimitWindow | null {
+    const window = objectValue(value);
+    if (!window || typeof window.used_percent !== 'number') return null;
+    const usedPercent = Math.min(100, Math.max(0, window.used_percent));
+    return {
+        usedPercent,
+        remainingPercent: 100 - usedPercent,
+        resetAt: typeof window.reset_at === 'number' ? window.reset_at : null,
+    };
+}
+
+function accountQuota(value: unknown): AccountQuota | null {
+    const rateLimit = objectValue(objectValue(value)?.rate_limit);
+    if (!rateLimit) return null;
+    const quota = {
+        fiveHour: rateLimitWindow(rateLimit.primary_window),
+        weekly: rateLimitWindow(rateLimit.secondary_window),
+    };
+    return quota.fiveHour || quota.weekly ? quota : null;
+}
+
 
 function catalogModels(value: unknown): Model[] {
     if (!value || typeof value !== 'object' || !('models' in value) || !Array.isArray(value.models)) {
@@ -69,10 +107,12 @@ export default function Codex() {
     const accountLoad = useRef<AbortController | null>(null);
     const modelLoad = useRef<AbortController | null>(null);
     const usageLoad = useRef<AbortController | null>(null);
+    const quotaLoads = useRef(new Map<string, AbortController>());
     const [deleting, setDeleting] = useState<Account | null>(null);
     const [editing, setEditing] = useState<Account | null>(null);
     const [editLabel, setEditLabel] = useState('');
     const [usage, setUsage] = useState<{ account: Account; loading: boolean; data?: unknown; error?: string } | null>(null);
+    const [accountQuotas, setAccountQuotas] = useState<Record<string, AccountQuotaState>>({});
     const [device, setDevice] = useState<DeviceSession | null>(null);
     const pendingDeviceId = useRef<string | null>(null);
     const [deviceStarting, setDeviceStarting] = useState(false);
@@ -92,6 +132,33 @@ export default function Codex() {
         }
     }, []);
 
+    const loadAccountQuota = useCallback(async (account: Account) => {
+        quotaLoads.current.get(account.id)?.abort();
+        const controller = new AbortController();
+        quotaLoads.current.set(account.id, controller);
+        setAccountQuotas(current => ({
+            ...current,
+            [account.id]: { ...current[account.id], loading: true, error: undefined },
+        }));
+        try {
+            const value = await call<unknown>('codex_account_usage', { id: account.id }, controller);
+            const data = accountQuota(value);
+            if (!data) throw new Error('Codex usage response has no rate-limit windows.');
+            if (mounted.current) {
+                setAccountQuotas(current => ({ ...current, [account.id]: { loading: false, data } }));
+            }
+        } catch (error) {
+            if (!aborted(error) && mounted.current) {
+                setAccountQuotas(current => ({
+                    ...current,
+                    [account.id]: { loading: false, error: errorMessage(error) },
+                }));
+            }
+        } finally {
+            if (quotaLoads.current.get(account.id) === controller) quotaLoads.current.delete(account.id);
+        }
+    }, [call]);
+
     const loadAccounts = useCallback(async () => {
         accountLoad.current?.abort();
         const controller = new AbortController();
@@ -99,13 +166,15 @@ export default function Codex() {
         setAccountsLoading(true);
         setAccountsError('');
         try {
-            setAccounts(await call<AccountList>('codex_list_accounts', undefined, controller));
+            const next = await call<AccountList>('codex_list_accounts', undefined, controller);
+            setAccounts(next);
+            for (const account of next.accounts) void loadAccountQuota(account);
         } catch (error) {
             if (!aborted(error)) setAccountsError(errorMessage(error));
         } finally {
             if (mounted.current && !controller.signal.aborted) setAccountsLoading(false);
         }
-    }, [call]);
+    }, [call, loadAccountQuota]);
 
     const loadModels = useCallback(async () => {
         modelLoad.current?.abort();
@@ -132,6 +201,7 @@ export default function Codex() {
             mounted.current = false;
             controllers.current.forEach(controller => controller.abort());
             controllers.current.clear();
+            quotaLoads.current.clear();
             const id = pendingDeviceId.current;
             pendingDeviceId.current = null;
             if (id) {
@@ -327,6 +397,8 @@ export default function Codex() {
         try {
             const data = await call<unknown>('codex_account_usage', { id: account.id }, controller);
             setUsage({ account, loading: false, data });
+            const quota = accountQuota(data);
+            if (quota) setAccountQuotas(current => ({ ...current, [account.id]: { loading: false, data: quota } }));
         } catch (error) {
             if (!aborted(error)) setUsage({ account, loading: false, error: errorMessage(error) });
         }
@@ -371,9 +443,36 @@ export default function Codex() {
                 {accountsError && <p role="alert" className="text-error text-sm mt-3 break-words">{accountsError}</p>}
                 {accountsLoading && accounts.accounts.length === 0 ? <p role="status" className="py-8 text-center text-gray-500">{t('common.loading')}</p> : accounts.accounts.length === 0 && !accountsError ? <div className="py-8 text-center"><p className="font-medium">{t('codex.no_accounts')}</p><p className="text-sm text-gray-500 mt-1">{t('codex.no_accounts_help')}</p></div> : null}
                 <div className="grid xl:grid-cols-2 gap-4 mt-4">
-                    {accounts.accounts.map(account => <article key={account.id} className="border border-gray-200 dark:border-base-300 rounded-xl p-4 min-w-0">
+                    {accounts.accounts.map(account => {
+                        const quota = accountQuotas[account.id];
+                        return <article key={account.id} className="border border-gray-200 dark:border-base-300 rounded-xl p-4 min-w-0">
                         <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="font-semibold break-words">{account.label || account.email || account.id}</h3>{account.email && account.email !== account.label && <p className="text-sm text-gray-500 break-all">{account.email}</p>}</div><div className="flex flex-wrap gap-1">{accounts.active_account_id === account.id && <span className="badge badge-primary badge-outline gap-1"><Check size={12} />{t('codex.preferred')}</span>}<span className={`badge ${account.enabled ? 'badge-success badge-outline' : 'badge-ghost'}`}>{t(account.enabled ? 'common.enabled' : 'common.disabled')}</span></div></div>
                         <dl className="text-xs grid grid-cols-1 sm:grid-cols-2 gap-2 mt-4 text-gray-500 dark:text-gray-400"><div><dt>{t('codex.plan')}</dt><dd className="text-base-content mt-0.5">{account.plan_type || t('codex.not_available')}</dd></div><div><dt>{t('codex.expires')}</dt><dd className="text-base-content mt-0.5">{date(account.expires_at)}</dd></div><div><dt>{t('codex.last_used')}</dt><dd className="text-base-content mt-0.5">{date(account.last_used_at)}</dd></div></dl>
+                        <div className="mt-4">
+                            {quota?.loading ? <div className="grid sm:grid-cols-2 gap-3" role="status">
+                                <div className="h-24 animate-pulse rounded-lg bg-gray-100 dark:bg-base-200" />
+                                <div className="h-24 animate-pulse rounded-lg bg-gray-100 dark:bg-base-200" />
+                            </div> : quota?.data ? <div className="grid sm:grid-cols-2 gap-3">
+                                {([
+                                    [t('codex.five_hour_limit'), quota.data.fiveHour],
+                                    [t('codex.weekly_limit'), quota.data.weekly],
+                                ] as const).map(([label, window]) => <div key={label} className="rounded-lg border border-gray-100 bg-gray-50/70 p-3 dark:border-base-300 dark:bg-base-200/60">
+                                    <div className="flex items-center justify-between gap-2 text-xs">
+                                        <span className="font-medium text-gray-700 dark:text-gray-200">{label}</span>
+                                        <span className="font-semibold text-emerald-600 dark:text-emerald-400">{window ? t('codex.remaining_percent', { percent: window.remainingPercent }) : t('codex.not_available')}</span>
+                                    </div>
+                                    {window && <>
+                                        <div className="mt-2 h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-base-300" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={window.usedPercent}>
+                                            <div className="h-full rounded-full bg-blue-500 transition-[width]" style={{ width: `${window.usedPercent}%` }} />
+                                        </div>
+                                        <div className="mt-2 flex flex-wrap justify-between gap-x-2 gap-y-1 text-[11px] text-gray-500 dark:text-gray-400">
+                                            <span>{t('codex.used_percent', { percent: window.usedPercent })}</span>
+                                            <span>{window.resetAt ? t('codex.resets_at', { time: date(window.resetAt) }) : t('codex.reset_unknown')}</span>
+                                        </div>
+                                    </>}
+                                </div>)}
+                            </div> : quota?.error ? <p className="text-xs text-error break-words">{t('codex.quota_load_failed')}</p> : null}
+                        </div>
                         {account.last_error && <p className="mt-3 text-xs text-error break-words">{account.last_error}</p>}
                         <div className="flex flex-wrap gap-2 mt-4" aria-busy={busy === account.id}>
                             <button className="btn btn-xs btn-outline" disabled={!!busy || !account.enabled || accounts.active_account_id === account.id} onClick={() => void mutate('codex_activate_account', account)}>{t('codex.activate')}</button>
@@ -383,7 +482,8 @@ export default function Codex() {
                             <button className="btn btn-xs btn-ghost" disabled={!!busy} onClick={() => { setEditing(account); setEditLabel(account.label); }}>{t('codex.rename')}</button>
                             <button className="btn btn-xs btn-ghost text-error" disabled={!!busy} onClick={() => setDeleting(account)}>{t('common.delete')}</button>
                         </div>
-                    </article>)}
+                        </article>;
+                    })}
                 </div>
             </section>
             {usage && <section className={panel} aria-labelledby="codex-usage-title"><div className="flex flex-wrap justify-between gap-2"><h2 id="codex-usage-title" className="text-lg font-semibold break-all">{t('codex.usage')} · {usage.account.label || usage.account.email || usage.account.id}</h2><div className="flex gap-2"><button className="btn btn-sm btn-ghost" disabled={usage.loading} onClick={() => void loadUsage(usage.account)}>{t('common.refresh')}</button><button className="btn btn-sm btn-ghost" onClick={() => { usageLoad.current?.abort(); setUsage(null); }}>{t('common.close')}</button></div></div><p className="text-sm text-gray-500 my-3">{t('codex.usage_help')}</p>{usage.loading ? <p role="status">{t('common.loading')}</p> : usage.error ? <p role="alert" className="text-error break-words">{usage.error}</p> : <pre className="bg-gray-50 dark:bg-base-200 rounded-lg p-4 text-xs overflow-auto max-h-96">{JSON.stringify(usage.data, null, 2)}</pre>}</section>}
