@@ -10,7 +10,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -640,6 +640,7 @@ async fn collect_response(
     let mut source = upstream.bytes_stream();
     let mut parser = SseParser::default();
     let mut total = 0usize;
+    let mut completed_items = BTreeMap::new();
     while let Some(chunk) = tokio::time::timeout(STREAM_IDLE, source.next())
         .await
         .map_err(|_| CodexError::upstream("Codex response collection timed out"))?
@@ -653,19 +654,39 @@ async fn collect_response(
                 "Non-stream Codex response exceeds 64 MiB; use stream=true",
             ));
         }
-        for event in parser.push(&chunk)? {
+        for mut event in parser.push(&chunk)? {
             if let Some(response) = event.get("response") {
                 remember_response(manager, scope, account_id, response).await?;
             }
             match event.get("type").and_then(Value::as_str) {
+                Some("response.output_item.done") => {
+                    if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
+                        if let Some(item) = event.get_mut("item") {
+                            completed_items.insert(index, item.take());
+                        }
+                    }
+                }
                 Some("response.completed" | "response.incomplete" | "response.failed") => {
-                    return event
-                        .get("response")
-                        .cloned()
-                        .map(|response| (StatusCode::OK, response))
-                        .ok_or_else(|| {
+                    let mut response =
+                        event.get_mut("response").map(Value::take).ok_or_else(|| {
                             CodexError::upstream("Codex terminal event contains no response")
-                        });
+                        })?;
+                    // Subscription streams may deliver output only in item.done events.
+                    // A populated terminal output remains authoritative; never duplicate it.
+                    if response
+                        .get("output")
+                        .and_then(Value::as_array)
+                        .is_none_or(Vec::is_empty)
+                        && !completed_items.is_empty()
+                    {
+                        if let Some(object) = response.as_object_mut() {
+                            object.insert(
+                                "output".into(),
+                                Value::Array(completed_items.into_values().collect()),
+                            );
+                        }
+                    }
+                    return Ok((StatusCode::OK, response));
                 }
                 Some("error") => return Ok((StatusCode::BAD_GATEWAY, event)),
                 _ => {}
@@ -716,9 +737,19 @@ mod tests {
             "data: {}\n\n",
             json!({"type": "response.completed", "response": terminal})
         );
+        let sparse_event = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"type": "response.output_item.done", "output_index": 1, "item": terminal["output"][1]}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": terminal["output"][0]}),
+            json!({"type": "response.completed", "response": {"id":"resp-tools", "object":"response", "status":"completed", "output":[]}})
+        );
         let app = axum::Router::new()
             .route("/complete", get(move || {
                 let event = event.clone();
+                async move { Response::new(Body::from(event)) }
+            }))
+            .route("/sparse", get(move || {
+                let event = sparse_event.clone();
                 async move { Response::new(Body::from(event)) }
             }))
             .route("/truncated", get(|| async {
@@ -730,19 +761,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = client
-            .get(format!("http://{address}/complete"))
-            .send()
-            .await
-            .unwrap();
-        assert!(!response.headers().contains_key(header::CONTENT_TYPE));
-        assert!(is_sse_response(&response, false));
-        assert!(!is_sse_response(&response, true));
-        let (status, output) = collect_response(response, &manager, &[0; 32], "account-1")
-            .await
-            .unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(output, terminal);
+        for path in ["/complete", "/sparse"] {
+            let response = client
+                .get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert!(!response.headers().contains_key(header::CONTENT_TYPE));
+            assert!(is_sse_response(&response, false));
+            assert!(!is_sse_response(&response, true));
+            let (status, output) = collect_response(response, &manager, &[0; 32], "account-1")
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(output, terminal);
+        }
         let truncated = client
             .get(format!("http://{address}/truncated"))
             .send()
