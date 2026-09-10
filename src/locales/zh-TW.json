@@ -77,7 +77,8 @@
     "switch_to_spanish_short": "ES",
     "switch_to_malay": "切換到馬來語",
     "switch_to_malay_short": "MY",
-    "user_token": "用戶 Token"
+    "user_token": "用戶 Token",
+    "api_guide": "API 使用說明"
   },
   "dashboard": {
     "hello": "你好, 使用者 👋",
@@ -333,14 +334,7 @@
       "auto_launch": "開機自動啟動",
       "auto_launch_enabled": "啟用",
       "auto_launch_disabled": "停用",
-      "auto_launch_desc": "系統啟動時自動執行 Antigravity Tools",
-      "auto_check_update": "自動檢查更新",
-      "auto_check_update_desc": "啟動時自動檢查新版本",
-      "auto_check_update_enabled": "已啟用自動檢查更新",
-      "auto_check_update_disabled": "已停用自動檢查更新",
-      "update_check_interval": "檢查間隔(小時)",
-      "update_check_interval_desc": "設定自動檢查更新的時間間隔(1-168 小時)",
-      "update_check_interval_saved": "已儲存檢查間隔設定"
+      "auto_launch_desc": "系統啟動時自動執行 Antigravity Tools"
     },
     "account": {
       "title": "帳號設定",
@@ -495,12 +489,6 @@
       "github": "開源地址",
       "view_code": "檢視程式碼",
       "copyright": "Copyright © 2025-2026 Antigravity. All rights reserved.",
-      "check_update": "檢查更新",
-      "checking_update": "檢查中...",
-      "latest_version": "已是最新版本",
-      "new_version_available": "發現新版本 {{version}}",
-      "download_update": "前往下載",
-      "update_check_failed": "檢查更新失敗",
       "support_btn": "贊助作者",
       "support_title": "贊助支持",
       "support_desc": "如果您覺得本工具對您有幫助，歡迎掃碼請作者喝杯咖啡！您的支持是我持續維護項目的最大動力。",
@@ -1225,47 +1213,4 @@
     "placeholder_max_ips": "0 = 不限制",
     "hint_max_ips": "0 表示不限制",
     "hint_curfew": "留空則禁用。基於伺服器時間。"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN 中轉站",
-    "eyebrow": "中轉站",
-    "description": "Antigravity Tools 官方合作中轉站，提供穩定、開放、高性價比的大模型 API 服務。支援 Claude、OpenAI、Gemini 等主流模型。透過專屬連結註冊，可享最高充值永久 95 折優惠。",
-    "viewNow": "立即查看",
-    "usage": {
-      "remainingAmount": "剩餘額度",
-      "usedAmount": "已用額度",
-      "todayRequests": "今日請求",
-      "todayTokens": "今日 Token",
-      "totalRequests": "總請求",
-      "totalTokens": "總 Token"
-    },
-    "keyManager": {
-      "title": "金鑰管理",
-      "desc": "儲存常用 API Key，點擊即可切換並自動查詢額度。",
-      "lastRemainingLabel": "上次餘額",
-      "lastRemaining": "${{value}}",
-      "notQueried": "未查詢",
-      "addedAt": "新增於",
-      "empty": "暫無儲存的金鑰。"
-    },
-    "queryTitle": "金鑰額度查詢",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "貼上你的 API Key...",
-    "queryButton": "重新整理",
-    "cli": {
-      "quickConfig": "一鍵配置本地開發環境",
-      "syncDesc": "同步至官方標準配置",
-      "codexTooltip": "將 API Key 同步至 Antigravity Codex",
-      "claudeTooltip": "將 API Key 同步至 Claude Code"
-    },
-    "models": {
-      "title": "可用模型",
-      "empty": "當前 API Key 未返回模型列表。"
-    },
-    "errors": {
-      "parseFormat": "解析格式異常: {{err}}",
-      "fetchFailed": "取得失敗: {{err}}",
-      "queryFailed": "無法取得有效的額度資料，請確認 API Key 是否有效。"
-    }
-  }
-}
+  }}

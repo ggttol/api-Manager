@@ -83,7 +83,7 @@
     "switch_to_malay": "말레이어로 전환",
     "switch_to_malay_short": "MY",
     "user_token": "사용자 토큰",
-    "apikey_fun": "API 중계소",
+    "api_guide": "API 사용 안내",
     "logout": "로그아웃"
   },
   "dashboard": {
@@ -366,14 +366,7 @@
       "auto_launch": "시작 시 실행",
       "auto_launch_enabled": "활성화됨",
       "auto_launch_disabled": "비활성화됨",
-      "auto_launch_desc": "시스템 시작 시 Antigravity Tools 자동 실행",
-      "auto_check_update": "자동 업데이트 확인",
-      "auto_check_update_desc": "시작 시 새 버전을 자동으로 확인",
-      "auto_check_update_enabled": "자동 확인 활성화됨",
-      "auto_check_update_disabled": "자동 확인 비활성화됨",
-      "update_check_interval": "확인 간격 (시간)",
-      "update_check_interval_desc": "자동 확인 간격 설정 (1-168 시간)",
-      "update_check_interval_saved": "확인 간격 설정 저장됨"
+      "auto_launch_desc": "시스템 시작 시 Antigravity Tools 자동 실행"
     },
     "account": {
       "title": "계정 설정",
@@ -557,28 +550,6 @@
       "github": "GitHub",
       "view_code": "코드 보기",
       "copyright": "Copyright © 2025-2026 Antigravity. All rights reserved.",
-      "check_update": "업데이트 확인",
-      "checking_update": "확인 중...",
-      "latest_version": "최신 버전입니다",
-      "new_version_available": "새 버전 {{version}} 사용 가능",
-      "download_update": "다운로드",
-      "brew_upgrade": "Homebrew로 업데이트",
-      "brew_upgrading": "업그레이드 중...",
-      "brew_confirm_title": "Homebrew로 업데이트",
-      "brew_confirm_desc": "앱을 업데이트하기 위해 다음 명령을 실행합니다. 업그레이드 후 재시작이 필요합니다.",
-      "brew_quarantine_hint": "업데이트 후 \"App is damaged\" 오류가 표시되면 터미널에서 다음을 실행하세요:",
-      "brew_confirm_btn": "업데이트 시작",
-      "brew_success_title": "업그레이드 완료",
-      "brew_upgrade_success": "Homebrew 업그레이드에 성공했습니다. 새 버전을 적용하려면 앱을 재시작해 주세요.",
-      "brew_restart_btn": "지금 재시작",
-      "brew_restart_failed": "자동 재시작에 실패했습니다. 앱을 수동으로 닫았다가 다시 열어주세요",
-      "brew_upgrade_failed": "Homebrew 업그레이드에 실패했습니다. 터미널에서 직접 실행해 보세요: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_not_found": "Homebrew를 찾을 수 없습니다. brew가 설치되어 있는지 확인해 주세요",
-      "brew_error_brew_exec_failed": "brew 명령 실행에 실패했습니다. 터미널에서 직접 실행해 보세요",
-      "brew_error_brew_timeout": "Homebrew 업그레이드가 시간 초과되었습니다(3분). 터미널에서 직접 실행해 보세요: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_already_latest": "이미 최신 버전이며 업그레이드가 필요하지 않습니다",
-      "brew_error_brew_not_supported": "이 플랫폼에서는 Homebrew 업데이트를 지원하지 않습니다",
-      "update_check_failed": "업데이트 확인 실패",
       "support_btn": "저자 후원",
       "support_title": "기부 및 후원",
       "support_desc": "이 프로젝트가 도움이 되었다면 커피 한 잔 사주세요! 여러분의 후원은 프로젝트를 유지하는 데 큰 힘이 됩니다.",
@@ -1420,47 +1391,4 @@
     "placeholder_max_ips": "0 = 무제한",
     "hint_max_ips": "0 = 무제한",
     "hint_curfew": "비워두면 비활성화됩니다. 서버 시간 기준."
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN 허브",
-    "eyebrow": "허브",
-    "description": "Antigravity Tools 공식 API 허브로, 안정적이고 개방적이며 가성비 높은 대형 모델 API 서비스를 제공합니다. Claude, OpenAI, Gemini 등 주요 모델을 지원하며 Codex, Gemini CLI, Claude Code 등 개발 도구에서 통합 설정해 사용하기 좋습니다.",
-    "viewNow": "지금 보기",
-    "usage": {
-      "remainingAmount": "잔액",
-      "usedAmount": "사용액",
-      "todayRequests": "오늘 요청 수",
-      "todayTokens": "오늘 토큰 수",
-      "totalRequests": "총 요청 수",
-      "totalTokens": "총 토큰 수"
-    },
-    "keyManager": {
-      "title": "키 관리",
-      "desc": "자주 쓰는 API Key를 저장하세요. 클릭하면 전환되고 잔액을 자동으로 조회합니다.",
-      "lastRemainingLabel": "최근 잔액",
-      "lastRemaining": "${{value}}",
-      "notQueried": "조회 안 됨",
-      "addedAt": "추가일",
-      "empty": "저장된 키가 없습니다."
-    },
-    "queryTitle": "키 잔액 조회",
-    "apiKeyLabel": "API 키",
-    "apiKeyPlaceholder": "API Key를 붙여넣으세요...",
-    "queryButton": "새로고침",
-    "cli": {
-      "quickConfig": "원클릭 로컬 개발 설정",
-      "syncDesc": "공식 표준 설정으로 동기화",
-      "codexTooltip": "API Key와 BaseURL을 Antigravity Codex에 동기화",
-      "claudeTooltip": "API Key와 BaseURL을 Claude Code에 동기화"
-    },
-    "models": {
-      "title": "사용 가능한 모델",
-      "empty": "현재 API Key로 반환된 모델이 없습니다."
-    },
-    "errors": {
-      "parseFormat": "형식 파싱 오류: {{err}}",
-      "fetchFailed": "가져오기 실패: {{err}}",
-      "queryFailed": "유효한 잔액 또는 모델을 가져오지 못했습니다. API Key와 Base URL이 올바른지 확인하세요."
-    }
-  }
-}
+  }}

@@ -83,7 +83,7 @@
     "switch_to_malay": "マレー語に切り替え",
     "switch_to_malay_short": "MY",
     "user_token": "ユーザートークン",
-    "apikey_fun": "Transit Station",
+    "api_guide": "API 使用ガイド",
     "logout": "ログアウト"
   },
   "dashboard": {
@@ -366,14 +366,7 @@
       "auto_launch": "起動時に実行",
       "auto_launch_enabled": "有効",
       "auto_launch_disabled": "無効",
-      "auto_launch_desc": "システム起動時にAntigravity Toolsを自動的に起動する",
-      "auto_check_update": "更新を自動確認",
-      "auto_check_update_desc": "起動時に新しいバージョンを自動的に確認します",
-      "auto_check_update_enabled": "自動確認は有効です",
-      "auto_check_update_disabled": "自動確認は無効です",
-      "update_check_interval": "確認間隔（時間）",
-      "update_check_interval_desc": "自動確認の間隔を設定します（1-168時間）",
-      "update_check_interval_saved": "確認間隔の設定を保存しました"
+      "auto_launch_desc": "システム起動時にAntigravity Toolsを自動的に起動する"
     },
     "account": {
       "title": "アカウント設定",
@@ -557,28 +550,6 @@
       "github": "GitHub",
       "view_code": "コードを表示",
       "copyright": "Copyright © 2025-2026 Antigravity. All rights reserved.",
-      "check_update": "アップデートを確認",
-      "checking_update": "確認中...",
-      "latest_version": "最新バージョンです",
-      "new_version_available": "新バージョン {{version}} が利用可能です",
-      "download_update": "ダウンロード",
-      "brew_upgrade": "Update via Homebrew",
-      "brew_upgrading": "Upgrading...",
-      "brew_confirm_title": "Update via Homebrew",
-      "brew_confirm_desc": "The following command will be executed to update the app. A restart is required after the upgrade.",
-      "brew_quarantine_hint": "If you see an \"App is damaged\" error after update, run in terminal:",
-      "brew_confirm_btn": "Start Update",
-      "brew_success_title": "Upgrade Complete",
-      "brew_upgrade_success": "Homebrew upgrade succeeded. Please restart the app to load the new version.",
-      "brew_restart_btn": "Restart Now",
-      "brew_restart_failed": "Auto restart failed. Please close and reopen the app manually",
-      "brew_upgrade_failed": "Homebrew upgrade failed. Try running manually: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_not_found": "Homebrew not found. Please ensure brew is installed",
-      "brew_error_brew_exec_failed": "Failed to execute brew command. Try running manually in terminal",
-      "brew_error_brew_timeout": "Homebrew upgrade timed out (3min). Try running manually: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_already_latest": "Already up to date, no upgrade needed",
-      "brew_error_brew_not_supported": "Homebrew update is not supported on this platform",
-      "update_check_failed": "アップデートの確認に失敗しました",
       "support_btn": "作者をサポート",
       "support_title": "寄付とサポート",
       "support_desc": "このプロジェクトがお役に立てば、コーヒーを一杯ご馳走してください！皆様のサポートが、プロジェクトを継続する最大の動機です。",
@@ -1420,47 +1391,4 @@
     "placeholder_max_ips": "0 = 無制限",
     "hint_max_ips": "0 は制限なしを意味します",
     "hint_curfew": "空欄で無効。サーバー時間に基づきます。"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN ハブ",
-    "eyebrow": "ハブ",
-    "description": "Antigravity Tools 公式提携ハブ。安定かつ高コストパフォーマンスのAPIサービスを提供します。Claude、OpenAI、Geminiなどのモデルをサポート。",
-    "viewNow": "今すぐ見る",
-    "usage": {
-      "remainingAmount": "残高",
-      "usedAmount": "使用済み",
-      "todayRequests": "本日のリクエスト",
-      "todayTokens": "本日のトークン",
-      "totalRequests": "総リクエスト",
-      "totalTokens": "総トークン"
-    },
-    "keyManager": {
-      "title": "キー管理",
-      "desc": "よく使うAPIキーを保存し、クリックで切り替えて残高を確認します。",
-      "lastRemainingLabel": "前回残高",
-      "lastRemaining": "${{value}}",
-      "notQueried": "未確認",
-      "addedAt": "追加日時",
-      "empty": "保存されたキーはありません"
-    },
-    "queryTitle": "キー残高照会",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "APIキーを貼り付け...",
-    "queryButton": "更新",
-    "cli": {
-      "quickConfig": "ワンクリック開発環境設定",
-      "syncDesc": "公式標準設定に同期",
-      "codexTooltip": "Codexに同期",
-      "claudeTooltip": "Claude Codeに同期"
-    },
-    "models": {
-      "title": "利用可能なモデル",
-      "empty": "モデルリストがありません"
-    },
-    "errors": {
-      "parseFormat": "パースエラー: {{err}}",
-      "fetchFailed": "取得失敗: {{err}}",
-      "queryFailed": "データの取得に失敗しました。キーを確認してください。"
-    }
-  }
-}
+  }}

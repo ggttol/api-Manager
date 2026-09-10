@@ -76,7 +76,8 @@
     "switch_to_spanish_short": "ES",
     "switch_to_malay": "Chuyển sang Tiếng Mã Lai",
     "switch_to_malay_short": "MY",
-    "user_token": "Token người dùng"
+    "user_token": "Token người dùng",
+    "api_guide": "Hướng dẫn sử dụng API"
   },
   "dashboard": {
     "hello": "Xin chào, Bạn 👋",
@@ -329,14 +330,7 @@
       "auto_launch": "Mở khi đăng nhập",
       "auto_launch_enabled": "Đã bật",
       "auto_launch_disabled": "Đã tắt",
-      "auto_launch_desc": "Tự động mở Antigravity Tools khi bạn đăng nhập vào máy",
-      "auto_check_update": "Tự động kiểm tra cập nhật",
-      "auto_check_update_desc": "Tự động kiểm tra phiên bản mới khi mở app",
-      "auto_check_update_enabled": "Đã bật tự động kiểm tra",
-      "auto_check_update_disabled": "Đã tắt tự động kiểm tra",
-      "update_check_interval": "Chu kỳ kiểm tra (giờ)",
-      "update_check_interval_desc": "Đặt khoảng thời gian tự động kiểm tra (1-168 giờ)",
-      "update_check_interval_saved": "Đã lưu cài đặt chu kỳ kiểm tra"
+      "auto_launch_desc": "Tự động mở Antigravity Tools khi bạn đăng nhập vào máy"
     },
     "account": {
       "title": "Cài đặt Tài khoản",
@@ -497,12 +491,6 @@
       "github": "GitHub",
       "view_code": "Xem Mã nguồn",
       "copyright": "Bản quyền © 2025-2026 Antigravity. Đã đăng ký bản quyền.",
-      "check_update": "Kiểm tra Cập nhật",
-      "checking_update": "Đang kiểm tra...",
-      "latest_version": "Bạn đang dùng bản mới nhất",
-      "new_version_available": "Có phiên bản mới {{version}}",
-      "download_update": "Tải xuống",
-      "update_check_failed": "Kiểm tra cập nhật thất bại",
       "support_btn": "Hỗ trợ tác giả",
       "support_title": "Quyên góp & Hỗ trợ",
       "support_desc": "Nếu bạn thấy dự án này hữu ích, hãy mời tác giả một ly cà phê! Sự hỗ trợ của bạn là động lực lớn nhất để tôi duy trì dự án này.",
@@ -1204,47 +1192,4 @@
     "placeholder_max_ips": "0 = Không giới hạn",
     "hint_max_ips": "0 nghĩa là không giới hạn",
     "hint_curfew": "Để trống để tắt. Dựa trên giờ máy chủ."
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "No models returned for current API Key."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    }
-  }
-}
+  }}

@@ -423,14 +423,7 @@
       "auto_launch": "Launch at Startup",
       "auto_launch_enabled": "Enabled",
       "auto_launch_disabled": "Disabled",
-      "auto_launch_desc": "Automatically launch Antigravity Tools when system starts",
-      "auto_check_update": "Auto Check for Updates",
-      "auto_check_update_desc": "Automatically check for new versions on startup",
-      "auto_check_update_enabled": "Auto check enabled",
-      "auto_check_update_disabled": "Auto check disabled",
-      "update_check_interval": "Check Interval (hours)",
-      "update_check_interval_desc": "Set auto-check interval (1-168 hours)",
-      "update_check_interval_saved": "Check interval settings saved"
+      "auto_launch_desc": "Automatically launch Antigravity Tools when system starts"
     },
     "account": {
       "title": "Account Settings",
@@ -614,28 +607,6 @@
       "github": "GitHub",
       "view_code": "View Code",
       "copyright": "Copyright © 2025-2026 Antigravity. All rights reserved.",
-      "check_update": "Check for Updates",
-      "checking_update": "Checking...",
-      "latest_version": "You're up to date",
-      "new_version_available": "New version {{version}} available",
-      "download_update": "Download",
-      "brew_upgrade": "Update via Homebrew",
-      "brew_upgrading": "Upgrading...",
-      "brew_confirm_title": "Update via Homebrew",
-      "brew_confirm_desc": "The following command will be executed to update the app. A restart is required after the upgrade.",
-      "brew_quarantine_hint": "If you see an \"App is damaged\" error after update, run in terminal:",
-      "brew_confirm_btn": "Start Update",
-      "brew_success_title": "Upgrade Complete",
-      "brew_upgrade_success": "Homebrew upgrade succeeded. Please restart the app to load the new version.",
-      "brew_restart_btn": "Restart Now",
-      "brew_restart_failed": "Auto restart failed. Please close and reopen the app manually",
-      "brew_upgrade_failed": "Homebrew upgrade failed. Try running manually: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_not_found": "Homebrew not found. Please ensure brew is installed",
-      "brew_error_brew_exec_failed": "Failed to execute brew command. Try running manually in terminal",
-      "brew_error_brew_timeout": "Homebrew upgrade timed out (3min). Try running manually: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_already_latest": "Already up to date, no upgrade needed",
-      "brew_error_brew_not_supported": "Homebrew update is not supported on this platform",
-      "update_check_failed": "Update check failed",
       "support_btn": "Support Author",
       "support_title": "Donation & Support",
       "support_desc": "If you find this project helpful, feel free to buy me a coffee! Your support is the biggest motivation for me to maintain this project.",
@@ -1479,47 +1450,4 @@
     "placeholder_max_ips": "0 = Unlimited",
     "hint_max_ips": "0 = Unlimited",
     "hint_curfew": "Leave empty to disable. Based on server time."
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Codex / ChatGPT CLI",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "No models returned for current API Key."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    }
-  }
-}
+  }}

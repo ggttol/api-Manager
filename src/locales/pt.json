@@ -98,7 +98,7 @@
     "switch_to_malay": "Alternar para Malaio",
     "switch_to_malay_short": "MY",
     "user_token": "Tokens de usuário",
-    "apikey_fun": "ApiKey.fun",
+    "api_guide": "Guia de Uso da API",
     "logout": "Sair",
     "more": "Mais",
     "mini_view": "Visualização Compacta"
@@ -389,14 +389,7 @@
       "auto_launch": "Iniciar na Inicialização",
       "auto_launch_enabled": "Habilitado",
       "auto_launch_disabled": "Desabilitado",
-      "auto_launch_desc": "Iniciar automaticamente o Antigravity Tools quando o sistema iniciar",
-      "auto_check_update": "Verificar Atualizações Automaticamente",
-      "auto_check_update_desc": "Verificar automaticamente novas versões na inicialização",
-      "auto_check_update_enabled": "Verificação automática habilitada",
-      "auto_check_update_disabled": "Verificação automática desabilitada",
-      "update_check_interval": "Intervalo de Verificação (horas)",
-      "update_check_interval_desc": "Definir intervalo de verificação automática (1-168 horas)",
-      "update_check_interval_saved": "Configurações de intervalo de verificação salvas"
+      "auto_launch_desc": "Iniciar automaticamente o Antigravity Tools quando o sistema iniciar"
     },
     "account": {
       "title": "Configurações de Conta",
@@ -588,28 +581,6 @@
       "github": "Repositório GitHub",
       "view_code": "Ver Código",
       "copyright": "© 2026 Antigravity Manager. Todos os direitos reservados.",
-      "check_update": "Verificar Atualizações",
-      "checking_update": "Verificando...",
-      "latest_version": "Você está atualizado",
-      "new_version_available": "Nova versão {{version}} disponível",
-      "download_update": "Baixar",
-      "brew_upgrade": "Atualizar via Homebrew",
-      "brew_upgrading": "Atualizando via Homebrew...",
-      "brew_confirm_title": "Confirmar Atualização do Homebrew",
-      "brew_confirm_desc": "O sistema executará o comando brew upgrade para atualizar a versão mais recente. Deseja continuar?",
-      "brew_quarantine_hint": "Dica: Em caso de erro de segurança no macOS, execute o comando xattr correspondente",
-      "brew_confirm_btn": "Confirmar Atualização",
-      "brew_success_title": "Atualização Concluída",
-      "brew_upgrade_success": "Atualização do Homebrew concluída com sucesso. Reinicie o aplicativo.",
-      "brew_restart_btn": "Reiniciar Aplicativo",
-      "brew_restart_failed": "Falha ao reiniciar o aplicativo automaticamente. Por favor, reinicie manualmente.",
-      "brew_upgrade_failed": "Falha na atualização do Homebrew. Tente executar manualmente: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_not_found": "Comando Homebrew (brew) não encontrado no sistema",
-      "brew_error_brew_exec_failed": "Erro durante a execução do comando Homebrew",
-      "brew_error_brew_timeout": "Tempo limite excedido ao executar a atualização do Homebrew",
-      "brew_error_brew_already_latest": "Você já está na versão mais recente disponível no Homebrew",
-      "brew_error_brew_not_supported": "A atualização via Homebrew só é suportada no macOS/Linux",
-      "update_check_failed": "Falha na verificação de atualização",
       "support_btn": "Apoiar Autor",
       "support_title": "Doação e Suporte",
       "support_desc": "Se você acha este projeto útil, sinta-se à vontade para me pagar um café! Seu apoio é a maior motivação para eu manter este projeto.",
@@ -1489,51 +1460,6 @@
     "expires_custom": "Personalizado",
     "custom_expires_at": "Data e Hora de Expiração",
     "hint_custom_expires": "Selecione a data e o horário exatos em que este token expirará"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "No models returned for current API Key.",
-      "emptyFromKey": "Nenhum modelo retornado. Consulte para buscar os modelos disponíveis."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    },
-    "syncSuccess": "Sincronizado com sucesso para {{app}}",
-    "syncError": "Falha ao sincronizar: {{error}}"
   },
   "debug_console": {
     "pause_scroll": "Pausar rolagem",

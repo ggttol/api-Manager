@@ -83,7 +83,7 @@
     "switch_to_malay": "Переключить на малайский",
     "switch_to_malay_short": "MY",
     "user_token": "Токены пользователей",
-    "apikey_fun": "Транзитная станция",
+    "api_guide": "Руководство по API",
     "logout": "Выйти"
   },
   "dashboard": {
@@ -366,14 +366,7 @@
       "auto_launch": "Запуск при старте системы",
       "auto_launch_enabled": "Включено",
       "auto_launch_disabled": "Отключено",
-      "auto_launch_desc": "Автоматически запускать Antigravity Tools при старте системы",
-      "auto_check_update": "Автоматическая проверка обновлений",
-      "auto_check_update_desc": "Автоматически проверять наличие новой версии при запуске",
-      "auto_check_update_enabled": "Автопроверка включена",
-      "auto_check_update_disabled": "Автопроверка отключена",
-      "update_check_interval": "Интервал проверки (часы)",
-      "update_check_interval_desc": "Установите интервал автопроверки (1-168 часов)",
-      "update_check_interval_saved": "Настройки интервала проверки сохранены"
+      "auto_launch_desc": "Автоматически запускать Antigravity Tools при старте системы"
     },
     "account": {
       "title": "Настройки аккаунта",
@@ -557,28 +550,6 @@
       "github": "GitHub",
       "view_code": "Просмотреть код",
       "copyright": "Copyright © 2025-2026 Antigravity. Все права защищены.",
-      "check_update": "Проверить обновления",
-      "checking_update": "Проверка...",
-      "latest_version": "У вас актуальная версия",
-      "new_version_available": "Доступна новая версия {{version}}",
-      "download_update": "Скачать",
-      "brew_upgrade": "Обновить через Homebrew",
-      "brew_upgrading": "Обновление...",
-      "brew_confirm_title": "Обновление через Homebrew",
-      "brew_confirm_desc": "Для обновления приложения будет выполнена следующая команда. После завершения потребуется перезапуск.",
-      "brew_quarantine_hint": "Если после обновления появляется ошибка «Приложение повреждено», выполните в терминале:",
-      "brew_confirm_btn": "Начать обновление",
-      "brew_success_title": "Обновление завершено",
-      "brew_upgrade_success": "Обновление через Homebrew успешно завершено. Перезапустите приложение для загрузки новой версии.",
-      "brew_restart_btn": "Перезапустить сейчас",
-      "brew_restart_failed": "Автоматический перезапуск не удался. Закройте и откройте приложение вручную",
-      "brew_upgrade_failed": "Ошибка обновления через Homebrew. Попробуйте выполнить вручную: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_not_found": "Homebrew не найден. Убедитесь, что brew установлен",
-      "brew_error_brew_exec_failed": "Не удалось выполнить команду brew. Попробуйте запустить вручную в терминале",
-      "brew_error_brew_timeout": "Превышено время ожидания обновления Homebrew (3 мин). Попробуйте вручную: brew upgrade --cask antigravity-tools",
-      "brew_error_brew_already_latest": "Уже установлена последняя версия, обновление не требуется",
-      "brew_error_brew_not_supported": "Обновление через Homebrew не поддерживается на этой платформе",
-      "update_check_failed": "Не удалось проверить обновления",
       "support_btn": "Поддержать автора",
       "support_title": "Донат и поддержка",
       "support_desc": "Если вы считаете этот проект полезным, не стесняйтесь купить мне кофе! Ваша поддержка — главная мотивация для меня поддерживать этот проект.",
@@ -1420,47 +1391,4 @@
     "placeholder_max_ips": "0 = Безлимитно",
     "hint_max_ips": "0 означает безлимитно",
     "hint_curfew": "Оставьте пустым, чтобы отключить. По времени сервера."
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "No models returned for current API Key."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    }
-  }
-}
+  }}

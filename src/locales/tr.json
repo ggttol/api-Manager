@@ -74,7 +74,8 @@
     "switch_to_spanish_short": "ES",
     "switch_to_malay": "Malayca'ya Geç",
     "switch_to_malay_short": "MY",
-    "user_token": "Kullanıcı Tokenları"
+    "user_token": "Kullanıcı Tokenları",
+    "api_guide": "API Kullanım Kılavuzu"
   },
   "dashboard": {
     "hello": "Merhaba, Kullanıcı 👋",
@@ -463,12 +464,6 @@
       "github": "GitHub",
       "view_code": "Kodu Görüntüle",
       "copyright": "Telif Hakkı © 2025-2026 Antigravity. Tüm hakları saklıdır.",
-      "check_update": "Güncellemeleri Kontrol Et",
-      "checking_update": "Kontrol ediliyor...",
-      "latest_version": "Güncelsiniz",
-      "new_version_available": "Yeni sürüm {{version}} mevcut",
-      "download_update": "İndir",
-      "update_check_failed": "Güncelleme kontrolü başarısız",
       "support_btn": "Yazarı Destekle",
       "support_title": "Bağış ve Destek",
       "support_desc": "Bu projeyi yararlı buluyorsanız, yazara bir kahve ısmarlayabilirsiniz! Desteğiniz, bu projeyi sürdürmek için en büyük motivasyon kaynağımdır.",
@@ -1155,47 +1150,4 @@
     "placeholder_max_ips": "0 = Sınırsız",
     "hint_max_ips": "0 sınırsız demektir",
     "hint_curfew": "Devre dışı bırakmak için boş bırakın. Sunucu saatine göredir."
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "No models returned for current API Key."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    }
-  }
-}
+  }}

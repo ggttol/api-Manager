@@ -75,7 +75,8 @@
     "switch_to_spanish_short": "ES",
     "switch_to_malay": "Switch to Malay",
     "switch_to_malay_short": "MY",
-    "user_token": "رموز المستخدم"
+    "user_token": "رموز المستخدم",
+    "api_guide": "دليل استخدام API"
   },
   "dashboard": {
     "hello": "مرحبًا، المستخدم 👋",
@@ -332,14 +333,7 @@
       "auto_launch": "تشغيل عند البدء",
       "auto_launch_enabled": "مفعل",
       "auto_launch_disabled": "معطل",
-      "auto_launch_desc": "تشغيل Antigravity Tools تلقائيًا عند بدء النظام",
-      "auto_check_update": "تحقق تلقائي من التحديثات",
-      "auto_check_update_desc": "التحقق تلقائيًا من الإصدارات الجديدة عند البدء",
-      "auto_check_update_enabled": "التحقق التلقائي مفعل",
-      "auto_check_update_disabled": "التحقق التلقائي معطل",
-      "update_check_interval": "فاصل التحقق (ساعات)",
-      "update_check_interval_desc": "تعيين فاصل التحقق التلقائي (1-168 ساعة)",
-      "update_check_interval_saved": "تم حفظ إعدادات فاصل التحقق"
+      "auto_launch_desc": "تشغيل Antigravity Tools تلقائيًا عند بدء النظام"
     },
     "account": {
       "title": "إعدادات الحساب",
@@ -500,12 +494,6 @@
       "github": "GitHub",
       "view_code": "عرض الكود",
       "copyright": "حقوق النشر © 2025-2026 Antigravity. جميع الحقوق محفوظة.",
-      "check_update": "تحقق من التحديثات",
-      "checking_update": "جاري التحقق...",
-      "latest_version": "أنت على أحدث إصدار",
-      "new_version_available": "إصدار جديد {{version}} متاح",
-      "download_update": "تنزيل",
-      "update_check_failed": "فشل التحقق من التحديث",
       "support_btn": "دعم المؤلف",
       "support_title": "تبرع ودعم",
       "support_desc": "إذا وجدت هذا المشروع مفيدًا، لا تتردد في شراء قهوة لي! دعمك هو أكبر حافز لي لصيانة هذا المشروع.",
@@ -1194,47 +1182,4 @@
     "placeholder_max_ips": "0 = غير محدود",
     "hint_max_ips": "0 = غير محدود",
     "hint_curfew": "اتركه فارغًا لتعطيله. بناءً على وقت الخادم."
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "No models returned for current API Key."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    }
-  }
-}
+  }}

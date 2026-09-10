@@ -422,14 +422,7 @@
       "auto_launch": "开机自动启动",
       "auto_launch_enabled": "启用",
       "auto_launch_disabled": "禁用",
-      "auto_launch_desc": "系统启动时自动运行 Antigravity Tools",
-      "auto_check_update": "自动检查更新",
-      "auto_check_update_desc": "启动时自动检查新版本",
-      "auto_check_update_enabled": "已启用自动检查更新",
-      "auto_check_update_disabled": "已禁用自动检查更新",
-      "update_check_interval": "检查间隔(小时)",
-      "update_check_interval_desc": "设置自动检查更新的时间间隔(1-168 小时)",
-      "update_check_interval_saved": "已保存检查间隔设置"
+      "auto_launch_desc": "系统启动时自动运行 Antigravity Tools"
     },
     "account": {
       "title": "账号设置",
@@ -614,28 +607,6 @@
       "github": "开源地址",
       "view_code": "查看代码",
       "copyright": "Copyright © 2025-2026 Antigravity. All rights reserved.",
-      "check_update": "检测更新",
-      "checking_update": "检测中...",
-      "latest_version": "已是最新版本",
-      "new_version_available": "发现新版本 {{version}}",
-      "download_update": "前往下载",
-      "brew_upgrade": "通过 Homebrew 更新",
-      "brew_upgrading": "更新中...",
-      "brew_confirm_title": "通过 Homebrew 更新",
-      "brew_confirm_desc": "即将执行以下命令更新应用，更新完成后需要重启应用。",
-      "brew_quarantine_hint": "如更新后遇到「应用已损坏」提示，请在终端运行：",
-      "brew_confirm_btn": "开始更新",
-      "brew_success_title": "升级完成",
-      "brew_upgrade_success": "Homebrew 升级成功，请重启应用以加载新版本。",
-      "brew_restart_btn": "立即重启",
-      "brew_restart_failed": "自动重启失败，请手动关闭并重新打开应用",
-      "brew_upgrade_failed": "Homebrew 升级失败，请尝试在终端手动执行：brew upgrade --cask antigravity-tools",
-      "brew_error_brew_not_found": "未找到 Homebrew，请确认已安装 brew",
-      "brew_error_brew_exec_failed": "执行 brew 命令失败，请尝试在终端手动执行",
-      "brew_error_brew_timeout": "Homebrew 升级超时（3分钟），请在终端手动执行：brew upgrade --cask antigravity-tools",
-      "brew_error_brew_already_latest": "已是最新版本，无需升级",
-      "brew_error_brew_not_supported": "当前系统不支持 Homebrew 更新",
-      "update_check_failed": "检测更新失败",
       "support_btn": "支持作者",
       "support_title": "赞助支持",
       "support_desc": "如果您觉得本工具对您有帮助，欢迎扫码请作者喝杯咖啡！您的支持是我持续维护项目的最大动力。",
@@ -1444,47 +1415,4 @@
     "placeholder_max_ips": "0 = 不限制",
     "hint_max_ips": "0 表示不限制",
     "hint_curfew": "留空则禁用。基于服务器时间。"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN 中转站",
-    "eyebrow": "中转站",
-    "description": "Antigravity Tools 官方合作中转站，为用户提供稳定、开放、高性价比的大模型 API 接入服务。支持 Claude、OpenAI、Gemini 等主流模型，适合在 Codex、Gemini CLI、Claude Code 及其他开发工具中统一配置使用。通过 Antigravity Tools 专属链接注册，可享受最高充值永久 95 折优惠。",
-    "viewNow": "立即查看",
-    "usage": {
-      "remainingAmount": "剩余额度",
-      "usedAmount": "已用额度",
-      "todayRequests": "今日请求",
-      "todayTokens": "今日 Token",
-      "totalRequests": "总请求",
-      "totalTokens": "总 Token"
-    },
-    "keyManager": {
-      "title": "密钥管理",
-      "desc": "保存常用 API Key，点击即可切换并自动查询额度。",
-      "lastRemainingLabel": "上次余额",
-      "lastRemaining": "${{value}}",
-      "notQueried": "未查询",
-      "addedAt": "添加于",
-      "empty": "暂无保存的密钥。"
-    },
-    "queryTitle": "密钥额度查询",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "粘贴你的 API Key...",
-    "queryButton": "刷新",
-    "cli": {
-      "quickConfig": "一键配置本地开发环境",
-      "syncDesc": "同步至官方标准配置",
-      "codexTooltip": "将 API Key 与 BaseURL 同步至 Codex / ChatGPT CLI",
-      "claudeTooltip": "将 API Key 与 BaseURL 同步至 Claude Code"
-    },
-    "models": {
-      "title": "可用模型",
-      "empty": "当前 API Key 未返回模型列表。"
-    },
-    "errors": {
-      "parseFormat": "解析格式异常: {{err}}",
-      "fetchFailed": "获取失败: {{err}}",
-      "queryFailed": "无法获取有效的额度数据或模型列表，请确认 API Key 是否有效，以及接口地址是否正确。"
-    }
-  }
-}
+  }}
