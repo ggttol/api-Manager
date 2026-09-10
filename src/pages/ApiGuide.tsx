@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ArrowRight, BookOpen, Check, Copy, KeyRound, RefreshCw, ShieldCheck, Terminal, Workflow } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Check, Copy, KeyRound, RefreshCw, ShieldCheck, Terminal, Workflow } from 'lucide-react';
 import { showToast } from '../components/common/ToastContainer';
 import { copyToClipboard } from '../utils/clipboard';
 import { request } from '../utils/request';
+import { PageHeader } from '../components/common/ConsolePage';
 
 const content = {
     zh: {
-        title: 'API 使用说明', subtitle: '从选择入口到连接客户端，在一个页面完成接入。', badge: '当前服务器',
+        title: '接入指南', subtitle: '从选择入口到连接客户端，在一个页面完成接入。', badge: '当前服务器',
         securityTitle: '先保护连接，再发送凭据',
         security: '远程访问请使用可信的 HTTPS，或通过 SSH 隧道访问本机回环地址。不要在公共 HTTP 连接上传输管理员密码、网关 Key 或账号授权文件；不要使用 curl -k 跳过证书校验。SSH 隧道建立后，请从隧道的本地地址重新打开本页面再复制示例。',
         insecure: '当前是非本机 HTTP 连接：请先切换到 HTTPS 或 SSH 隧道。',
@@ -21,10 +22,10 @@ const content = {
         catalog: '模型目录', inference: '推理', copy: '复制', copied: '已复制', copyFailed: '复制失败，请手动选择并复制。',
         setupTitle: '02 · 在本地准备网关 Key', setupHint: '以下为 Bash 命令。运行后在隐藏输入提示中粘贴网关 Key，避免将明文 Key 写入命令历史。不要粘贴管理员密码。只在可信的本机终端执行，不要开启 shell 调试（set -x）。',
         setupFooter: '环境变量仅供当前终端及其子进程使用。不要提交到代码仓库或截图分享；使用完毕可执行 unset API_MANAGER_KEY。',
-        examplesTitle: '03 · 查询目录，再发起请求', examplesHint: '示例不会自动执行。先运行所选入口的目录查询，将模型占位符替换成实际返回的 ID。Codex 示例会同步使用下方目录选择器中的模型。',
+        examplesTitle: '03 · 查询目录，再发起请求', examplesHint: '示例不会自动执行。先运行所选入口的目录查询，将模型占位符替换成实际返回的 ID。Codex 示例会同步使用 Codex CLI 接入方式中选择的模型。',
         googleExample: 'Google / OpenAI 兼容', geminiExample: 'Gemini 原生', codexExample: 'Codex / Responses',
         modelHint: '兼容接口使用 /v1/models 返回的 data[].id；Gemini 原生使用 /v1beta/models 返回的 models[].name，并在 URL 中去掉已有的 models/ 前缀。不要假设不同入口共享模型 ID。',
-        codexModelHint: 'Codex 使用 /codex/v1/models 返回的 data[].id；也可在下方加载真实目录后选择。示例中的单次问答是新会话，不含任何历史会话标识。',
+        codexModelHint: 'Codex 使用 /codex/v1/models 返回的 data[].id；也可切换到 Codex CLI 接入方式加载真实目录后选择。示例中的单次问答是新会话，不含任何历史会话标识。',
         configTitle: '04 · 连接 Codex CLI', configHint: '先在 Codex 账号页添加并启用账号，再加载上游真实模型目录。只从返回的原生 ID 中选择；不预设模型、不使用 Gemini 映射名称。',
         loadModels: '加载模型目录', refreshModels: '刷新模型目录', loading: '正在加载真实模型目录…', modelLabel: 'Codex 原生模型', chooseModel: '请选择目录中的模型',
         notLoaded: '尚未加载模型目录。加载并选择后即可复制完整配置。', noModels: '目录未返回可用模型。请检查 Codex 账号是否已授权并启用，然后重试。',
@@ -39,7 +40,7 @@ const content = {
         restart: '亲和性保存在服务器内存中，重启或过期后旧会话不能可靠续接。遇到未知 previous_response_id 或丢失亲和性的错误，请开启全新对话、使用新会话 ID，并重新提供原始任务文本；不要携带旧响应 ID、turn-state 或加密上下文。',
     },
     en: {
-        title: 'API usage guide', subtitle: 'Choose an endpoint, prepare your key, and connect your client.', badge: 'Current server',
+        title: 'Integration guide', subtitle: 'Choose an endpoint, prepare your key, and connect your client.', badge: 'Current server',
         securityTitle: 'Secure the connection before sending credentials',
         security: 'Use trusted HTTPS for remote access, or access a loopback address through an SSH tunnel. Never send an administrator password, gateway key, or account authorization file over public HTTP. Do not bypass certificate checks with curl -k. After establishing a tunnel, reopen this page at its local address before copying examples.',
         insecure: 'This is a non-local HTTP connection. Switch to HTTPS or an SSH tunnel first.',
@@ -53,10 +54,10 @@ const content = {
         catalog: 'Model catalog', inference: 'Inference', copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed. Please select and copy the text manually.',
         setupTitle: '02 · Prepare your gateway key locally', setupHint: 'These are Bash commands. Paste your gateway key at the hidden prompt instead of placing the plaintext key in shell history. Do not enter the administrator password. Run only in a trusted local terminal with shell tracing (set -x) disabled.',
         setupFooter: 'The variable is available to this terminal and its child processes only. Never commit it or share it in screenshots; run unset API_MANAGER_KEY when finished.',
-        examplesTitle: '03 · Query the catalog, then make a request', examplesHint: 'Examples are not executed automatically. Run the selected catalog query first, then replace the model placeholder with an actual returned ID. The Codex example also follows the live catalog selector below.',
+        examplesTitle: '03 · Query the catalog, then make a request', examplesHint: 'Examples are not executed automatically. Run the selected catalog query first, then replace the model placeholder with an actual returned ID. The Codex example also follows the model selected in the Codex CLI client configuration.',
         googleExample: 'Google / OpenAI compatible', geminiExample: 'Native Gemini', codexExample: 'Codex / Responses',
         modelHint: 'The compatible API uses data[].id from /v1/models. Native Gemini uses models[].name from /v1beta/models; remove the existing models/ prefix when inserting it into the example URL. Do not assume different endpoints share model IDs.',
-        codexModelHint: 'Codex uses data[].id from /codex/v1/models, or a model selected from the live catalog below. This one-turn example starts a new conversation without previous session identifiers.',
+        codexModelHint: 'Codex uses data[].id from /codex/v1/models. You can also switch to the Codex CLI client to load and select a live model. This one-turn example starts a new conversation without previous session identifiers.',
         configTitle: '04 · Connect Codex CLI', configHint: 'Add and enable an account on the Codex accounts page, then load the real upstream model catalog. Select a returned native ID only: no assumed models or Gemini mapping names.',
         loadModels: 'Load model catalog', refreshModels: 'Refresh model catalog', loading: 'Loading the live model catalog…', modelLabel: 'Native Codex model', chooseModel: 'Select a model from the catalog',
         notLoaded: 'The catalog has not been loaded. Load it and select a model to copy a complete configuration.', noModels: 'The catalog returned no usable models. Check that a Codex account is authorized and enabled, then retry.',
@@ -72,8 +73,8 @@ const content = {
     },
 };
 
-const panel = 'rounded-2xl border border-gray-200 bg-white p-5 shadow-sm dark:border-base-300 dark:bg-base-100 sm:p-6';
-const button = 'inline-flex items-center justify-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-40 dark:border-base-300 dark:text-gray-200 dark:hover:bg-base-200';
+const panel = 'console-panel min-w-0';
+const button = 'console-button text-xs disabled:cursor-not-allowed disabled:opacity-40';
 const paragraph = 'text-sm leading-6 text-gray-600 dark:text-gray-400';
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
 type CatalogModel = { id: string; name: string };
@@ -111,11 +112,13 @@ function CodeBlock({ title, code, copyLabel, copiedLabel, disabled = false, onCo
 }
 
 export default function ApiGuide() {
-    const { i18n } = useTranslation();
+    const { t, i18n } = useTranslation();
     const text = content[(i18n.resolvedLanguage || i18n.language).toLowerCase().startsWith('zh') ? 'zh' : 'en'];
     const origin = window.location.origin;
     const insecure = window.location.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname) && !/^127\.\d+\.\d+\.\d+$/.test(window.location.hostname);
     const [example, setExample] = useState<Example>('codex');
+    const [client, setClient] = useState<'curl' | 'codex'>('curl');
+    const isChinese = i18n.language.startsWith('zh');
     const [models, setModels] = useState<CatalogModel[]>([]);
     const [model, setModel] = useState('');
     const [loading, setLoading] = useState(false);
@@ -177,74 +180,101 @@ export default function ApiGuide() {
     const config = `model = ${JSON.stringify(codexModel)}\nmodel_provider = "api_manager_codex"\n\n[model_providers.api_manager_codex]\nname = "API Manager Codex"\nbase_url = ${JSON.stringify(`${origin}/codex/v1`)}\nenv_key = "API_MANAGER_KEY"\nwire_api = "responses"\nsupports_websockets = false\nrequires_openai_auth = false`;
 
     return (
-        <div className="mx-auto h-full w-full max-w-7xl space-y-6 overflow-y-auto p-4 sm:p-6">
-            <header className="flex flex-wrap items-start justify-between gap-4">
-                <div><h1 className="flex items-center gap-3 text-2xl font-bold text-gray-900 dark:text-gray-100"><BookOpen className="shrink-0 text-blue-500" />{text.title}</h1><p className={`${paragraph} mt-2`}>{text.subtitle}</p></div>
-                <span className="inline-flex max-w-full items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-2 text-xs dark:border-base-300 dark:bg-base-100"><ShieldCheck size={14} className="shrink-0 text-emerald-500" /><span className="truncate" title={origin}>{text.badge} · {origin}</span></span>
-            </header>
+        <div className="console-page console-page-scroll h-full space-y-5">
+            <PageHeader
+                title={text.title}
+                description={text.subtitle}
+                actions={<span className="inline-flex max-w-full items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-base-300"><ShieldCheck size={14} className="shrink-0 text-emerald-500" /><span className="truncate" title={origin}>{text.badge} · {origin}</span></span>}
+            />
 
-            <aside className="rounded-2xl border border-amber-200 bg-amber-50 p-5 text-amber-950 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
-                <h2 className="flex items-center gap-2 font-semibold"><ShieldCheck size={19} className="shrink-0" />{text.securityTitle}</h2>
-                {insecure && <p role="alert" className="mt-3 flex items-start gap-2 text-sm font-semibold"><AlertTriangle size={17} className="mt-0.5 shrink-0" />{text.insecure}</p>}
-                <p className="mt-2 text-sm leading-6">{text.security}</p>
-            </aside>
+            {insecure && <aside role="alert" className="flex items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm font-medium text-amber-950 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200"><AlertTriangle size={18} className="mt-0.5 shrink-0" />{text.insecure}</aside>}
 
-            <section className={panel} aria-labelledby="guide-credentials">
-                <h2 id="guide-credentials" className="flex items-center gap-2 text-lg font-semibold"><KeyRound size={20} className="text-blue-500" />{text.credentialsTitle}</h2>
-                <div className="mt-4 grid gap-5 md:grid-cols-2">
-                    <div><h3 className="mb-2 font-medium">{text.adminTitle}</h3><p className={paragraph}>{text.admin}</p></div>
-                    <div className="border-t border-gray-100 pt-4 dark:border-base-300 md:border-l md:border-t-0 md:pl-5 md:pt-0"><h3 className="mb-2 font-medium">{text.gatewayTitle}</h3><p className={paragraph}>{text.gateway}</p></div>
+            <nav className="console-tabs flex flex-wrap gap-1" aria-label={text.title}>
+                <a className="console-tab" href="#guide-endpoints">{text.endpointsTitle}</a>
+                <a className="console-tab" href="#guide-setup">{text.setupTitle}</a>
+                <a className="console-tab" href={client === 'codex' ? '#guide-codex' : '#guide-examples'}>{client === 'codex' ? text.configTitle : text.examplesTitle}</a>
+                {example === 'codex' && <a className="console-tab" href="#guide-sessions">{text.protocolTitle}</a>}
+            </nav>
+
+            <section className={`${panel} space-y-5 scroll-mt-4`} aria-labelledby="guide-endpoints">
+                <div><h2 id="guide-endpoints" className="text-lg font-semibold">{text.endpointsTitle}</h2><p className={`${paragraph} mt-2`}>{text.endpointsHint}</p></div>
+                <div className="grid gap-4 md:grid-cols-3">
+                    <fieldset className="min-w-0">
+                        <legend className="mb-2 text-sm font-medium">{t('console.guide_provider', { defaultValue: isChinese ? '账号池' : 'Account pool' })}</legend>
+                        <div className="console-tabs flex flex-wrap gap-1">
+                            <button type="button" className={`console-tab ${example !== 'codex' ? 'active' : ''}`} aria-pressed={example !== 'codex'} onClick={() => { setExample('google'); setClient('curl'); }}>Google</button>
+                            <button type="button" className={`console-tab ${example === 'codex' ? 'active' : ''}`} aria-pressed={example === 'codex'} onClick={() => setExample('codex')}>Codex</button>
+                        </div>
+                    </fieldset>
+                    <label className="block min-w-0 text-sm font-medium">
+                        <span className="mb-2 block">{t('console.guide_protocol', { defaultValue: isChinese ? '接口协议' : 'Protocol' })}</span>
+                        <select className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-sm dark:border-base-300 dark:bg-base-200" value={example} onChange={event => { setExample(event.target.value as Example); setClient('curl'); }}>
+                            {example === 'codex' ? <option value="codex">{text.codexExample}</option> : <><option value="google">{text.googleExample}</option><option value="gemini">{text.geminiExample}</option></>}
+                        </select>
+                    </label>
+                    <label className="block min-w-0 text-sm font-medium">
+                        <span className="mb-2 block">{t('console.guide_client', { defaultValue: isChinese ? '接入方式' : 'Client' })}</span>
+                        <select className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-sm dark:border-base-300 dark:bg-base-200" value={client} onChange={event => setClient(event.target.value as 'curl' | 'codex')}>
+                            <option value="curl">cURL / HTTP</option>
+                            {example === 'codex' && <option value="codex">Codex CLI</option>}
+                        </select>
+                    </label>
                 </div>
+                <article className="grid min-w-0 gap-5 rounded-xl border border-gray-200 bg-gray-50 p-4 dark:border-base-300 dark:bg-base-200 lg:grid-cols-2">
+                    <div className="min-w-0"><span className={`inline-block rounded-lg px-2.5 py-1 font-mono text-xs font-semibold ${endpoint.accent}`}>{endpoint.base}</span><h3 className="mt-3 font-semibold">{endpoint.title}</h3><p className={`${paragraph} mt-2`}>{endpoint.description}</p></div>
+                    <div className="min-w-0">
+                        <div className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white p-2 dark:border-base-300 dark:bg-base-100"><code className="min-w-0 flex-1 break-all text-xs leading-5">{origin}{endpoint.base}</code><button type="button" className={`${button} shrink-0 !p-2`} aria-label={`${text.copy} ${endpoint.title} Base URL`} onClick={() => void copy(origin + endpoint.base)}><Copy size={14} /></button></div>
+                        <dl className="mt-3 space-y-2 text-xs"><div><dt className="text-gray-500 dark:text-gray-400">{text.catalog}</dt><dd className="mt-1 break-all font-mono">GET {endpoint.catalog}</dd></div><div><dt className="text-gray-500 dark:text-gray-400">{text.inference}</dt><dd className="mt-1 break-all font-mono">POST {endpoint.inference}</dd></div></dl>
+                    </div>
+                </article>
             </section>
 
-            <section aria-labelledby="guide-endpoints">
-                <h2 id="guide-endpoints" className="text-lg font-semibold">{text.endpointsTitle}</h2><p className={`${paragraph} mt-2`}>{text.endpointsHint}</p>
-                <div className="mt-4 grid gap-4 xl:grid-cols-3">
-                    {endpoints.map(item => <article key={item.base} className={`${panel} min-w-0 !p-5`}>
-                        <span className={`inline-block rounded-lg px-2.5 py-1 font-mono text-xs font-semibold ${item.accent}`}>{item.base}</span>
-                        <h3 className="mt-4 font-semibold">{item.title}</h3><p className={`${paragraph} mt-2`}>{item.description}</p>
-                        <div className="mt-4 flex items-center gap-2 rounded-lg bg-gray-50 p-2 dark:bg-base-200"><code className="min-w-0 flex-1 break-all text-xs leading-5">{origin}{item.base}</code><button type="button" className={`${button} shrink-0 !p-2`} aria-label={`${text.copy} ${item.title} Base URL`} onClick={() => void copy(origin + item.base)}><Copy size={14} /></button></div>
-                        <dl className="mt-4 space-y-2 text-xs"><div><dt className="text-gray-500 dark:text-gray-400">{text.catalog}</dt><dd className="mt-1 break-all font-mono">GET {item.catalog}</dd></div><div><dt className="text-gray-500 dark:text-gray-400">{text.inference}</dt><dd className="mt-1 break-all font-mono">POST {item.inference}</dd></div></dl>
-                    </article>)}
-                </div>
-            </section>
-
-            <section className={`${panel} space-y-4`} aria-labelledby="guide-setup">
-                <h2 id="guide-setup" className="text-lg font-semibold">{text.setupTitle}</h2><p className={paragraph}>{text.setupHint}</p>
+            <section className={`${panel} space-y-4 scroll-mt-4`} aria-labelledby="guide-setup">
+                <h2 id="guide-setup" className="text-lg font-semibold">{text.setupTitle}</h2>
+                <aside className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
+                    <h3 className="flex items-center gap-2 text-sm font-semibold"><ShieldCheck size={18} className="shrink-0" />{text.securityTitle}</h3>
+                    <p className="mt-2 text-sm leading-6">{text.security}</p>
+                </aside>
+                <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300">
+                    <summary className="cursor-pointer text-sm font-semibold"><KeyRound size={16} className="mr-2 inline text-blue-500" />{text.credentialsTitle}</summary>
+                    <div className="mt-4 grid gap-4 md:grid-cols-2"><div><h3 className="mb-2 text-sm font-medium">{text.adminTitle}</h3><p className={paragraph}>{text.admin}</p></div><div><h3 className="mb-2 text-sm font-medium">{text.gatewayTitle}</h3><p className={paragraph}>{text.gateway}</p></div></div>
+                </details>
+                <p className={paragraph}>{text.setupHint}</p>
                 <CodeBlock title="Bash · API_MANAGER_KEY" code={setup} {...copyProps} />
                 <p className="text-xs leading-5 text-gray-500 dark:text-gray-400">{text.setupFooter}</p>
             </section>
 
-            <section className={`${panel} space-y-4`} aria-labelledby="guide-examples">
-                <h2 id="guide-examples" className="text-lg font-semibold">{text.examplesTitle}</h2><p className={paragraph}>{text.examplesHint}</p>
-                <div className="flex flex-wrap gap-2" role="group" aria-label={text.endpointsTitle}>
-                    {(['google', 'gemini', 'codex'] as const).map(value => <button key={value} type="button" aria-pressed={example === value} onClick={() => setExample(value)} className={`${button} ${example === value ? '!border-blue-500 !bg-blue-50 !text-blue-700 dark:!bg-blue-950/40 dark:!text-blue-300' : ''}`}>{text[`${value}Example`]}</button>)}
-                </div>
-                <CodeBlock title={`GET ${endpoint.catalog}`} code={catalogCurl} {...copyProps} />
-                <p className={`${paragraph} flex items-start gap-2`}><ArrowRight size={17} className="mt-1 shrink-0 text-blue-500" /><span>{example === 'codex' ? text.codexModelHint : text.modelHint}</span></p>
-                <CodeBlock title={`POST ${endpoint.inference}`} code={inferenceCurl} {...copyProps} />
-            </section>
+            {client === 'curl' ? (
+                <section className={`${panel} space-y-4 scroll-mt-4`} aria-labelledby="guide-examples">
+                    <h2 id="guide-examples" className="text-lg font-semibold">{text.examplesTitle}</h2><p className={paragraph}>{text.examplesHint}</p>
+                    <CodeBlock title={`GET ${endpoint.catalog}`} code={catalogCurl} {...copyProps} />
+                    <p className={`${paragraph} flex items-start gap-2`}><ArrowRight size={17} className="mt-1 shrink-0 text-blue-500" /><span>{example === 'codex' ? text.codexModelHint : text.modelHint}</span></p>
+                    {example === 'codex' && <button type="button" className={button} onClick={() => setClient('codex')}><Terminal size={15} />{text.configTitle}</button>}
+                    <CodeBlock title={`POST ${endpoint.inference}`} code={inferenceCurl} {...copyProps} />
+                </section>
+            ) : (
+                <section className={`${panel} space-y-4 scroll-mt-4`} aria-labelledby="guide-codex">
+                    <h2 id="guide-codex" className="flex items-center gap-2 text-lg font-semibold"><Terminal size={20} className="text-emerald-500" />{text.configTitle}</h2><p className={paragraph}>{text.configHint}</p>
+                    <div className="flex flex-wrap items-end gap-3">
+                        <label className="block min-w-0 flex-1 text-sm sm:min-w-64"><span className="mb-2 block font-medium">{text.modelLabel}</span><select value={model} disabled={loading || models.length === 0} onChange={event => setModel(event.target.value)} className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 dark:border-base-300 dark:bg-base-200"><option value="">{text.chooseModel}</option>{models.map(item => <option key={item.id} value={item.id}>{item.name === item.id ? item.id : `${item.name} · ${item.id}`}</option>)}</select></label>
+                        <button type="button" className={`${button} !py-2.5`} disabled={loading} onClick={() => void loadModels()}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />{loaded ? text.refreshModels : text.loadModels}</button>
+                    </div>
+                    {loading ? <p role="status" className={paragraph}>{text.loading}</p> : modelsError ? <p role="alert" className="text-sm leading-6 text-red-600 dark:text-red-400">{text.modelsError}</p> : models.length === 0 ? <p className={paragraph}>{loaded ? text.noModels : text.notLoaded}</p> : null}
+                    <p className={paragraph}>{text.configHelp}</p>
+                    <CodeBlock title="~/.codex/config.toml" code={config} disabled={!selectedModel} {...copyProps} />
+                    <div className="rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm leading-6 text-blue-900 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-200">{text.transport}</div>
+                    <p className={paragraph}>{text.launch}</p>
+                    <button type="button" className={button} onClick={() => setClient('curl')}><ArrowRight size={15} />{text.examplesTitle}</button>
+                </section>
+            )}
 
-            <section className={`${panel} space-y-4`} aria-labelledby="guide-codex">
-                <h2 id="guide-codex" className="flex items-center gap-2 text-lg font-semibold"><Terminal size={20} className="text-emerald-500" />{text.configTitle}</h2><p className={paragraph}>{text.configHint}</p>
-                <div className="flex flex-wrap items-end gap-3">
-                    <label className="block min-w-0 flex-1 text-sm sm:min-w-64"><span className="mb-2 block font-medium">{text.modelLabel}</span><select value={model} disabled={loading || models.length === 0} onChange={event => setModel(event.target.value)} className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 dark:border-base-300 dark:bg-base-200"><option value="">{text.chooseModel}</option>{models.map(item => <option key={item.id} value={item.id}>{item.name === item.id ? item.id : `${item.name} · ${item.id}`}</option>)}</select></label>
-                    <button type="button" className={`${button} !py-2.5`} disabled={loading} onClick={() => void loadModels()}><RefreshCw size={15} className={loading ? 'animate-spin' : ''} />{loaded ? text.refreshModels : text.loadModels}</button>
-                </div>
-                {loading ? <p role="status" className={paragraph}>{text.loading}</p> : modelsError ? <p role="alert" className="text-sm leading-6 text-red-600 dark:text-red-400">{text.modelsError}</p> : models.length === 0 ? <p className={paragraph}>{loaded ? text.noModels : text.notLoaded}</p> : null}
-                <p className={paragraph}>{text.configHelp}</p>
-                <CodeBlock title="~/.codex/config.toml" code={config} disabled={!selectedModel} {...copyProps} />
-                <div className="rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm leading-6 text-blue-900 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-200">{text.transport}</div>
-                <p className={paragraph}>{text.launch}</p>
-            </section>
-
-            <section className={`${panel} space-y-5`} aria-labelledby="guide-sessions">
+            {example === 'codex' && <section className={`${panel} scroll-mt-4`} aria-labelledby="guide-sessions">
                 <h2 id="guide-sessions" className="flex items-center gap-2 text-lg font-semibold"><Workflow size={20} className="text-violet-500" />{text.protocolTitle}</h2>
-                <div className="grid gap-6 lg:grid-cols-2">
-                    <article className="min-w-0"><h3 className="mb-2 font-semibold">{text.compactTitle}</h3><p className={`${paragraph} break-words`}>{text.compact}</p><p className={`${paragraph} mt-3`}>{text.compactNote}</p></article>
-                    <article className="min-w-0"><h3 className="mb-2 font-semibold">{text.affinityTitle}</h3><p className={paragraph}>{text.affinity}</p><p className={`${paragraph} mt-3`}>{text.restart}</p></article>
+                <div className="mt-4 space-y-3">
+                    <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300"><summary className="cursor-pointer text-sm font-semibold">{text.compactTitle}</summary><p className={`${paragraph} mt-3 break-words`}>{text.compact}</p><p className={`${paragraph} mt-3`}>{text.compactNote}</p></details>
+                    <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300"><summary className="cursor-pointer text-sm font-semibold">{text.affinityTitle}</summary><p className={`${paragraph} mt-3`}>{text.affinity}</p><p className={`${paragraph} mt-3`}>{text.restart}</p></details>
                 </div>
-            </section>
+            </section>}
         </div>
     );
 }

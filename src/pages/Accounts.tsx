@@ -6,6 +6,7 @@ import {
   Download,
   LayoutGrid,
   List,
+  MoreHorizontal,
   RefreshCw,
   Search,
   Sparkles,
@@ -22,6 +23,7 @@ import AddAccountDialog from "../components/accounts/AddAccountDialog";
 import DeviceFingerprintDialog from "../components/accounts/DeviceFingerprintDialog";
 import ModalDialog from "../components/common/ModalDialog";
 import Pagination from "../components/common/Pagination";
+import { AccountPoolTabs, PageHeader } from "../components/common/ConsolePage";
 import AccountErrorDialog from "../components/accounts/AccountErrorDialog";
 import { showToast } from "../components/common/ToastContainer";
 import { exportAccounts } from "../services/accountService";
@@ -39,7 +41,7 @@ export type QuotaWindow = "5h" | "weekly";
 
 
 function Accounts() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const {
     accounts,
     currentAccount,
@@ -60,8 +62,6 @@ function Accounts() {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [filter, setFilter] = useState<FilterType>('all');
-  const [isSearchExpanded, setIsSearchExpanded] = useState(false);
-  const searchInputRef = useRef<HTMLInputElement>(null);
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     const saved = localStorage.getItem('accounts_view_mode');
     return (saved === 'list' || saved === 'grid') ? saved : 'list';
@@ -218,16 +218,10 @@ function Accounts() {
       );
       return Math.max(10, autoFitCount);
     } else {
-      const cardHeight = 180; // AccountCard 实际高度 (含间距)
+      const cardHeight = 300;
       const gap = 16; // gap-4
 
-      // 匹配 Tailwind 断点逻辑
-      let cols = 1;
-      if (containerSize.width >= 1200)
-        cols = 4; // xl (约为 1280 左右)
-      else if (containerSize.width >= 900)
-        cols = 3; // lg (约为 1024 左右)
-      else if (containerSize.width >= 600) cols = 2; // md (约为 768 左右)
+      const cols = Math.max(1, Math.floor((containerSize.width + gap) / (360 + gap)));
 
       const rows = Math.max(
         1,
@@ -749,8 +743,7 @@ function Accounts() {
   };
 
   return (
-    <div className="h-full flex flex-col p-5 gap-4 max-w-7xl mx-auto w-full">
-      {/* 测试按钮 - 在最顶部 */}
+    <div className="console-page console-page-fixed overflow-y-auto">
       <input
         ref={fileInputRef}
         type="file"
@@ -759,343 +752,73 @@ function Accounts() {
         onChange={handleFileChange}
       />
 
-      {/* 顶部工具栏:搜索、过滤和操作按钮 */}
-      <div className="flex-none flex items-center gap-2">
-        {/* 搜索框 - 响应式:大屏显示输入框,小屏显示图标 */}
-        <div className="hidden lg:block flex-none w-40 relative transition-all focus-within:w-48">
-          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
-          <input
-            type="text"
-            placeholder={t('accounts.search_placeholder')}
-            className="w-full pl-9 pr-4 py-2 bg-white dark:bg-base-100 text-sm text-gray-900 dark:text-base-content border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 dark:placeholder:text-gray-500"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-        </div>
-
-        {/* 搜索按钮 - 小屏显示 */}
-        <div className="lg:hidden relative">
-          {!isSearchExpanded ? (
-            <button
-              onClick={() => {
-                setIsSearchExpanded(true);
-                setTimeout(() => searchInputRef.current?.focus(), 100);
-              }}
-              className="p-2 bg-gray-100 dark:bg-base-200 hover:bg-gray-200 dark:hover:bg-base-100 rounded-lg transition-colors"
-              title={t('accounts.search_placeholder')}
-            >
-              <Search className="w-4 h-4 text-gray-600 dark:text-gray-300" />
-            </button>
-          ) : (
-            <div className="absolute left-0 top-0 z-10 w-64 flex items-center gap-1">
-              <div className="flex-1 relative">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  placeholder={t('accounts.search_placeholder')}
-                  className="w-full pl-9 pr-4 py-2 bg-white dark:bg-base-100 text-sm text-gray-900 dark:text-base-content border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 dark:placeholder:text-gray-500 shadow-lg"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  onBlur={() => setIsSearchExpanded(false)}
-                />
-              </div>
+      <PageHeader
+        title={t('console.account_pool', { defaultValue: i18n.language.startsWith('zh') ? '账号池' : 'Account pool' })}
+        description={t('console.google_pool_description', { defaultValue: i18n.language.startsWith('zh') ? '管理 Google 账号、配额与代理可用性。' : 'Manage Google accounts, quota, and proxy availability.' })}
+        actions={<AddAccountDialog onAdd={handleAddAccount} />}
+      />
+      <AccountPoolTabs />
+      <section className="console-panel flex-none space-y-3 sm:space-y-4">
+        <div className="console-toolbar !flex-nowrap">
+          <div className="relative flex-1 min-w-0">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input type="search" aria-label={t('accounts.search_placeholder')} placeholder={t('accounts.search_placeholder')}
+              className="w-full pl-9 pr-3 py-2 text-sm bg-transparent border border-gray-200 dark:border-base-300 rounded-lg"
+              value={searchQuery} onChange={event => setSearchQuery(event.target.value)} />
+          </div>
+          <button className="console-button shrink-0" onClick={handleRefreshClick} disabled={isRefreshing} title={selectedIds.size > 0 ? t('accounts.refresh_selected', { count: selectedIds.size }) : t('accounts.refresh_all')}>
+            <RefreshCw size={16} className={isRefreshing ? 'animate-spin' : ''} />
+            <span className="sr-only sm:not-sr-only">{isRefreshing ? t('common.loading') : selectedIds.size > 0 ? t('accounts.refresh_selected', { count: selectedIds.size }) : t('accounts.refresh_all')}</span>
+          </button>
+          <details className="relative shrink-0">
+            <summary className="console-button cursor-pointer"><MoreHorizontal size={16} className="sm:hidden" /><span className="sr-only sm:not-sr-only">{t('console.more_actions', { defaultValue: i18n.language.startsWith('zh') ? '更多操作' : 'More actions' })}</span></summary>
+            <div className="absolute right-0 top-full mt-2 z-30 w-64 max-w-[80vw] rounded-xl border border-gray-200 dark:border-base-300 bg-white dark:bg-base-100 shadow-lg p-2 flex flex-col gap-1">
+              <button className="console-button justify-start" onClick={() => setIsWarmupConfirmOpen(true)} disabled={isWarmuping}>
+                <Sparkles size={16} />{isWarmuping ? t('common.loading') : selectedIds.size > 0 ? t('accounts.warmup_selected', { count: selectedIds.size }) : t('accounts.warmup_all')}
+              </button>
+              <button className="console-button justify-start" onClick={handleImportJson}><Upload size={16} />{t('accounts.import_json')}</button>
+              <button className="console-button justify-start" onClick={handleExport}><Download size={16} />{selectedIds.size > 0 ? t('accounts.export_selected', { count: selectedIds.size }) : t('common.export')}</button>
+              <label className="flex items-center justify-between gap-2 p-2 text-sm cursor-pointer">
+                {t('accounts.show_all_quotas')}
+                <input type="checkbox" className="toggle toggle-xs toggle-primary" checked={showAllQuotas} onChange={toggleShowAllQuotas} />
+              </label>
             </div>
-          )}
+          </details>
         </div>
-
-        {/* 配额周期切换 (5H / 7天周配额) */}
-        <div className="flex gap-1 bg-gray-100 dark:bg-base-200 p-1 rounded-lg shrink-0 items-center">
-          <button
-            className={cn(
-              "px-2 py-1 text-xs font-semibold rounded-md transition-all flex items-center gap-1",
-              quotaWindow === "5h"
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
-            )}
-            onClick={() => setQuotaWindow("5h")}
-            title={t("accounts.quota_window_5h", "5小时滑动配额")}
-          >
-            <Clock className="w-3.5 h-3.5" />
-            <span>5H</span>
-          </button>
-          <button
-            className={cn(
-              "px-2 py-1 text-xs font-semibold rounded-md transition-all flex items-center gap-1",
-              quotaWindow === "weekly"
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
-            )}
-            onClick={() => setQuotaWindow("weekly")}
-            title={t("accounts.quota_window_weekly", "7天周配额")}
-          >
-            <Calendar className="w-3.5 h-3.5" />
-            <span>{t("accounts.quota_window_weekly_short", "周配额")}</span>
-          </button>
-        </div>
-
-        {/* 视图切换按钮组 */}
-        <div className="flex gap-1 bg-gray-100 dark:bg-base-200 p-1 rounded-lg shrink-0">
-          <button
-            className={cn(
-              "p-1.5 rounded-md transition-all",
-              viewMode === "list"
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
-            )}
-            onClick={() => setViewMode("list")}
-            title={t("accounts.views.list")}
-          >
-            <List className="w-4 h-4" />
-          </button>
-          <button
-            className={cn(
-              "p-1.5 rounded-md transition-all",
-              viewMode === "grid"
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content",
-            )}
-            onClick={() => setViewMode("grid")}
-            title={t("accounts.views.grid")}
-          >
-            <LayoutGrid className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* 过滤按钮组 - 图标化响应式 */}
-        <div className="flex gap-0.5 bg-gray-100/80 dark:bg-base-200 p-1 rounded-xl border border-gray-200/50 dark:border-white/5 shrink-0">
-          {/* 全部 */}
-          <button
-            className={cn(
-              "px-2 md:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 md:gap-1.5 whitespace-nowrap shrink-0",
-              filter === 'all'
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('all')}
-            title={`${t('accounts.all')} (${filterCounts.all})`}
-          >
-            <span className="hidden md:inline">{t('accounts.all')}</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'all'
-                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.all}
-            </span>
-          </button>
-
-          {/* PRO */}
-          <button
-            className={cn(
-              "px-2 md:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all flex items-center gap-1 md:gap-1.5 whitespace-nowrap shrink-0",
-              filter === 'pro'
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('pro')}
-            title={`${t('accounts.pro')} (${filterCounts.pro})`}
-          >
-            <span className="hidden md:inline">{t('accounts.pro')}</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'pro'
-                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.pro}
-            </span>
-          </button>
-
-          {/* ULTRA */}
-          <button
-            className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
-              filter === 'ultra'
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('ultra')}
-            title={`${t('accounts.ultra')} (${filterCounts.ultra})`}
-          >
-            <span className="hidden md:inline">{t('accounts.ultra')}</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'ultra'
-                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.ultra}
-            </span>
-          </button>
-
-          {/* FREE */}
-          <button
-            className={cn(
-              "flex px-2 lg:px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all items-center gap-1 lg:gap-1.5 whitespace-nowrap shrink-0",
-              filter === 'free'
-                ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm ring-1 ring-black/5"
-                : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content hover:bg-white/40"
-            )}
-            onClick={() => setFilter('free')}
-            title={`${t('accounts.free')} (${filterCounts.free})`}
-          >
-            <span className="hidden md:inline">{t('accounts.free')}</span>
-            <span className={cn(
-              "px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors",
-              filter === 'free'
-                ? "bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400"
-                : "bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400"
-            )}>
-              {filterCounts.free}
-            </span>
-          </button>
-        </div>
-
-        <div className="flex-1 min-w-[8px]"></div>
-
-        {/* 操作按钮组 */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          <AddAccountDialog onAdd={handleAddAccount} showText={false} />
-
-          {selectedIds.size > 0 && (
-            <>
-              <button
-                className="px-2.5 py-2 bg-red-500 text-white text-xs font-medium rounded-lg hover:bg-red-600 transition-colors flex items-center gap-1.5 shadow-sm"
-                onClick={handleBatchDelete}
-                title={t("accounts.delete_selected", {
-                  count: selectedIds.size,
-                })}
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span className="hidden xl:inline">
-                  {t("accounts.delete_selected", { count: selectedIds.size })}
-                </span>
+        <div className="console-toolbar justify-between">
+          <div className="grid grid-cols-4 sm:flex sm:flex-wrap gap-1 w-full sm:w-auto" aria-label={t('accounts.all')}>
+            {(['all', 'pro', 'ultra', 'free'] as const).map(value => (
+              <button key={value} className={cn('console-tab !px-1 sm:!px-3 !text-xs sm:!text-sm', filter === value && 'active')} aria-pressed={filter === value} onClick={() => setFilter(value)}>
+                {t(`accounts.${value}`)} <span className="ml-1 text-xs tabular-nums opacity-70">{filterCounts[value]}</span>
               </button>
-              <button
-                className="px-2.5 py-2 bg-orange-500 text-white text-xs font-medium rounded-lg hover:bg-orange-600 transition-colors flex items-center gap-1.5 shadow-sm"
-                onClick={() => handleBatchToggleProxy(false)}
-                title={t("accounts.disable_proxy_selected", {
-                  count: selectedIds.size,
-                })}
-              >
-                <ToggleLeft className="w-3.5 h-3.5" />
-                <span className="hidden xl:inline">
-                  {t("accounts.disable_proxy_selected", {
-                    count: selectedIds.size,
-                  })}
-                </span>
-              </button>
-              <button
-                className="px-2.5 py-2 bg-green-500 text-white text-xs font-medium rounded-lg hover:bg-green-600 transition-colors flex items-center gap-1.5 shadow-sm"
-                onClick={() => handleBatchToggleProxy(true)}
-                title={t("accounts.enable_proxy_selected", {
-                  count: selectedIds.size,
-                })}
-              >
-                <ToggleRight className="w-3.5 h-3.5" />
-                <span className="hidden xl:inline">
-                  {t("accounts.enable_proxy_selected", {
-                    count: selectedIds.size,
-                  })}
-                </span>
-              </button>
-            </>
-          )}
-
-          <button
-            className={`px-2.5 py-2 bg-blue-500 text-white text-xs font-medium rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-1.5 shadow-sm ${isRefreshing ? "opacity-70 cursor-not-allowed" : ""}`}
-            onClick={handleRefreshClick}
-            disabled={isRefreshing}
-            title={
-              selectedIds.size > 0
-                ? t("accounts.refresh_selected", { count: selectedIds.size })
-                : t("accounts.refresh_all")
-            }
-          >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${isRefreshing ? "animate-spin" : ""}`}
-            />
-            <span className="hidden xl:inline">
-              {isRefreshing
-                ? t("common.loading")
-                : selectedIds.size > 0
-                  ? t("accounts.refresh_selected", { count: selectedIds.size })
-                  : t("accounts.refresh_all")}
-            </span>
-          </button>
-
-          <button
-            className={`px-2.5 py-2 bg-orange-500 text-white text-xs font-medium rounded-lg hover:bg-orange-600 transition-colors flex items-center gap-1.5 shadow-sm ${isWarmuping ? "opacity-70 cursor-not-allowed" : ""}`}
-            onClick={() => setIsWarmupConfirmOpen(true)}
-            disabled={isWarmuping}
-            title={
-              selectedIds.size > 0
-                ? t("accounts.warmup_selected", { count: selectedIds.size })
-                : t("accounts.warmup_all", "一键预热所有账号")
-            }
-          >
-            <Sparkles
-              className={`w-3.5 h-3.5 ${isWarmuping ? "animate-pulse" : ""}`}
-            />
-            <span className="hidden xl:inline">
-              {isWarmuping
-                ? t("common.loading")
-                : selectedIds.size > 0
-                  ? t("accounts.warmup_selected", { count: selectedIds.size })
-                  : t("accounts.warmup_all", "一键预热")}
-            </span>
-          </button>
-
-          <label className="flex items-center gap-2 cursor-pointer select-none px-2 py-2 border border-transparent hover:bg-gray-100 dark:hover:bg-base-200 rounded-lg transition-colors" title={t('accounts.show_all_quotas')}>
-            <span className="text-xs font-medium text-gray-600 dark:text-gray-300 hidden xl:inline">
-              {t('accounts.show_all_quotas')}
-            </span>
-            <input
-              type="checkbox"
-              className="toggle toggle-xs toggle-primary"
-              checked={showAllQuotas}
-              onChange={toggleShowAllQuotas}
-            />
-          </label>
-          <div className="w-px h-4 bg-gray-200 dark:bg-gray-700 self-center mx-1 shrink-0"></div>
-
-          <button
-            className="px-2.5 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-1.5"
-            onClick={handleImportJson}
-            title={t("accounts.import_json")}
-          >
-            <Upload className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">
-              {t("accounts.import_json")}
-            </span>
-          </button>
-
-          <button
-            className="px-2.5 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 text-xs font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-1.5"
-            onClick={handleExport}
-            title={
-              selectedIds.size > 0
-                ? t("accounts.export_selected", { count: selectedIds.size })
-                : t("common.export")
-            }
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">
-              {selectedIds.size > 0
-                ? t("accounts.export_selected", { count: selectedIds.size })
-                : t("common.export")}
-            </span>
-          </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-3 items-center">
+            <div className="flex gap-1">
+              <button className={cn('console-tab', quotaWindow === '5h' && 'active')} aria-pressed={quotaWindow === '5h'} onClick={() => setQuotaWindow('5h')} title={t('accounts.quota_window_5h')}><Clock size={14} />5H</button>
+              <button className={cn('console-tab', quotaWindow === 'weekly' && 'active')} aria-pressed={quotaWindow === 'weekly'} onClick={() => setQuotaWindow('weekly')}><Calendar size={14} />{t('accounts.quota_window_weekly_short')}</button>
+            </div>
+            <div className="flex gap-1">
+              <button className={cn('console-tab', viewMode === 'list' && 'active')} aria-pressed={viewMode === 'list'} aria-label={t('accounts.views.list')} onClick={() => setViewMode('list')}><List size={16} /></button>
+              <button className={cn('console-tab', viewMode === 'grid' && 'active')} aria-pressed={viewMode === 'grid'} aria-label={t('accounts.views.grid')} onClick={() => setViewMode('grid')}><LayoutGrid size={16} /></button>
+            </div>
+          </div>
         </div>
-      </div>
+        {selectedIds.size > 0 && (
+          <div className="console-toolbar border-t border-gray-100 dark:border-base-300 pt-3" aria-live="polite">
+            <span className="text-sm font-medium tabular-nums">{t('console.selected_accounts', { count: selectedIds.size, defaultValue: i18n.language.startsWith('zh') ? '已选 {{count}} 个账号' : '{{count}} accounts selected' })}</span>
+            <button className="console-button" onClick={() => handleBatchToggleProxy(true)}><ToggleRight size={16} />{t('accounts.enable_proxy_selected', { count: selectedIds.size })}</button>
+            <button className="console-button" onClick={() => handleBatchToggleProxy(false)}><ToggleLeft size={16} />{t('accounts.disable_proxy_selected', { count: selectedIds.size })}</button>
+            <button className="console-button text-red-600 dark:text-red-400" onClick={handleBatchDelete}><Trash2 size={16} />{t('accounts.delete_selected', { count: selectedIds.size })}</button>
+          </div>
+        )}
+      </section>
 
       {/* 账号列表内容区域 */}
-      <div className="flex-1 min-h-0 relative" ref={containerRef}>
+      <div className="flex-1 min-h-64 min-w-0 w-full relative" ref={containerRef}>
         {viewMode === "list" ? (
           <div className="h-full bg-white dark:bg-base-100 rounded-2xl shadow-sm border border-gray-100 dark:border-base-200 flex flex-col overflow-hidden">
-            <div className="flex-1 overflow-y-auto">
+            <div className="flex-1 min-w-0 overflow-auto">
               <AccountTable
                 accounts={paginatedAccounts}
                 selectedIds={selectedIds}
@@ -1268,11 +991,6 @@ function Accounts() {
         onCancel={() => setIsWarmupConfirmOpen(false)}
       />
 
-      {/* 账号详情弹窗 */}
-      <AccountDetailsDialog
-        account={detailsAccount}
-        onClose={() => setDetailsAccount(null)}
-      />
 
       {/* 账号错误详情弹窗 */}
       <AccountErrorDialog

@@ -31,7 +31,8 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
     const { t } = useTranslation();
     const [logs, setLogs] = useState<IpAccessLog[]>([]);
     const [total, setTotal] = useState(0);
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(false);
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(50);
     const [search, setSearch] = useState('');
@@ -39,6 +40,7 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
 
     const loadLogs = async () => {
         setLoading(true);
+        setLoadError(false);
         try {
             const res = await invoke<IpAccessLogResponse>('get_ip_access_logs', {
                 page,
@@ -49,6 +51,7 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
             setLogs(res.logs);
             setTotal(res.total);
         } catch (e) {
+            setLoadError(true);
             console.error('Failed to load logs', e);
         } finally {
             setLoading(false);
@@ -66,14 +69,15 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
     };
 
     return (
-        <div className="flex flex-col h-full bg-white dark:bg-base-100 rounded-xl">
+        <div className="flex flex-col h-full min-h-0 min-w-0">
             {/* Toolbar */}
-            <div className="p-5 border-b border-gray-100 dark:border-base-200 flex flex-wrap items-center gap-6">
-                <div className="relative flex-1 min-w-[200px] max-w-md">
+            <div className="console-toolbar p-4 border-b border-[var(--console-border)]">
+                <div className="relative flex-1 min-w-[180px] max-w-md">
                     <Search className="absolute left-3 top-2.5 text-gray-400" size={16} />
                     <input
                         type="text"
                         placeholder={t('security.logs.search_placeholder')}
+                        aria-label={t('security.logs.search_placeholder')}
                         className="input input-sm input-bordered w-full pl-9"
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
@@ -106,10 +110,11 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
                     </select>
                 </div>
             </div>
+            {loadError && <div role="alert" className="p-4 text-sm text-error">{t('common.load_failed')}</div>}
 
             {/* Table */}
-            <div className="flex-1 overflow-auto">
-                <table className="table table-xs w-full">
+            <div className="flex-1 min-h-0 min-w-0 overflow-auto" aria-busy={loading}>
+                <table className="table table-sm w-full min-w-[960px] text-sm">
                     <thead className="sticky top-0 bg-gray-100 dark:bg-base-200 z-10 shadow-sm text-gray-600 dark:text-gray-400">
                         <tr>
                             <th className="w-20">{t('security.logs.status')}</th>
@@ -145,7 +150,8 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
                                 <td className="text-xs text-red-500 truncate" title={log.block_reason}>{log.block_reason}</td>
                             </tr>
                         ))}
-                        {!loading && logs.length === 0 && (
+                        {loading && logs.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-gray-500" role="status">{t('common.loading')}</td></tr>}
+                        {!loading && !loadError && logs.length === 0 && (
                             <tr>
                                 <td colSpan={8} className="text-center py-10 text-gray-400">
                                     {t('security.logs.no_logs')}
@@ -157,7 +163,7 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
             </div>
 
             {/* Pagination */}
-            <div className="p-3 border-t border-gray-100 dark:border-base-200 flex items-center justify-between text-xs text-gray-500 bg-gray-50 dark:bg-base-200">
+            <div className="p-4 border-t border-[var(--console-border)] flex flex-wrap shrink-0 gap-3 items-center justify-between text-xs text-gray-500">
                 <span>{t('security.logs.total_records', { total })}</span>
                 <div className="flex gap-2">
                     <button

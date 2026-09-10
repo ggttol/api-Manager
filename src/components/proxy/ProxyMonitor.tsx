@@ -57,9 +57,9 @@ const LogTable: React.FC<LogTableProps> = ({
 }) => {
     return (
         <div
-            className="flex-1 overflow-y-auto overflow-x-auto bg-white dark:bg-base-100"
+            className="flex-1 min-h-0 min-w-0 overflow-auto"
         >
-            <table className="table table-xs w-full">
+            <table className="table table-sm w-full min-w-[1100px] text-sm">
                 <thead className="bg-gray-50 dark:bg-base-200 text-gray-500 sticky top-0 z-10">
                     <tr>
                         <th style={{ width: '60px' }}>{t('monitor.table.status')}</th>
@@ -79,6 +79,13 @@ const LogTable: React.FC<LogTableProps> = ({
                             key={log.id}
                             className="hover:bg-blue-50 dark:hover:bg-blue-900/20 cursor-pointer"
                             onClick={() => onLogClick(log)}
+                            tabIndex={0}
+                            onKeyDown={(event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                    event.preventDefault();
+                                    onLogClick(log);
+                                }
+                            }}
                         >
                             <td style={{ width: '60px' }}>
                                 <span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>
@@ -103,16 +110,16 @@ const LogTable: React.FC<LogTableProps> = ({
                                     </span>
                                 )}
                             </td>
-                            <td className="text-gray-600 dark:text-gray-400 truncate text-[10px]" style={{ width: '140px', maxWidth: '140px' }} title={log.account_email || ''}>
+                            <td className="text-gray-600 dark:text-gray-400 truncate text-xs" style={{ width: '140px', maxWidth: '140px' }} title={log.account_email || ''}>
                                 {log.account_email ? log.account_email.replace(/(.{3}).*(@.*)/, '$1***$2') : '-'}
                             </td>
                             <td className="truncate" style={{ width: '180px', maxWidth: '180px' }}>{log.url}</td>
-                            <td className="text-right text-[9px]" style={{ width: '90px' }}>
+                            <td className="text-right text-xs" style={{ width: '90px' }}>
                                 {log.input_tokens != null && <div>{t('monitor.input')}: {formatCompactNumber(log.input_tokens)}</div>}
                                 {log.output_tokens != null && <div>{t('monitor.output')}: {formatCompactNumber(log.output_tokens)}</div>}
                             </td>
                             <td className="text-right" style={{ width: '80px' }}>{log.duration}ms</td>
-                            <td className="text-right text-[10px]" style={{ width: '80px' }}>
+                            <td className="text-right text-xs" style={{ width: '80px' }}>
                                 {new Date(log.timestamp).toLocaleTimeString()}
                             </td>
                         </tr>
@@ -163,6 +170,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [totalCount, setTotalCount] = useState(0);
     const [loading, setLoading] = useState(false);
     const [loadingDetail, setLoadingDetail] = useState(false);
+    const [loadError, setLoadError] = useState(false);
 
     const uniqueAccounts = useMemo(() => {
         const emailSet = new Set<string>();
@@ -180,6 +188,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const loadData = async (page = 1, searchFilter = filter, accountEmailFilter = accountFilter) => {
         if (loading) return;
         setLoading(true);
+        setLoadError(false);
 
         try {
             // Add timeout control (10 seconds)
@@ -238,6 +247,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
             if (currentStats) setStats(currentStats);
         } catch (e: any) {
+            setLoadError(true);
             console.error("Failed to load proxy data", e);
             if (e.message === 'Request timeout') {
                 // Show timeout error to user
@@ -433,9 +443,9 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         if (!body) return <span className="text-gray-400 italic">{t('monitor.details.payload_empty')}</span>;
         try {
             const obj = JSON.parse(body);
-            return <pre className="text-[10px] font-mono whitespace-pre-wrap text-gray-700 dark:text-gray-300">{JSON.stringify(obj, null, 2)}</pre>;
+            return <pre className="text-xs font-mono whitespace-pre-wrap break-all text-gray-700 dark:text-gray-300">{JSON.stringify(obj, null, 2)}</pre>;
         } catch (e) {
-            return <pre className="text-[10px] font-mono whitespace-pre-wrap text-gray-700 dark:text-gray-300">{body}</pre>;
+            return <pre className="text-xs font-mono whitespace-pre-wrap break-all text-gray-700 dark:text-gray-300">{body}</pre>;
         }
     };
 
@@ -450,25 +460,24 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
 
     return (
-        <div className={`flex flex-col bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden ${className || 'flex-1'}`}>
-            <div className="p-3 border-b border-gray-100 dark:border-base-200 space-y-3 bg-gray-50/30 dark:bg-base-200/30">
-                <div className="flex items-center gap-4">
+        <div className={`console-panel !p-0 min-w-0 flex flex-col overflow-hidden ${className || 'flex-1'}`}>
+            <div className="p-4 border-b border-[var(--console-border)] space-y-4">
+                <div className="console-toolbar">
                     <button
                         onClick={toggleLogging}
-                        className={`btn btn-sm gap-2 px-4 border font-bold ${isLoggingEnabled
-                            ? 'bg-red-500 border-red-600 text-white animate-pulse'
-                            : 'bg-white dark:bg-base-200 border-gray-300 text-gray-600'
-                            }`}
+                        aria-pressed={isLoggingEnabled}
+                        className={`console-button ${isLoggingEnabled ? 'text-emerald-700 dark:text-emerald-400' : ''}`}
                     >
-                        <div className={`w-2.5 h-2.5 rounded-full ${isLoggingEnabled ? 'bg-white' : 'bg-gray-400'}`} />
+                        <div className={`w-2 h-2 rounded-full ${isLoggingEnabled ? 'bg-emerald-500' : 'bg-gray-400'}`} />
                         {isLoggingEnabled ? t('monitor.logging_status.active') : t('monitor.logging_status.paused')}
                     </button>
 
-                    <div className="relative flex-1">
+                    <div className="relative flex-1 min-w-[180px]">
                         <Search className="absolute left-2.5 top-2 text-gray-400" size={14} />
                         <input
                             type="text"
                             placeholder={t('monitor.filters.placeholder')}
+                            aria-label={t('monitor.filters.placeholder')}
                             className="input input-sm input-bordered w-full pl-9 text-xs"
                             value={filter}
                             onChange={(e) => setFilter(e.target.value)}
@@ -492,30 +501,31 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         </select>
                     </div>
 
-                    <div className="hidden lg:flex gap-4 text-[10px] font-bold uppercase">
+                    <div className="flex flex-wrap gap-4 text-xs font-medium">
                         <span className="text-blue-500">{formatCompactNumber(stats.total_requests)} {t('monitor.stats.total')}</span>
                         <span className="text-green-500">{formatCompactNumber(stats.success_count)} {t('monitor.stats.ok')}</span>
                         <span className="text-red-500">{formatCompactNumber(stats.error_count)} {t('monitor.stats.err')}</span>
                     </div>
 
-                    <button onClick={() => loadData(currentPage, filter)} className="btn btn-sm btn-ghost text-gray-400" title={t('common.refresh')}>
+                    <button onClick={() => loadData(currentPage, filter)} disabled={loading} className="console-button" title={t('common.refresh')}>
                         <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                     </button>
-                    <button onClick={clearLogs} className="btn btn-sm btn-ghost text-gray-400">
+                    <button onClick={clearLogs} className="console-button text-error" title={t('common.delete')}>
                         <Trash2 size={16} />
                     </button>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[10px] font-bold text-gray-400 uppercase">{t('monitor.filters.quick_filters')}</span>
+                    <span className="text-xs font-medium text-gray-500">{t('monitor.filters.quick_filters')}</span>
                     {quickFilters.map(q => (
-                        <button key={q.label} onClick={() => setFilter(q.value)} className={`px-2 py-0.5 rounded-full text-[10px] border ${filter === q.value ? 'bg-blue-500 text-white' : 'bg-white dark:bg-base-200 text-gray-500'}`}>
+                        <button key={q.label} onClick={() => setFilter(q.value)} aria-pressed={filter === q.value} className={`console-button !py-1 !px-3 ${filter === q.value ? 'console-button-primary' : ''}`}>
                             {q.label}
                         </button>
                     ))}
-                    {(filter || accountFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); }} className="text-[10px] text-blue-500"> {t('monitor.filters.reset')} </button>}
+                    {(filter || accountFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); }} className="console-button"> {t('monitor.filters.reset')} </button>}
                 </div>
             </div>
+            {loadError && <div role="alert" className="p-4 text-sm text-error">{t('common.load_failed')}</div>}
 
             <LogTable
                 logs={filteredLogs}
@@ -536,7 +546,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             />
 
             {/* Pagination Controls */}
-            <div className="flex items-center justify-between px-4 py-3 bg-gray-50 dark:bg-base-200 border-t border-gray-200 dark:border-base-300 text-xs">
+            <div className="flex flex-wrap shrink-0 items-center justify-between gap-3 px-4 py-3 border-t border-[var(--console-border)] text-xs">
                 <div className="flex items-center gap-2 whitespace-nowrap">
                     <span className="text-gray-500">{t('common.per_page')}</span>
                     <select
@@ -553,6 +563,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 <div className="flex items-center gap-3">
                     <button
                         onClick={() => goToPage(currentPage - 1)}
+                        aria-label={t('security.logs.prev_page')}
                         disabled={currentPage <= 1 || loading}
                         className="btn btn-xs btn-ghost"
                     >
@@ -563,6 +574,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     </span>
                     <button
                         onClick={() => goToPage(currentPage + 1)}
+                        aria-label={t('security.logs.next_page')}
                         disabled={currentPage >= totalPages || loading}
                         className="btn btn-xs btn-ghost"
                     >
@@ -586,7 +598,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                 <span className="font-mono font-bold text-gray-900 dark:text-base-content text-sm">{selectedLog.method}</span>
                                 <span className="text-xs text-gray-500 dark:text-gray-400 font-mono truncate max-w-md hidden sm:inline">{selectedLog.url}</span>
                             </div>
-                            <button onClick={() => setSelectedLog(null)} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300"><X size={18} /></button>
+                            <button onClick={() => setSelectedLog(null)} aria-label={t('common.close')} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300"><X size={18} /></button>
                         </div>
 
                         {/* Modal Content */}
@@ -639,7 +651,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                 {selectedLog.account_email && (
                                     <div className="mt-5 pt-5 border-t border-gray-200 dark:border-base-300">
                                         <span className="block text-gray-500 dark:text-gray-400 uppercase font-black text-[10px] tracking-widest mb-2">{t('monitor.details.account_used')}</span>
-                                        <span className="font-mono font-semibold text-gray-900 dark:text-base-content text-xs">{selectedLog.account_email}</span>
+                                        <span className="font-mono font-semibold break-all text-gray-900 dark:text-base-content text-xs">{selectedLog.account_email}</span>
                                     </div>
                                 )}
                             </div>

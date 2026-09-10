@@ -122,7 +122,7 @@ const PinnedQuotaModels = ({ config, onChange }: PinnedQuotaModelsProps) => {
                                     flex items-center justify-between p-2 rounded-lg border cursor-pointer transition-all duration-200
                                     ${isSelected
                                         ? 'bg-indigo-50 dark:bg-indigo-900/10 border-indigo-200 dark:border-indigo-800/50 text-indigo-700 dark:text-indigo-400'
-                                        : 'bg-gray-50/50 dark:bg-base-200/50 border-gray-100 dark:border-base-300/50 text-gray-500 hover:border-gray-200 dark:hover:border-base-300'}
+                                        : 'bg-gray-50/50 dark:bg-base-200 border-gray-100 dark:border-base-300 text-gray-500 hover:border-gray-200 dark:hover:border-base-300'}
                                 `}
                             >
                                 <div className="flex flex-col min-w-0">

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, Copy, ExternalLink, RefreshCw, ShieldCheck, Terminal, Upload, Users } from 'lucide-react';
+import { AlertTriangle, Check, Copy, ExternalLink, Plus, RefreshCw, Search, ShieldCheck, Terminal, Upload, Users } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { AccountPoolTabs, PageHeader } from '../components/common/ConsolePage';
 import ModalDialog from '../components/common/ModalDialog';
 import { showToast } from '../components/common/ToastContainer';
 import { copyToClipboard } from '../utils/clipboard';
@@ -44,7 +46,7 @@ type AccountQuotaState = {
     error?: string;
 };
 type Model = { id: string; name: string };
-const panel = 'bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 p-5';
+const panel = 'console-panel';
 const controls = '[&_.btn]:rounded-lg [&_.btn]:border [&_.btn]:border-gray-200 [&_.btn]:px-3 [&_.btn]:transition-colors [&_.btn:disabled]:opacity-40 [&_.btn:disabled]:cursor-not-allowed [&_.btn-primary]:bg-blue-600 [&_.btn-primary]:text-white [&_.btn-primary]:border-blue-600 [&_.input]:rounded-lg [&_.input]:border [&_.input]:border-gray-300 [&_.input]:px-3 [&_.file-input]:rounded-lg [&_.file-input]:border [&_.file-input]:border-gray-300 [&_.select]:rounded-lg [&_.select]:border [&_.select]:border-gray-300 [&_.select]:px-3 dark:[&_.btn]:border-gray-600 dark:[&_.input]:border-gray-600 dark:[&_.file-input]:border-gray-600 dark:[&_.select]:border-gray-600';
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 const aborted = (error: unknown) => error instanceof DOMException && error.name === 'AbortError';
@@ -106,6 +108,11 @@ export default function Codex() {
     const [label, setLabel] = useState('');
     const [fileSelected, setFileSelected] = useState(false);
     const fileInput = useRef<HTMLInputElement>(null);
+    const [addOpen, setAddOpen] = useState(false);
+    const addDialog = useRef<HTMLDialogElement>(null);
+    const usageDialog = useRef<HTMLDialogElement>(null);
+    const [search, setSearch] = useState('');
+    const [importError, setImportError] = useState('');
     const [busy, setBusy] = useState('');
     const busyRef = useRef(false);
     const mounted = useRef(false);
@@ -239,6 +246,18 @@ export default function Codex() {
     }, [deviceOpen]);
 
     useEffect(() => {
+        const dialog = addDialog.current;
+        if (addOpen && dialog && !dialog.open) dialog.showModal();
+        if (!addOpen && dialog?.open) dialog.close();
+    }, [addOpen]);
+
+    useEffect(() => {
+        const dialog = usageDialog.current;
+        if (usage && dialog && !dialog.open) dialog.showModal();
+        if (!usage && dialog?.open) dialog.close();
+    }, [!!usage]);
+
+    useEffect(() => {
         if (!device || device.status !== 'pending') return;
         const timer = window.setInterval(() => setNow(Date.now()), 1000);
         return () => window.clearInterval(timer);
@@ -309,6 +328,7 @@ export default function Codex() {
     });
 
     const importAccount = () => run('import', async () => {
+        setImportError('');
         let file: File | null = fileInput.current?.files?.[0] ?? null;
         let auth: Record<string, unknown> | null = null;
         let text = '';
@@ -334,7 +354,11 @@ export default function Codex() {
             await call('codex_import_account', { auth_json: auth, ...(label.trim() ? { label: label.trim() } : {}) });
             auth = null;
             setLabel('');
+            setAddOpen(false);
             showToast(t('codex.imported'), 'success');
+        } catch (error) {
+            if (!aborted(error) && mounted.current) setImportError(errorMessage(error));
+            throw error;
         } finally {
             text = '';
             auth = null;
@@ -347,6 +371,7 @@ export default function Codex() {
 
     const startDevice = () => {
         if (deviceOpen || busyRef.current) return;
+        setAddOpen(false);
         void run('device', async () => {
             setDeviceStarting(true);
             setDeviceError('');
@@ -421,48 +446,42 @@ export default function Codex() {
     const config = selectedModel ? `model = ${JSON.stringify(selectedModel.id)}\nmodel_provider = "api_manager_codex"\n\n[model_providers.api_manager_codex]\nname = "API Manager Codex"\nbase_url = ${JSON.stringify(`${window.location.origin}/codex/v1`)}\nenv_key = "API_MANAGER_KEY"\nwire_api = "responses"\nsupports_websockets = false\nrequires_openai_auth = false` : '';
     const remaining = device ? Math.max(0, Math.ceil(device.expires_at - now / 1000)) : 0;
 
-    if (desktop) return <div className="max-w-7xl mx-auto p-5"><div className={`${panel} flex items-start gap-3`}><Terminal className="shrink-0 text-blue-500" /><div><h1 className="text-xl font-bold">{t('codex.title')}</h1><p className="mt-2 text-sm text-gray-500">{t('codex.server_only')}</p></div></div></div>;
+    if (desktop) return <div className="console-page console-page-scroll space-y-5"><PageHeader title={t('console.account_pool', { defaultValue: i18n.language.startsWith('zh') ? '账号池' : 'Account pool' })} description={t('codex.subtitle')} /><AccountPoolTabs /><div className={`${panel} flex items-start gap-3`}><Terminal className="shrink-0 text-blue-500" /><div><h2 className="text-lg font-semibold">{t('codex.title')}</h2><p className="mt-2 text-sm console-muted">{t('codex.server_only')}</p></div></div></div>;
 
     return (
-        <div className={`h-full overflow-y-auto p-4 sm:p-5 space-y-5 max-w-7xl mx-auto w-full ${controls}`}>
-            <header className="flex flex-wrap items-start justify-between gap-3">
-                <div><h1 className="text-2xl font-bold flex items-center gap-2"><Terminal className="text-blue-500" />{t('codex.title')}</h1><p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{t('codex.subtitle')}</p></div>
-                <span className="badge badge-outline gap-1"><ShieldCheck size={14} />{t('codex.server_badge')}</span>
-            </header>
-            <div role={insecure ? 'alert' : undefined} className={`rounded-xl border p-4 flex items-start gap-3 text-sm ${insecure ? 'border-amber-300 bg-amber-50 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200' : 'border-blue-100 bg-blue-50 text-blue-900 dark:bg-blue-950/20 dark:text-blue-200'}`}>
-                <AlertTriangle size={20} className="shrink-0 mt-0.5" /><div>{insecure && <strong className="block mb-1">{t('codex.insecure_title')}</strong>}{t('codex.security_warning')}</div>
+        <div className={`console-page console-page-scroll space-y-5 ${controls}`}>
+            <PageHeader
+                title={t('console.account_pool', { defaultValue: i18n.language.startsWith('zh') ? '账号池' : 'Account pool' })}
+                description={t('codex.subtitle')}
+                actions={<button className="console-button console-button-primary" onClick={() => setAddOpen(true)}><Plus size={16} />{t('codex.add_account')}</button>}
+            />
+            <AccountPoolTabs />
+            <div role={insecure ? 'alert' : undefined} className={`rounded-xl border px-4 py-3 flex flex-wrap items-center gap-2 text-sm ${insecure ? 'border-amber-300 bg-amber-50 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200' : 'border-[var(--console-border)] bg-[var(--console-surface)] text-[var(--console-muted)]'}`}>
+                {insecure ? <AlertTriangle size={16} className="shrink-0" /> : <ShieldCheck size={16} className="shrink-0" />}
+                <span className="flex-1">{insecure ? t('codex.insecure_title') : t('console.codex_secure_notice', { defaultValue: i18n.language.startsWith('zh') ? '凭据保存在服务器端。仅在可信服务器和安全连接下导入。' : 'Credentials stay on the server. Import only over a secure connection to a trusted server.' })}</span>
+                <span className="text-xs">{t('codex.server_badge')}</span>
             </div>
-            <section className={panel} aria-labelledby="codex-add-title">
-                <h2 id="codex-add-title" className="text-lg font-semibold">{t('codex.add_account')}</h2>
-                <div className="grid lg:grid-cols-2 gap-6 mt-4">
-                    <form onSubmit={event => { event.preventDefault(); void importAccount(); }} className="space-y-3">
-                        <p className="text-sm text-gray-500 dark:text-gray-400">{t('codex.import_help')}</p>
-                        <label className="block text-sm"><span>{t('codex.label')}</span><input value={label} onChange={event => setLabel(event.target.value)} maxLength={200} disabled={!!busy} className="input input-bordered input-sm w-full mt-1" autoComplete="off" /></label>
-                        <label className="block text-sm"><span>{t('codex.auth_file')}</span><input ref={fileInput} type="file" accept=".json,application/json" disabled={!!busy} onChange={event => setFileSelected(!!event.target.files?.length)} className="file-input file-input-bordered file-input-sm w-full mt-1" /></label>
-                        <button type="submit" className="btn btn-primary btn-sm gap-2" disabled={!fileSelected || !!busy}><Upload size={15} />{busy === 'import' ? t('common.loading') : t('codex.import')}</button>
-                    </form>
-                    <div className="lg:border-l lg:pl-6 border-gray-100 dark:border-base-200 space-y-3"><h3 className="font-medium">{t('codex.device_title')}</h3><p className="text-sm text-gray-500 dark:text-gray-400">{t('codex.device_help')}</p><button className="btn btn-outline btn-sm" disabled={!!busy || deviceOpen} onClick={startDevice}>{t('codex.device_start')}</button></div>
-                </div>
-            </section>
             <section className={panel} aria-labelledby="codex-accounts-title">
-                <div className="flex items-center justify-between gap-2"><h2 id="codex-accounts-title" className="text-lg font-semibold flex items-center gap-2"><Users size={20} />{t('codex.accounts')} <span className="badge badge-ghost">{accounts.accounts.length}</span></h2><button className="btn btn-ghost btn-sm gap-1" disabled={accountsLoading || !!busy} onClick={() => void loadAccounts()}><RefreshCw size={15} className={accountsLoading ? 'animate-spin' : ''} />{t('common.refresh')}</button></div>
+                <div className="console-toolbar justify-between"><div><h2 id="codex-accounts-title" className="text-lg font-semibold flex items-center gap-2"><Users size={20} />{t('codex.accounts')} <span className="text-sm console-muted tabular-nums">{accounts.accounts.length}</span></h2><p className="text-xs console-muted mt-1">{t('common.enabled')}: {accounts.accounts.filter(account => account.enabled).length} · {t('common.disabled')}: {accounts.accounts.filter(account => !account.enabled).length}</p></div><button className="console-button" disabled={accountsLoading || !!busy} onClick={() => void loadAccounts()}><RefreshCw size={15} className={accountsLoading ? 'animate-spin' : ''} />{t('common.refresh')}</button></div>
+                {accounts.accounts.length > 0 && <div className="relative mt-4"><Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 console-muted" /><input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label={t('accounts.search_placeholder')} placeholder={t('accounts.search_placeholder')} className="w-full rounded-lg border border-[var(--console-border)] bg-transparent pl-9 pr-3 py-2 text-sm" /></div>}
                 {accountsError && <p role="alert" className="text-error text-sm mt-3 break-words">{accountsError}</p>}
-                {accountsLoading && accounts.accounts.length === 0 ? <p role="status" className="py-8 text-center text-gray-500">{t('common.loading')}</p> : accounts.accounts.length === 0 && !accountsError ? <div className="py-8 text-center"><p className="font-medium">{t('codex.no_accounts')}</p><p className="text-sm text-gray-500 mt-1">{t('codex.no_accounts_help')}</p></div> : null}
+                {accountsLoading && accounts.accounts.length === 0 ? <p role="status" className="py-8 text-center console-muted">{t('common.loading')}</p> : accounts.accounts.length === 0 && !accountsError ? <div className="py-10 text-center"><Users size={32} className="mx-auto mb-3 console-muted" /><p className="font-medium">{t('codex.no_accounts')}</p><p className="text-sm console-muted mt-1">{t('console.codex_empty_help', { defaultValue: i18n.language.startsWith('zh') ? '导入 auth.json 或使用设备登录来添加订阅账号。' : 'Import auth.json or use device sign-in to add a subscription account.' })}</p><button className="console-button console-button-primary mt-4" onClick={() => setAddOpen(true)}><Plus size={16} />{t('codex.add_account')}</button></div> : null}
+                {search && !accounts.accounts.some(account => `${account.label} ${account.email ?? ''} ${account.id}`.toLowerCase().includes(search.toLowerCase())) && <p role="status" className="py-8 text-center console-muted">{t('console.account_search_empty', { defaultValue: i18n.language.startsWith('zh') ? '没有匹配的账号。请尝试其他搜索条件。' : 'No matching accounts. Try another search.' })}</p>}
                 <div className="grid xl:grid-cols-2 gap-4 mt-4">
-                    {accounts.accounts.map(account => {
+                    {accounts.accounts.filter(account => `${account.label} ${account.email ?? ''} ${account.id}`.toLowerCase().includes(search.toLowerCase())).map(account => {
                         const quota = accountQuotas[account.id];
                         const quotaWindows = quota?.data ? [
                             { key: 'five-hour', label: t('codex.five_hour_limit'), window: quota.data.fiveHour },
                             { key: 'weekly', label: t('codex.weekly_limit'), window: quota.data.weekly },
                         ].filter((item): item is { key: string; label: string; window: RateLimitWindow } => item.window !== null) : [];
-                        return <article key={account.id} className="border border-gray-200 dark:border-base-300 rounded-xl p-4 min-w-0">
+                        return <article key={account.id} className="border border-[var(--console-border)] bg-[var(--console-surface)] rounded-xl p-4 sm:p-5 min-w-0">
                         <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="font-semibold break-words">{account.label || account.email || account.id}</h3>{account.email && account.email !== account.label && <p className="text-sm text-gray-500 break-all">{account.email}</p>}</div><div className="flex flex-wrap gap-1">{accounts.active_account_id === account.id && <span className="badge badge-primary badge-outline gap-1"><Check size={12} />{t('codex.preferred')}</span>}<span className={`badge ${account.enabled ? 'badge-success badge-outline' : 'badge-ghost'}`}>{t(account.enabled ? 'common.enabled' : 'common.disabled')}</span></div></div>
                         <dl className="text-xs grid grid-cols-1 sm:grid-cols-2 gap-2 mt-4 text-gray-500 dark:text-gray-400"><div><dt>{t('codex.plan')}</dt><dd className="text-base-content mt-0.5">{account.plan_type || t('codex.not_available')}</dd></div><div><dt>{t('codex.expires')}</dt><dd className="text-base-content mt-0.5">{date(account.expires_at)}</dd></div><div><dt>{t('codex.last_used')}</dt><dd className="text-base-content mt-0.5">{date(account.last_used_at)}</dd></div></dl>
                         <div className="mt-4">
                             {quota?.loading ? <div role="status">
                                 <div className="h-24 animate-pulse rounded-lg bg-gray-100 dark:bg-base-200" />
                             </div> : quota?.data ? <div className={`grid gap-3 ${quotaWindows.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1'}`}>
-                                {quotaWindows.map(({ key, label, window }) => <div key={key} className="rounded-lg border border-gray-100 bg-gray-50/70 p-3 dark:border-base-300 dark:bg-base-200/60">
+                                {quotaWindows.map(({ key, label, window }) => <div key={key} className="rounded-lg border border-gray-100 bg-gray-50/70 p-3 dark:border-base-300 dark:bg-base-200">
                                     <div className="flex items-center justify-between gap-2 text-xs">
                                         <span className="font-medium text-gray-700 dark:text-gray-200">{label}</span>
                                         <span className="font-semibold text-emerald-600 dark:text-emerald-400">{t('codex.remaining_percent', { percent: window.remainingPercent })}</span>
@@ -478,26 +497,54 @@ export default function Codex() {
                             </div> : quota?.error ? <p className="text-xs text-error break-words">{t('codex.quota_load_failed')}</p> : null}
                         </div>
                         {account.last_error && <p className="mt-3 text-xs text-error break-words">{account.last_error}</p>}
-                        <div className="flex flex-wrap gap-2 mt-4" aria-busy={busy === account.id}>
-                            <button className="btn btn-xs btn-outline" disabled={!!busy || !account.enabled || accounts.active_account_id === account.id} onClick={() => void mutate('codex_activate_account', account)}>{t('codex.activate')}</button>
-                            <button className="btn btn-xs btn-ghost" disabled={!!busy} onClick={() => void mutate('codex_update_account', account, { enabled: !account.enabled })}>{t(account.enabled ? 'codex.disable' : 'codex.enable')}</button>
-                            <button className="btn btn-xs btn-ghost" disabled={!!busy} onClick={() => void mutate('codex_refresh_account', account)}>{t('codex.refresh_auth')}</button>
-                            <button className="btn btn-xs btn-ghost" disabled={!!busy} onClick={() => void loadUsage(account)}>{t('codex.usage')}</button>
-                            <button className="btn btn-xs btn-ghost" disabled={!!busy} onClick={() => { setEditing(account); setEditLabel(account.label); }}>{t('codex.rename')}</button>
-                            <button className="btn btn-xs btn-ghost text-error" disabled={!!busy} onClick={() => setDeleting(account)}>{t('common.delete')}</button>
+                        <div className="flex flex-wrap items-center gap-2 mt-4 pt-4 border-t border-[var(--console-border)]" aria-busy={busy === account.id}>
+                            <button className="console-button" disabled={!!busy || !account.enabled || accounts.active_account_id === account.id} onClick={() => void mutate('codex_activate_account', account)}>{accounts.active_account_id === account.id ? <><Check size={14} />{t('codex.preferred')}</> : t('codex.activate')}</button>
+                            <button className="console-button" disabled={!!busy} onClick={() => void loadUsage(account)}>{t('codex.usage')}</button>
+                            <details className="relative ml-auto">
+                                <summary className="console-button cursor-pointer">{t('console.more_actions', { defaultValue: i18n.language.startsWith('zh') ? '更多操作' : 'More actions' })}</summary>
+                                <div className="absolute right-0 bottom-full mb-2 z-20 w-52 bg-[var(--console-surface)] border border-[var(--console-border)] shadow-lg rounded-xl p-2 flex flex-col gap-1">
+                                    <button className="console-button justify-start" disabled={!!busy} onClick={() => void mutate('codex_update_account', account, { enabled: !account.enabled })}>{t(account.enabled ? 'codex.disable' : 'codex.enable')}</button>
+                                    <button className="console-button justify-start" disabled={!!busy} onClick={() => void mutate('codex_refresh_account', account)}>{t('codex.refresh_auth')}</button>
+                                    <button className="console-button justify-start" disabled={!!busy} onClick={() => { setEditing(account); setEditLabel(account.label); }}>{t('codex.rename')}</button>
+                                    <button className="console-button justify-start text-red-600 dark:text-red-400" disabled={!!busy} onClick={() => setDeleting(account)}>{t('common.delete')}</button>
+                                </div>
+                            </details>
                         </div>
                         </article>;
                     })}
                 </div>
             </section>
-            {usage && <section className={panel} aria-labelledby="codex-usage-title"><div className="flex flex-wrap justify-between gap-2"><h2 id="codex-usage-title" className="text-lg font-semibold break-all">{t('codex.usage')} · {usage.account.label || usage.account.email || usage.account.id}</h2><div className="flex gap-2"><button className="btn btn-sm btn-ghost" disabled={usage.loading} onClick={() => void loadUsage(usage.account)}>{t('common.refresh')}</button><button className="btn btn-sm btn-ghost" onClick={() => { usageLoad.current?.abort(); setUsage(null); }}>{t('common.close')}</button></div></div><p className="text-sm text-gray-500 my-3">{t('codex.usage_help')}</p>{usage.loading ? <p role="status">{t('common.loading')}</p> : usage.error ? <p role="alert" className="text-error break-words">{usage.error}</p> : <pre className="bg-gray-50 dark:bg-base-200 rounded-lg p-4 text-xs overflow-auto max-h-96">{JSON.stringify(usage.data, null, 2)}</pre>}</section>}
-            <section className={panel} aria-labelledby="codex-connect-title"><div className="flex items-center justify-between gap-2"><h2 id="codex-connect-title" className="text-lg font-semibold">{t('codex.connect')}</h2><button className="btn btn-sm btn-ghost gap-1" disabled={modelsLoading || !hasEnabled || !!busy} onClick={() => void loadModels()}><RefreshCw size={15} className={modelsLoading ? 'animate-spin' : ''} />{t('codex.refresh_models')}</button></div><p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('codex.connect_help')}</p>
+            <dialog ref={usageDialog} className="modal" aria-labelledby="codex-usage-title" onCancel={event => { event.preventDefault(); usageLoad.current?.abort(); setUsage(null); }}>
+                <div className="modal-box bg-[var(--console-surface)] text-[var(--console-text)] max-w-3xl">
+                    <div className="flex flex-wrap justify-between gap-3"><h2 id="codex-usage-title" className="text-lg font-semibold break-all">{t('codex.usage')} · {usage?.account.label || usage?.account.email || usage?.account.id}</h2><button className="console-button" onClick={() => { usageLoad.current?.abort(); setUsage(null); }}>{t('common.close')}</button></div>
+                    <p className="text-sm console-muted my-3">{t('codex.usage_help')}</p>
+                    {usage?.loading ? <p role="status">{t('common.loading')}</p> : usage?.error ? <p role="alert" className="text-error break-words">{usage.error}</p> : <pre className="bg-[var(--console-surface-muted)] rounded-lg p-4 text-xs overflow-auto max-h-96">{JSON.stringify(usage?.data, null, 2)}</pre>}
+                    <div className="modal-action"><button className="console-button" disabled={usage?.loading} onClick={() => { if (usage) void loadUsage(usage.account); }}><RefreshCw size={15} />{t('common.refresh')}</button></div>
+                </div>
+            </dialog>
+            <details className={panel}>
+                <summary id="codex-connect-title" className="cursor-pointer font-semibold">{t('codex.connect')}</summary>
+                <div className="flex flex-wrap items-center justify-between gap-3 mt-4"><Link className="text-sm text-blue-600 dark:text-blue-400 underline underline-offset-4" to="/api-guide">{t('console.open_integration_guide', { defaultValue: i18n.language.startsWith('zh') ? '查看接入指南' : 'Open integration guide' })}</Link><button className="console-button" disabled={modelsLoading || !hasEnabled || !!busy} onClick={() => void loadModels()}><RefreshCw size={15} className={modelsLoading ? 'animate-spin' : ''} />{t('codex.refresh_models')}</button></div><p className="text-sm console-muted mt-2">{t('codex.connect_help')}</p>
                 {!hasEnabled ? <p className="text-sm mt-4">{t('codex.models_need_account')}</p> : modelsLoading ? <p role="status" className="text-sm mt-4">{t('common.loading')}</p> : modelsError ? <p role="alert" className="text-sm text-error mt-4 break-words">{modelsError}</p> : models.length === 0 ? <p className="text-sm mt-4">{t('codex.no_models')}</p> : <>
                     <label className="block text-sm mt-4 max-w-lg"><span>{t('codex.model')}</span><select className="select select-bordered select-sm w-full mt-1" value={model} onChange={event => setModel(event.target.value)}>{models.map(item => <option key={item.id} value={item.id}>{item.name} · {item.id}</option>)}</select></label>
                     <div className="mt-4 flex justify-between items-center gap-2"><code className="text-xs">~/.codex/config.toml</code><button className="btn btn-sm btn-ghost gap-1" disabled={!config} onClick={() => void copy(config)}><Copy size={14} />{t('common.copy')}</button></div><pre className="bg-gray-50 dark:bg-base-200 rounded-lg p-4 text-xs overflow-x-auto mt-2">{config}</pre>
                 </>}
                 <p className="text-sm mt-4">{t('codex.gateway_key_help')}</p><pre className="bg-gray-50 dark:bg-base-200 rounded-lg p-4 text-xs overflow-x-auto mt-2">{'export API_MANAGER_KEY=\'<YOUR_GATEWAY_API_KEY>\'\ncodex'}</pre><p className="text-xs text-gray-500 dark:text-gray-400 mt-3">{t('codex.transport_help')}</p>
-            </section>
+            </details>
+            <dialog ref={addDialog} className="modal" aria-labelledby="codex-add-title" onCancel={event => { event.preventDefault(); if (!busyRef.current) { setAddOpen(false); if (fileInput.current) fileInput.current.value = ''; setFileSelected(false); } }}>
+                <div className="modal-box bg-[var(--console-surface)] text-[var(--console-text)] max-w-2xl">
+                    <div className="flex items-start justify-between gap-3"><h2 id="codex-add-title" className="text-xl font-semibold">{t('codex.add_account')}</h2><button className="console-button" disabled={!!busy} onClick={() => { setAddOpen(false); if (fileInput.current) fileInput.current.value = ''; setFileSelected(false); }}>{t('common.close')}</button></div>
+                    <div className="rounded-lg bg-amber-50 dark:bg-amber-950/30 text-amber-900 dark:text-amber-200 p-3 text-sm my-5 flex items-start gap-2"><AlertTriangle size={18} className="shrink-0 mt-0.5" /><p>{insecure && <strong className="block mb-1">{t('codex.insecure_title')}</strong>}{t('codex.security_warning')}</p></div>
+                    <form onSubmit={event => { event.preventDefault(); void importAccount(); }} className="space-y-4">
+                        <p className="text-sm console-muted">{t('codex.import_help')}</p>
+                        {importError && <p role="alert" className="text-sm text-error break-words">{importError}</p>}
+                        <label className="block text-sm"><span>{t('codex.label')}</span><input value={label} onChange={event => setLabel(event.target.value)} maxLength={200} disabled={!!busy} className="input input-bordered w-full mt-1" autoComplete="off" /></label>
+                        <label className="block text-sm"><span>{t('codex.auth_file')}</span><input ref={fileInput} type="file" accept=".json,application/json" disabled={!!busy} onChange={event => setFileSelected(!!event.target.files?.length)} className="file-input file-input-bordered w-full mt-1" /></label>
+                        <button type="submit" className="console-button console-button-primary" disabled={!fileSelected || !!busy}><Upload size={15} />{busy === 'import' ? t('common.loading') : t('codex.import')}</button>
+                    </form>
+                    <div className="mt-6 pt-5 border-t border-[var(--console-border)] space-y-3"><h3 className="font-medium">{t('codex.device_title')}</h3><p className="text-sm console-muted">{t('codex.device_help')}</p><button className="console-button" disabled={!!busy || deviceOpen} onClick={startDevice}>{t('codex.device_start')}</button></div>
+                </div>
+            </dialog>
             <ModalDialog isOpen={!!deleting} title={t('codex.delete_title')} message={t('codex.delete_confirm', { account: deleting?.label || deleting?.email || deleting?.id })} type="confirm" isDestructive confirmText={busy ? t('common.loading') : t('common.delete')} onConfirm={() => { if (deleting) void mutate('codex_delete_account', deleting); }} onCancel={() => { if (!busyRef.current) setDeleting(null); }} />
             <ModalDialog isOpen={!!editing} title={t('codex.rename')} type="confirm" confirmText={busy ? t('common.loading') : t('common.save')} onConfirm={() => { if (editing) void mutate('codex_update_account', editing, { label: editLabel.trim() }); }} onCancel={() => { if (!busyRef.current) setEditing(null); }}><label className="block text-sm">{t('codex.label')}<input value={editLabel} maxLength={200} disabled={!!busy} onChange={event => setEditLabel(event.target.value)} className="input input-bordered input-sm w-full mt-2" autoComplete="off" /></label></ModalDialog>
             <dialog ref={deviceDialog} className="modal" aria-labelledby="codex-device-title" onCancel={event => { event.preventDefault(); closeDevice(); }}>

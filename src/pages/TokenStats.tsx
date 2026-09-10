@@ -1,8 +1,9 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { request as invoke } from '../utils/request';
 import { useTranslation } from 'react-i18next';
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import { Clock, Calendar, CalendarDays, Users, Zap, TrendingUp, RefreshCw, Cpu } from 'lucide-react';
+import { PageHeader } from '../components/common/ConsolePage';
 
 interface TokenStatsAggregated {
     period: string;
@@ -77,7 +78,7 @@ const shortenModelName = (model: string): string => {
 };
 
 const TokenStats: React.FC = () => {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
     const [timeRange, setTimeRange] = useState<TimeRange>('daily');
     const [viewMode, setViewMode] = useState<ViewMode>('model');
     const [chartData, setChartData] = useState<TokenStatsAggregated[]>([]);
@@ -89,9 +90,12 @@ const TokenStats: React.FC = () => {
     const [allAccounts, setAllAccounts] = useState<string[]>([]);
     const [summary, setSummary] = useState<TokenStatsSummary | null>(null);
     const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(false);
+    const [showAllSeries, setShowAllSeries] = useState(false);
 
     const fetchData = async () => {
         setLoading(true);
+        setLoadError(false);
         try {
             let hours = 24;
             let data: TokenStatsAggregated[] = [];
@@ -168,6 +172,7 @@ const TokenStats: React.FC = () => {
             setModelData(models_stats);
             setSummary(summaryData);
         } catch (error) {
+            setLoadError(true);
             console.error('Failed to fetch token stats:', error);
         } finally {
             setLoading(false);
@@ -178,12 +183,49 @@ const TokenStats: React.FC = () => {
         fetchData();
     }, [timeRange]);
 
-    const pieData = accountData.slice(0, 8).map((account, index) => ({
-        name: account.account_email.split('@')[0] + '...',
-        value: account.total_tokens,
-        fullEmail: account.account_email,
-        color: COLORS[index % COLORS.length]
-    }));
+    const otherLabel = t('console.stats_other', { defaultValue: i18n.language.startsWith('zh') ? '其他' : 'Other' });
+    const trend = useMemo(() => {
+        const rows = viewMode === 'model' ? modelTrendData : accountTrendData;
+        const names = viewMode === 'model' ? allModels : allAccounts;
+        const totals: Record<string, number> = Object.create(null);
+        names.forEach(name => { totals[name] = 0; });
+        rows.forEach(row => names.forEach(name => { totals[name] += row[name] || 0; }));
+        const ranked = [...names].sort((a, b) => totals[b] - totals[a]);
+        const visible = showAllSeries ? ranked : ranked.slice(0, 6);
+        const hidden = showAllSeries ? [] : ranked.slice(6);
+        const palette = viewMode === 'model' ? MODEL_COLORS : COLORS;
+        const series = visible.map((name, index) => ({ name, color: palette[index % palette.length] }));
+        if (hidden.length) series.push({ name: otherLabel, color: '#94a3b8' });
+        return {
+            count: names.length,
+            series,
+            rows: rows.map(row => ({
+                period: row.period,
+                values: [
+                    ...visible.map(name => row[name] || 0),
+                    ...(hidden.length ? [hidden.reduce((sum, name) => sum + (row[name] || 0), 0)] : [])
+                ]
+            }))
+        };
+    }, [viewMode, modelTrendData, accountTrendData, allModels, allAccounts, showAllSeries, otherLabel]);
+
+    const pieData = useMemo(() => {
+        const ranked = [...accountData].sort((a, b) => b.total_tokens - a.total_tokens);
+        const visible = showAllSeries ? ranked : ranked.slice(0, 6);
+        const entries = visible.map((account, index) => ({
+            name: account.account_email,
+            value: account.total_tokens,
+            fullEmail: account.account_email,
+            color: COLORS[index % COLORS.length]
+        }));
+        if (!showAllSeries && ranked.length > 6) entries.push({
+            name: otherLabel,
+            value: ranked.slice(6).reduce((sum, account) => sum + account.total_tokens, 0),
+            fullEmail: otherLabel,
+            color: '#94a3b8'
+        });
+        return entries;
+    }, [accountData, showAllSeries, otherLabel]);
 
     const trendChartContainerRef = useRef<HTMLDivElement>(null);
     const [tooltipPosition, setTooltipPosition] = useState<{ x: number; y: number } | undefined>(undefined);
@@ -260,7 +302,7 @@ const TokenStats: React.FC = () => {
                                     </span>
                                 </div>
                                 <span className="font-mono font-medium text-gray-700 dark:text-gray-200">
-                                    {formatNumber(entry.value)}
+                                    {entry.value.toLocaleString()}
                                 </span>
                             </div>
                         );
@@ -321,7 +363,7 @@ const TokenStats: React.FC = () => {
                         {entry.payload.fullEmail || entry.name}:
                     </span>
                     <span className="font-mono font-medium text-gray-700 dark:text-gray-200">
-                        {formatNumber(entry.value)}
+                        {entry.value.toLocaleString()}
                     </span>
                 </div>
             </div>
@@ -329,59 +371,48 @@ const TokenStats: React.FC = () => {
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto">
-            <div className="p-5 space-y-4 max-w-7xl mx-auto">
-                <div className="flex items-center justify-between">
-                    <h1 className="text-2xl font-bold text-gray-800 dark:text-white flex items-center gap-2">
-                        <Zap className="w-6 h-6 text-blue-500" />
-                        {t('token_stats.title', 'Token 消费统计')}
-                    </h1>
-                    <div className="flex items-center gap-2">
-                        <div className="flex bg-gray-100 dark:bg-gray-800 rounded-lg p-1">
+        <div className="console-page console-page-scroll">
+            <div className="space-y-5">
+                <PageHeader
+                    title={t('nav.token_stats')}
+                    description={t('console.stats_description', { defaultValue: i18n.language.startsWith('zh') ? '查看用量趋势、模型分布与账号明细。' : 'Explore usage trends, model distribution and account details.' })}
+                    actions={<button onClick={fetchData} disabled={loading} className="console-button">
+                        <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />{t('common.refresh')}
+                    </button>}
+                />
+                {loadError && <div role="alert" className="console-panel text-error">{t('common.load_failed')}</div>}
+                <div className="console-toolbar">
+                        <div className="console-tabs">
                             <button
                                 onClick={() => setTimeRange('hourly')}
-                                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${timeRange === 'hourly'
-                                    ? 'bg-white dark:bg-gray-700 text-blue-600 shadow-sm'
-                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-800'
-                                    }`}
+                                aria-pressed={timeRange === 'hourly'}
+                                className={`console-tab ${timeRange === 'hourly' ? 'active' : ''}`}
                             >
                                 <Clock className="w-4 h-4" />
                                 {t('token_stats.hourly', '小时')}
                             </button>
                             <button
                                 onClick={() => setTimeRange('daily')}
-                                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${timeRange === 'daily'
-                                    ? 'bg-white dark:bg-gray-700 text-blue-600 shadow-sm'
-                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-800'
-                                    }`}
+                                aria-pressed={timeRange === 'daily'}
+                                className={`console-tab ${timeRange === 'daily' ? 'active' : ''}`}
                             >
                                 <Calendar className="w-4 h-4" />
                                 {t('token_stats.daily', '日')}
                             </button>
                             <button
                                 onClick={() => setTimeRange('weekly')}
-                                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${timeRange === 'weekly'
-                                    ? 'bg-white dark:bg-gray-700 text-blue-600 shadow-sm'
-                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-800'
-                                    }`}
+                                aria-pressed={timeRange === 'weekly'}
+                                className={`console-tab ${timeRange === 'weekly' ? 'active' : ''}`}
                             >
                                 <CalendarDays className="w-4 h-4" />
                                 {t('token_stats.weekly', '周')}
                             </button>
                         </div>
-                        <button
-                            onClick={fetchData}
-                            disabled={loading}
-                            className="p-2 rounded-lg bg-blue-500 text-white hover:bg-blue-600 transition-colors disabled:opacity-50"
-                        >
-                            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-                        </button>
-                    </div>
                 </div>
 
                 {summary && (
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
-                        <div className="bg-gradient-to-br from-white to-gray-50 dark:from-gray-800 dark:to-gray-800/50 rounded-xl p-4 shadow-sm border border-gray-200 dark:border-gray-700 hover:shadow-md transition-shadow">
+                        <div className="console-panel">
                             <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-gray-100 dark:bg-gray-700">
                                     <Zap className="w-4 h-4 text-gray-600 dark:text-gray-300" />
@@ -392,7 +423,7 @@ const TokenStats: React.FC = () => {
                                 {formatNumber(summary.total_tokens)}
                             </div>
                         </div>
-                        <div className="bg-gradient-to-br from-blue-50/50 to-white dark:from-blue-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-blue-100 dark:border-blue-900/30 hover:shadow-md transition-shadow">
+                        <div className="console-panel">
                             <div className="flex items-center gap-2 text-blue-600/80 dark:text-blue-400/80 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-blue-100/50 dark:bg-blue-900/30">
                                     <TrendingUp className="w-4 h-4 text-blue-600 dark:text-blue-400" />
@@ -403,7 +434,7 @@ const TokenStats: React.FC = () => {
                                 {formatNumber(summary.total_input_tokens)}
                             </div>
                         </div>
-                        <div className="bg-gradient-to-br from-purple-50/50 to-white dark:from-purple-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-purple-100 dark:border-purple-900/30 hover:shadow-md transition-shadow">
+                        <div className="console-panel">
                             <div className="flex items-center gap-2 text-purple-600/80 dark:text-purple-400/80 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-purple-100/50 dark:bg-purple-900/30">
                                     <TrendingUp className="w-4 h-4 rotate-180 text-purple-600 dark:text-purple-400" />
@@ -414,7 +445,7 @@ const TokenStats: React.FC = () => {
                                 {formatNumber(summary.total_output_tokens)}
                             </div>
                         </div>
-                        <div className="bg-gradient-to-br from-sky-50/50 to-white dark:from-sky-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-sky-100 dark:border-sky-900/30 hover:shadow-md transition-shadow">
+                        <div className="console-panel">
                             <div className="flex items-center gap-2 text-sky-600/80 dark:text-sky-400/80 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-sky-100/50 dark:bg-sky-900/30">
                                     <Zap className="w-4 h-4 text-sky-600 dark:text-sky-400" />
@@ -425,7 +456,7 @@ const TokenStats: React.FC = () => {
                                 {formatNumber(summary.total_cached_tokens)}
                             </div>
                         </div>
-                        <div className="bg-gradient-to-br from-green-50/50 to-white dark:from-green-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-green-100 dark:border-green-900/30 hover:shadow-md transition-shadow">
+                        <div className="console-panel">
                             <div className="flex items-center gap-2 text-green-600/80 dark:text-green-400/80 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-green-100/50 dark:bg-green-900/30">
                                     <Users className="w-4 h-4 text-green-600 dark:text-green-400" />
@@ -436,7 +467,7 @@ const TokenStats: React.FC = () => {
                                 {summary.unique_accounts}
                             </div>
                         </div>
-                        <div className="bg-gradient-to-br from-orange-50/50 to-white dark:from-orange-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-orange-100 dark:border-orange-900/30 hover:shadow-md transition-shadow">
+                        <div className="console-panel">
                             <div className="flex items-center gap-2 text-orange-600/80 dark:text-orange-400/80 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-orange-100/50 dark:bg-orange-900/30">
                                     <Cpu className="w-4 h-4 text-orange-600 dark:text-orange-400" />
@@ -450,8 +481,8 @@ const TokenStats: React.FC = () => {
                     </div>
                 )}
 
-                <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700">
-                    <div className="flex items-center justify-between mb-4">
+                <div className="console-panel min-w-0">
+                    <div className="console-toolbar justify-between mb-4">
                         <h2 className="text-lg font-semibold text-gray-800 dark:text-white flex items-center gap-2">
                             {viewMode === 'model' ? (
                                 <Cpu className="w-5 h-5 text-purple-500" />
@@ -463,32 +494,37 @@ const TokenStats: React.FC = () => {
                                 : t('token_stats.account_trend', '分账号使用趋势')
                             }
                         </h2>
-                        <div className="flex bg-gray-100/80 dark:bg-gray-700/50 rounded-lg p-1">
+                        <div className="console-tabs">
                             <button
                                 onClick={() => setViewMode('model')}
-                                className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${viewMode === 'model'
-                                    ? 'bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm'
-                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                                    }`}
+                                aria-pressed={viewMode === 'model'}
+                                className={`console-tab ${viewMode === 'model' ? 'active' : ''}`}
                             >
                                 {t('token_stats.by_model', '按模型')}
                             </button>
                             <button
                                 onClick={() => setViewMode('account')}
-                                className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${viewMode === 'account'
-                                    ? 'bg-white dark:bg-gray-600 text-blue-600 dark:text-blue-400 shadow-sm'
-                                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                                    }`}
+                                aria-pressed={viewMode === 'account'}
+                                className={`console-tab ${viewMode === 'account' ? 'active' : ''}`}
                             >
                                 {t('token_stats.by_account_view', '按账号')}
                             </button>
                         </div>
+                        {(trend.count > 6 || accountData.length > 6) && <button
+                            className="console-button"
+                            aria-pressed={showAllSeries}
+                            onClick={() => setShowAllSeries(value => !value)}
+                        >
+                            {showAllSeries
+                                ? t('console.stats_show_top', { defaultValue: i18n.language.startsWith('zh') ? '显示前 6 项 + 其他' : 'Show top 6 + Other' })
+                                : t('console.stats_show_all', { defaultValue: i18n.language.startsWith('zh') ? '显示全部系列' : 'Show all series' })}
+                        </button>}
                     </div>
-                    <div className="h-72" ref={trendChartContainerRef}>
-                        {modelTrendData.length > 0 && allModels.length > 0 ? (
+                    <div className="h-80 min-w-0" ref={trendChartContainerRef}>
+                        {trend.rows.length > 0 && trend.series.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
                                 <AreaChart
-                                    data={viewMode === 'model' ? modelTrendData : accountTrendData}
+                                    data={trend.rows}
                                     onMouseMove={handleTrendChartMouseMove}
                                     onMouseLeave={() => setTooltipPosition(undefined)}
                                 >
@@ -519,7 +555,7 @@ const TokenStats: React.FC = () => {
                                         wrapperStyle={{ zIndex: 100 }}
                                     />
                                     <Legend
-                                        formatter={(value) => viewMode === 'model' ? shortenModelName(value) : value.split('@')[0]}
+                                        formatter={(value) => <span title={value}>{viewMode === 'model' ? shortenModelName(value) : value.split('@')[0]}</span>}
                                         wrapperStyle={{
                                             fontSize: '11px',
                                             paddingTop: '10px',
@@ -528,15 +564,17 @@ const TokenStats: React.FC = () => {
                                             zIndex: 0
                                         }}
                                     />
-                                    {(viewMode === 'model' ? allModels : allAccounts).map((item, index) => (
+                                    {trend.series.map((item, index) => (
                                         <Area
-                                            key={item}
+                                            key={index}
+                                            name={item.name}
                                             type="monotone"
-                                            dataKey={item}
+                                            dataKey={`values.${index}`}
+                                            isAnimationActive={false}
                                             stackId="1"
-                                            stroke={viewMode === 'model' ? MODEL_COLORS[index % MODEL_COLORS.length] : COLORS[index % COLORS.length]}
-                                            fill={viewMode === 'model' ? MODEL_COLORS[index % MODEL_COLORS.length] : COLORS[index % COLORS.length]}
-                                            fillOpacity={0.6}
+                                            stroke={item.color}
+                                            fill={item.color}
+                                            fillOpacity={0.25}
                                         />
                                     ))}
                                 </AreaChart>
@@ -550,11 +588,11 @@ const TokenStats: React.FC = () => {
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    <div className="lg:col-span-2 bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700 flex flex-col">
+                    <div className="console-panel lg:col-span-2 min-w-0 flex flex-col">
                         <h2 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">
                             {t('token_stats.usage_trend', 'Token 使用趋势')}
                         </h2>
-                        <div className="flex-1 min-h-[16rem]">
+                        <div className="h-72 min-w-0">
                             {chartData.length > 0 ? (
                                 <ResponsiveContainer width="100%" height="100%">
                                     <BarChart data={chartData}>
@@ -583,9 +621,9 @@ const TokenStats: React.FC = () => {
                                             allowEscapeViewBox={{ x: true, y: true }}
                                             wrapperStyle={{ zIndex: 100 }}
                                         />
-                                        <Bar dataKey="total_cached_tokens" name={t('token_stats.cached_token', '缓存命中')} stackId="input" fill="#93c5fd" radius={[0, 0, 4, 4]} maxBarSize={50} />
-                                        <Bar dataKey="uncached_input_tokens" name={t('token_stats.input', '输入')} stackId="input" fill="#3b82f6" radius={[4, 4, 0, 0]} maxBarSize={50} />
-                                        <Bar dataKey="total_output_tokens" name={t('token_stats.output', '输出')} fill="#8b5cf6" radius={[4, 4, 0, 0]} maxBarSize={50} />
+                                        <Bar isAnimationActive={false} dataKey="total_cached_tokens" name={t('token_stats.cached_token', '缓存命中')} stackId="input" fill="#93c5fd" radius={[0, 0, 4, 4]} maxBarSize={50} />
+                                        <Bar isAnimationActive={false} dataKey="uncached_input_tokens" name={t('token_stats.input', '输入')} stackId="input" fill="#3b82f6" radius={[4, 4, 0, 0]} maxBarSize={50} />
+                                        <Bar isAnimationActive={false} dataKey="total_output_tokens" name={t('token_stats.output', '输出')} fill="#8b5cf6" radius={[4, 4, 0, 0]} maxBarSize={50} />
                                     </BarChart>
                                 </ResponsiveContainer>
                             ) : (
@@ -596,7 +634,7 @@ const TokenStats: React.FC = () => {
                         </div>
                     </div>
 
-                    <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700">
+                    <div className="console-panel min-w-0">
                         <h2 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">
                             {t('token_stats.by_account', '分账号统计')}
                         </h2>
@@ -608,6 +646,7 @@ const TokenStats: React.FC = () => {
                                         onMouseLeave={() => setPieTooltipPosition(undefined)}
                                     >
                                         <Pie
+                                            isAnimationActive={false}
                                             data={pieData}
                                             cx="50%"
                                             cy="50%"
@@ -635,19 +674,19 @@ const TokenStats: React.FC = () => {
                             )}
                         </div>
                         <div className="mt-4 space-y-2 max-h-32 overflow-y-auto">
-                            {accountData.slice(0, 5).map((account, index) => (
-                                <div key={account.account_email} className="flex items-center justify-between text-sm">
+                            {pieData.map((account) => (
+                                <div key={account.fullEmail} className="flex items-center justify-between gap-3 text-sm">
                                     <div className="flex items-center gap-2">
                                         <div
                                             className="w-3 h-3 rounded-full"
-                                            style={{ backgroundColor: COLORS[index % COLORS.length] }}
+                                            style={{ backgroundColor: account.color }}
                                         />
-                                        <span className="text-gray-600 dark:text-gray-300 truncate max-w-[120px]">
-                                            {account.account_email.split('@')[0]}
+                                        <span className="text-gray-600 dark:text-gray-300 truncate max-w-[160px]" title={account.fullEmail}>
+                                            {account.name}
                                         </span>
                                     </div>
                                     <span className="font-medium text-gray-800 dark:text-white">
-                                        {formatNumber(account.total_tokens)}
+                                        {formatNumber(account.value)}
                                     </span>
                                 </div>
                             ))}
@@ -658,13 +697,13 @@ const TokenStats: React.FC = () => {
 
                 {
                     modelData.length > 0 && viewMode === 'model' && (
-                        <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700">
+                        <div className="console-panel min-w-0">
                             <h2 className="text-lg font-semibold text-gray-800 dark:text-white mb-4 flex items-center gap-2">
                                 <Cpu className="w-5 h-5 text-blue-500" />
                                 {t('token_stats.model_details', '分模型详细统计')}
                             </h2>
                             <div className="overflow-x-auto">
-                                <table className="w-full text-sm">
+                                <table className="w-full min-w-[800px] text-sm">
                                     <thead>
                                         <tr className="border-b border-gray-200 dark:border-gray-700">
                                             <th className="text-left py-3 px-4 font-medium text-gray-500 dark:text-gray-400">
@@ -692,7 +731,7 @@ const TokenStats: React.FC = () => {
                                     </thead>
                                     <tbody>
                                         {modelData.map((model, index) => {
-                                            const percentage = summary ? ((model.total_tokens / summary.total_tokens) * 100).toFixed(1) : '0';
+                                            const percentage = summary && summary.total_tokens > 0 ? ((model.total_tokens / summary.total_tokens) * 100).toFixed(1) : '0';
                                             return (
                                                 <tr
                                                     key={model.model}
@@ -754,12 +793,12 @@ const TokenStats: React.FC = () => {
 
                 {
                     accountData.length > 0 && viewMode === 'account' && (
-                        <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700">
+                        <div className="console-panel min-w-0">
                             <h2 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">
                                 {t('token_stats.account_details', '账号详细统计')}
                             </h2>
                             <div className="overflow-x-auto">
-                                <table className="w-full text-sm">
+                                <table className="w-full min-w-[720px] text-sm">
                                     <thead>
                                         <tr className="border-b border-gray-200 dark:border-gray-700">
                                             <th className="text-left py-3 px-4 font-medium text-gray-500 dark:text-gray-400">

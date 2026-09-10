@@ -5,7 +5,12 @@ export interface NavItem {
     path: string;
     label: string;
     icon: LucideIcon;
-    priority: 'high' | 'medium' | 'low';
+}
+
+export interface NavGroup {
+    id: string;
+    label: string;
+    items: NavItem[];
 }
 
 export interface Language {
@@ -30,14 +35,3 @@ export const LANGUAGES: Language[] = [
     { code: 'my', label: 'Bahasa Melayu', short: 'MY' },
 ];
 
-// 工具函数
-export const isActive = (pathname: string, itemPath: string): boolean => {
-    if (itemPath === '/') {
-        return pathname === '/';
-    }
-    return pathname.startsWith(itemPath);
-};
-
-export const getCurrentNavItem = (pathname: string, navItems: NavItem[]): NavItem => {
-    return navItems.find(item => isActive(pathname, item.path)) || navItems[0];
-};

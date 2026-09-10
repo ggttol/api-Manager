@@ -201,7 +201,7 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
                 </div>
 
                 {/* Custom BaseURL Input */}
-                <div className="px-5 py-2 shrink-0 border-b border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200/30">
+                <div className="px-5 py-2 shrink-0 border-b border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200">
                     <div className="flex flex-col gap-1.5">
                         <div className="flex items-center justify-between">
                             <label htmlFor="customBaseUrl" className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">

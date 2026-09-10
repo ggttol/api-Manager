@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
-import { Trash2, Check, Plus, Search, X, ShieldCheck } from 'lucide-react';
+import { Trash2, Check, Plus, Search, X } from 'lucide-react';
 
 interface IpWhitelistEntry {
     ip_pattern: string;
@@ -17,7 +17,8 @@ interface Props {
 export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
     const { t } = useTranslation();
     const [entries, setEntries] = useState<IpWhitelistEntry[]>([]);
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(false);
     const [search, setSearch] = useState('');
 
     // Add Modal State
@@ -27,10 +28,12 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
 
     const loadWhitelist = async () => {
         setLoading(true);
+        setLoadError(false);
         try {
             const data = await invoke<IpWhitelistEntry[]>('get_ip_whitelist');
             setEntries(data);
         } catch (e) {
+            setLoadError(true);
             console.error('Failed to load whitelist', e);
         } finally {
             setLoading(false);
@@ -55,7 +58,7 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
             loadWhitelist();
         } catch (e) {
             console.error('Failed to add to whitelist', e);
-            alert('Failed to add IP: ' + e);
+            alert(`${t('security.blacklist.error_add_failed')}: ${String(e)}`);
         }
     };
 
@@ -77,20 +80,21 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
     );
 
     return (
-        <div className="flex flex-col h-full bg-white dark:bg-base-100 rounded-xl">
-            <div className="p-5 border-b border-gray-100 dark:border-base-200 flex items-center gap-4">
+        <div className="flex flex-col h-full min-h-0 min-w-0">
+            <div className="console-toolbar p-4 border-b border-[var(--console-border)]">
                 <button
                     onClick={() => setIsAddOpen(true)}
-                    className="px-4 py-2 bg-white dark:bg-base-100 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors flex items-center gap-2 shadow-sm border border-gray-200/50 dark:border-base-300"
+                    className="console-button console-button-primary"
                 >
                     <Plus size={16} /> {t('security.whitelist.add_ip')}
                 </button>
 
-                <div className="relative flex-1 max-w-md">
+                <div className="relative flex-1 min-w-[180px] max-w-md">
                     <Search className="absolute left-3 top-2.5 text-gray-400" size={16} />
                     <input
                         type="text"
                         placeholder={t('security.blacklist.search_placeholder')}
+                        aria-label={t('security.blacklist.search_placeholder')}
                         className="input input-sm input-bordered w-full pl-9"
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
@@ -100,26 +104,25 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
                 <div className="flex-1"></div>
             </div>
 
-            <div className="flex-1 overflow-auto p-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="flex-1 min-h-0 overflow-auto p-4">
+                {loadError && <div role="alert" className="py-4 text-sm text-error">{t('common.load_failed')}</div>}
+                {loading && entries.length === 0 && <div role="status" className="py-10 text-center text-gray-500">{t('common.loading')}</div>}
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                     {filteredEntries.map(entry => (
-                        <div key={entry.ip_pattern} className="bg-white dark:bg-base-100 border border-green-100 dark:border-green-900/30 rounded-lg p-4 shadow-sm hover:shadow-md transition-shadow relative group">
-                            <div className="absolute top-0 right-0 p-2 opacity-10">
-                                <ShieldCheck size={64} className="text-green-500" />
-                            </div>
-
-                            <div className="flex items-start justify-between mb-2 relative z-10">
-                                <h3 className="font-mono font-bold text-lg text-green-700 dark:text-green-400">{entry.ip_pattern}</h3>
+                        <div key={entry.ip_pattern} className="console-panel min-w-0">
+                            <div className="flex items-start justify-between gap-3 mb-2">
+                                <h3 className="font-mono font-semibold text-sm break-all">{entry.ip_pattern}</h3>
                                 <button
                                     onClick={() => handleRemove(entry.ip_pattern)}
-                                    className="btn btn-ghost btn-xs text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                                    className="console-button !p-2 shrink-0 text-error"
+                                    aria-label={t('common.delete')}
                                 >
                                     <Trash2 size={14} />
                                 </button>
                             </div>
 
                             {entry.description && (
-                                <p className="text-sm text-gray-600 dark:text-gray-400 mb-2 flex items-center gap-1 relative z-10">
+                                <p className="text-sm text-gray-600 dark:text-gray-400 mb-2 flex items-center gap-1 break-all">
                                     <Check size={12} className="text-green-500" /> {entry.description}
                                 </p>
                             )}
@@ -129,7 +132,7 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
                             </div>
                         </div>
                     ))}
-                    {!loading && filteredEntries.length === 0 && (
+                    {!loading && !loadError && filteredEntries.length === 0 && (
                         <div className="col-span-full text-center py-10 text-gray-400">
                             {t('security.whitelist.no_data')}
                         </div>
@@ -139,11 +142,11 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
 
             {/* Add Modal */}
             {isAddOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-                    <div className="bg-white dark:bg-base-100 rounded-lg shadow-xl w-full max-w-md p-6">
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                    <div role="dialog" aria-modal="true" aria-label={t('security.whitelist.add_title')} className="console-panel w-full max-w-md max-h-[90vh] overflow-y-auto">
                         <div className="flex justify-between items-center mb-4">
                             <h3 className="text-lg font-bold">{t('security.whitelist.add_title')}</h3>
-                            <button onClick={() => setIsAddOpen(false)} className="btn btn-ghost btn-sm btn-circle">
+                            <button onClick={() => setIsAddOpen(false)} aria-label={t('common.close')} className="btn btn-ghost btn-sm btn-circle">
                                 <X size={18} />
                             </button>
                         </div>
@@ -172,13 +175,13 @@ export const WhitelistManager: React.FC<Props> = ({ refreshKey }) => {
 
                             <div className="flex justify-end gap-3 mt-6">
                                 <button
-                                    className="px-4 py-2 bg-gray-100 dark:bg-base-200 text-gray-700 dark:text-gray-300 text-sm font-medium rounded-lg hover:bg-gray-200 dark:hover:bg-base-300 transition-colors"
+                                    className="console-button"
                                     onClick={() => setIsAddOpen(false)}
                                 >
                                     {t('security.whitelist.cancel')}
                                 </button>
                                 <button
-                                    className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium rounded-lg shadow-lg shadow-emerald-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                                    className="console-button console-button-primary"
                                     onClick={handleAdd}
                                     disabled={!newIp}
                                 >

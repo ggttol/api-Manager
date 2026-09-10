@@ -74,7 +74,7 @@ function calculateEffectiveQuota(
 }
 
 function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProps) {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
     // 1. 获取按综合有效配额排序的列表 (排除当前账号及已禁用账号)
     const geminiSorted = accounts
         .filter(a => a.id !== currentAccountId && !a.disabled && !a.proxy_disabled)
@@ -155,39 +155,40 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
     const bestClaudeRender = bestClaude ? { ...bestClaude, claudeQuota: bestClaude.quotaVal } : undefined;
 
     return (
-        <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
+        <div className="console-panel h-full flex flex-col">
             <h2 className="text-base font-semibold text-gray-900 dark:text-base-content mb-3 flex items-center gap-2">
                 <TrendingUp className="w-4 h-4 text-blue-500 dark:text-blue-400" />
                 {t('dashboard.best_accounts')}
             </h2>
+            <p className="mb-4 text-xs console-muted">{t('console.overview_recommendation_score', { defaultValue: i18n.language.startsWith('zh') ? '基于现有配额规则的推荐分数（满分 100），不是合并额度。' : 'Recommendation scores from the existing quota rules (out of 100), not pooled quota.' })}</p>
 
             <div className="space-y-2 flex-1">
                 {/* Gemini 最佳 */}
                 {bestGeminiRender && (
-                    <div className="flex items-center justify-between p-2.5 bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-100 dark:border-green-900/30">
+                    <div className="flex items-center justify-between gap-2 p-3 bg-gray-50 dark:bg-white/5 rounded-lg border border-gray-200 dark:border-base-300">
                         <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-green-600 dark:text-green-400 font-medium mb-0.5">{t('dashboard.for_gemini')}</div>
+                            <div className="text-xs text-blue-600 dark:text-blue-400 font-medium mb-0.5">{t('dashboard.for_gemini')}</div>
                             <div className="font-medium text-sm text-gray-900 dark:text-base-content truncate">
                                 {bestGeminiRender.email}
                             </div>
                         </div>
-                        <div className="ml-2 px-2 py-0.5 bg-green-500 text-white text-xs font-semibold rounded-full">
-                            {bestGeminiRender.geminiQuota}%
+                        <div className="ml-2 px-2 py-1 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs font-semibold rounded-md shrink-0">
+                            {bestGeminiRender.geminiQuota} / 100
                         </div>
                     </div>
                 )}
 
                 {/* Claude 最佳 */}
                 {bestClaudeRender && (
-                    <div className="flex items-center justify-between p-2.5 bg-cyan-50 dark:bg-cyan-900/20 rounded-lg border border-cyan-100 dark:border-cyan-900/30">
+                    <div className="flex items-center justify-between gap-2 p-3 bg-gray-50 dark:bg-white/5 rounded-lg border border-gray-200 dark:border-base-300">
                         <div className="flex-1 min-w-0">
-                            <div className="text-[10px] text-cyan-600 dark:text-cyan-400 font-medium mb-0.5">{t('dashboard.for_claude')}</div>
+                            <div className="text-xs text-blue-600 dark:text-blue-400 font-medium mb-0.5">{t('dashboard.for_claude')}</div>
                             <div className="font-medium text-sm text-gray-900 dark:text-base-content truncate">
                                 {bestClaudeRender.email}
                             </div>
                         </div>
-                        <div className="ml-2 px-2 py-0.5 bg-cyan-500 text-white text-xs font-semibold rounded-full">
-                            {bestClaudeRender.claudeQuota}%
+                        <div className="ml-2 px-2 py-1 bg-blue-50 dark:bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs font-semibold rounded-md shrink-0">
+                            {bestClaudeRender.claudeQuota} / 100
                         </div>
                     </div>
                 )}
@@ -202,7 +203,7 @@ function BestAccounts({ accounts, currentAccountId, onSwitch }: BestAccountsProp
             {(bestGeminiRender || bestClaudeRender) && onSwitch && (
                 <div className="mt-auto pt-3">
                     <button
-                        className="w-full px-3 py-1.5 bg-blue-500 text-white text-xs font-medium rounded-lg hover:bg-blue-600 transition-colors"
+                        className="console-button console-button-primary w-full justify-center"
                         onClick={() => {
                             // 优先切换到配额更高的账号
                             let targetId = bestGeminiRender?.id;

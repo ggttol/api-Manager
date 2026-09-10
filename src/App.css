@@ -14,12 +14,79 @@ body {
   border: none;
 }
 
+:root {
+  color-scheme: light;
+  --console-bg: #f5f7fb;
+  --console-surface: #ffffff;
+  --console-surface-muted: #f8fafc;
+  --console-border: #e2e8f0;
+  --console-text: #172033;
+  --console-muted: #64748b;
+  --console-primary: #2563eb;
+  --console-primary-soft: #eff6ff;
+}
+
 html {
-  background-color: #FAFBFC;
+  background-color: var(--console-bg);
 }
 
 html.dark {
-  background-color: #1d232a;
+  color-scheme: dark;
+  --console-bg: #0c1220;
+  --console-surface: #141e2e;
+  --console-surface-muted: #1b273a;
+  --console-border: #2a374c;
+  --console-text: #e5edf8;
+  --console-muted: #a0aec2;
+  --console-primary: #60a5fa;
+  --console-primary-soft: #172d4b;
+  background-color: var(--console-bg);
+}
+
+/* DaisyUI and hand-built controls share the same semantic palette. */
+:root[data-theme] {
+  --color-base-100: var(--console-surface);
+  --color-base-200: var(--console-surface-muted);
+  --color-base-300: var(--console-border);
+  --color-base-content: var(--console-text);
+  --color-primary: #2563eb;
+  --color-primary-content: #ffffff;
+  --color-secondary: #64748b;
+  --color-secondary-content: #ffffff;
+  --color-accent: #0f766e;
+  --color-accent-content: #ffffff;
+  --color-neutral: #334155;
+  --color-neutral-content: #f8fafc;
+  --color-info: #0284c7;
+  --color-info-content: #ffffff;
+  --color-success: #15803d;
+  --color-success-content: #ffffff;
+  --color-warning: #fbbf24;
+  --color-warning-content: #422006;
+  --color-error: #dc2626;
+  --color-error-content: #ffffff;
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 0.75rem;
+}
+
+:root.dark[data-theme] {
+  --color-primary: #60a5fa;
+  --color-primary-content: #0f172a;
+  --color-secondary: #94a3b8;
+  --color-secondary-content: #0f172a;
+  --color-accent: #5eead4;
+  --color-accent-content: #042f2e;
+  --color-info: #38bdf8;
+  --color-info-content: #082f49;
+  --color-success: #4ade80;
+  --color-success-content: #052e16;
+  --color-error: #f87171;
+  --color-error-content: #450a0a;
+}
+
+html.dark .text-gray-500 {
+  color: var(--console-muted);
 }
 
 /* 全局样式 */
@@ -30,13 +97,10 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #FAFBFC;
-}
-
-/* Dark mode override for body strictly */
-.dark body {
-  background-color: #1d232a;
-  /* matches base-300 commonly used */
+  background-color: var(--console-bg);
+  color: var(--console-text);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
 }
 
 #root {
@@ -57,26 +121,206 @@ a {
   text-decoration: none;
 }
 
-/* 滚动条优化 - 彻底隐藏但保留功能 */
+/* Keep scrollable configuration and data surfaces discoverable. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--console-border) transparent;
+}
+
 ::-webkit-scrollbar {
-  width: 0px;
-  background: transparent;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background-color: transparent;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background-color: rgba(0, 0, 0, 0.1);
-  border-radius: 99px;
-  border: 3px solid transparent;
-  background-clip: content-box;
-  transition: background-color 0.2s;
+  background: var(--console-border);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(0, 0, 0, 0.3);
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--console-primary);
+  outline-offset: 3px;
+}
+
+.console-page {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  width: 100%;
+  max-width: 1600px;
+  margin-inline: auto;
+  padding: 24px;
+  color: var(--console-text);
+}
+
+.console-page-scroll {
+  overflow-y: auto;
+}
+
+.console-page-fixed {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.console-page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
+}
+
+.console-page-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  color: var(--console-text);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.35;
+  letter-spacing: -0.025em;
+}
+
+.console-page-description {
+  margin-top: 6px;
+  max-width: 70ch;
+  color: var(--console-muted);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.console-eyebrow {
+  margin-bottom: 6px;
+  color: var(--console-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.console-page-actions,
+.console-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.console-panel {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--console-border);
+  border-radius: 12px;
+  background: var(--console-surface);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.025);
+}
+
+.console-muted {
+  color: var(--console-muted);
+}
+
+.console-tabs {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--console-border);
+}
+
+.console-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 11px 16px;
+  border-bottom: 2px solid transparent;
+  color: var(--console-muted);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.console-tab:hover {
+  background: var(--console-surface-muted);
+  color: var(--console-text);
+}
+
+.console-tab.active,
+.console-tab[aria-selected="true"],
+.console-tab[aria-current="page"] {
+  border-bottom-color: var(--console-primary);
+  color: var(--console-primary);
+}
+
+.console-button,
+.console-button-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  background: var(--console-surface);
+  color: var(--console-text);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  cursor: pointer;
+}
+
+.console-button:hover {
+  background: var(--console-surface-muted);
+}
+
+.console-button-primary {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #fff;
+}
+
+.console-button-primary:hover {
+  border-color: #1d4ed8;
+  background: #1d4ed8;
+}
+
+.console-button:disabled,
+.console-button-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .console-page {
+    padding: 16px;
+  }
+
+  .console-page-title {
+    font-size: 21px;
+  }
+
+  .console-page-header {
+    gap: 12px;
+  }
+
+  .console-page-actions {
+    gap: 8px;
+  }
+
+  .console-panel {
+    padding: 16px;
+  }
 }
 
 /* View Transitions API 主题切换动画 */

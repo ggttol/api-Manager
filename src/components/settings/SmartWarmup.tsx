@@ -98,7 +98,7 @@ const SmartWarmup: React.FC<SmartWarmupProps> = ({ config, onChange }) => {
                                                 flex items-center justify-between p-2 rounded-lg border cursor-pointer transition-all duration-200
                                                 ${isSelected
                                                     ? 'bg-orange-50 dark:bg-orange-900/10 border-orange-200 dark:border-orange-800/50 text-orange-700 dark:text-orange-400'
-                                                    : 'bg-gray-50/50 dark:bg-base-200/50 border-gray-100 dark:border-base-300/50 text-gray-500 hover:border-gray-200 dark:hover:border-base-300'}
+                                                    : 'bg-gray-50/50 dark:bg-base-200 border-gray-100 dark:border-base-300 text-gray-500 hover:border-gray-200 dark:hover:border-base-300'}
                                             `}
                                         >
                                             <span className="text-[11px] font-medium truncate pr-2">

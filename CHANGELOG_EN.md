@@ -2,6 +2,15 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## API Manager console integration (based on v4.7.0)
+
+Unified grouped sidebar, collapsible desktop navigation, mobile drawer, page headers, and light/dark semantic colors. All ten existing page URLs remain available. Google and Codex share account-pool presentation without merging their endpoints, quotas, or scheduling; Codex import and raw usage now open in dialogs.
+
+Gateway configuration is organized into service/authentication, routing/scheduling, advanced, and integration sections. Credential fields and configuration previews are masked by default with explicit temporary reveal. User-token content no longer depends on opacity entry animations. Usage charts show the leading six series plus an exact Other aggregate, with a reversible show-all option. Fixed narrow-table/tool-tip overflow and light quota/table surfaces in dark mode.
+
+Frontend-only change with no database or backend protocol migration. Verified in desktop browsers, a 390px mobile viewport, and dark mode using production-backed data, including dialogs, configuration sections, masking, chart expansion, live catalog configuration, and guide copying. Destructive account and credential operations were not executed.
+
+
 *   **Version History**:
     *   **v4.7.0 (2026-09-10)**:
         -   **[Session & Proxy Fix] Prevent 400 Errors and Account Freezes from Upstream 1M Token Accumulation (PR #3415, Issue #3411, refs #3325)**:

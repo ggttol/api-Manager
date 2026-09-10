@@ -118,20 +118,22 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
     }
 
     return (
-        <div className="min-h-screen bg-slate-50 dark:bg-base-300 flex items-center justify-center p-4 relative">
+        <div className="min-h-screen bg-[var(--console-bg)] flex items-center justify-center px-4 py-24 relative">
             {/* 语言切换按钮 */}
             <div className="absolute top-8 right-8">
                 <div className="relative">
                     <button
                         onClick={() => setShowLangMenu(!showLangMenu)}
-                        className="flex items-center gap-2 px-4 py-2 bg-white dark:bg-base-100 rounded-2xl shadow-sm border border-slate-100 dark:border-white/5 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-white/5 transition-all"
+                        className="console-button"
+                        aria-expanded={showLangMenu}
+                        aria-label={i18n.language.startsWith('zh') ? '选择语言' : 'Choose language'}
                     >
                         <Globe className="w-4 h-4" />
                         <span className="text-sm font-medium uppercase">{i18n.language.split('-')[0]}</span>
                     </button>
 
                     {showLangMenu && (
-                        <div className="absolute right-0 mt-2 w-40 bg-white dark:bg-base-100 rounded-2xl shadow-xl border border-slate-100 dark:border-white/5 py-2 z-50 animate-in fade-in zoom-in duration-200">
+                        <div className="absolute right-0 mt-2 w-40 console-panel !p-2 shadow-lg z-50">
                             {languages.map((lang) => (
                                 <button
                                     key={lang.code}
@@ -147,13 +149,14 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                 </div>
             </div>
 
-            <div className="max-w-md w-full bg-white dark:bg-base-100 rounded-3xl shadow-xl overflow-hidden border border-slate-100 dark:border-white/5">
+            <div className="max-w-md w-full console-panel !p-0 overflow-hidden">
                 <div className="p-8">
-                    <div className="w-16 h-16 bg-blue-50 dark:bg-blue-900/20 rounded-2xl flex items-center justify-center mb-6 mx-auto">
-                        <Lock className="w-8 h-8 text-blue-500" />
+                    <div className="w-12 h-12 bg-[var(--console-primary-soft)] rounded-xl flex items-center justify-center mb-5 mx-auto">
+                        <Lock className="w-6 h-6 text-[var(--console-primary)]" />
                     </div>
-                    <h2 className="text-2xl font-bold text-center text-slate-900 dark:text-slate-100 mb-2 font-display">{t('login.title')}</h2>
-                    <p className="text-center text-slate-500 dark:text-slate-400 mb-8 text-sm">{t('login.desc')}</p>
+                    <h1 className="text-2xl font-semibold text-center mb-2">API Manager</h1>
+                    <h2 className="text-sm font-medium text-center mb-2">{t('login.title')}</h2>
+                    <p className="text-center console-muted mb-8 text-sm leading-6">{t('login.desc')}</p>
 
                     <form onSubmit={handleLogin} className="space-y-6">
                         <div className="relative">
@@ -161,7 +164,9 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                             <input
                                 type="password"
                                 placeholder={t('login.placeholder')}
-                                className={`w-full pl-12 pr-4 py-4 bg-slate-50 dark:bg-base-200 border-2 rounded-2xl focus:ring-2 focus:ring-blue-500 transition-all outline-none text-slate-900 dark:text-white ${error ? 'border-red-400' : 'border-transparent'}`}
+                                className={`w-full pl-12 pr-4 py-3 bg-[var(--console-surface-muted)] border rounded-lg focus:ring-2 focus:ring-blue-500 text-[var(--console-text)] ${error ? 'border-red-400' : 'border-[var(--console-border)]'}`}
+                                aria-label={t('login.placeholder')}
+                                autoComplete="current-password"
                                 value={apiKey}
                                 onChange={(e) => { setApiKey(e.target.value); setError(''); }}
                                 autoFocus
@@ -169,7 +174,7 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                             />
                         </div>
                         {error && (
-                            <div className="flex items-center gap-2 text-red-500 text-sm">
+                            <div role="alert" className="flex items-center gap-2 text-red-500 text-sm">
                                 <AlertCircle className="w-4 h-4" />
                                 <span>{error}</span>
                             </div>
@@ -177,7 +182,7 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                         <button
                             type="submit"
                             disabled={isLoading || !apiKey.trim()}
-                            className="w-full py-4 bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 disabled:cursor-not-allowed text-white font-bold rounded-2xl shadow-lg shadow-blue-500/30 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+                            className="console-button-primary w-full !py-3"
                         >
                             {isLoading ? (
                                 <>
@@ -190,8 +195,8 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                         </button>
                     </form>
 
-                    <div className="mt-8 pt-6 border-t border-slate-50 dark:border-white/5 text-center">
-                        <p className="text-[10px] text-slate-400 leading-relaxed">
+                    <div className="mt-8 pt-6 border-t border-[var(--console-border)] text-center">
+                        <p className="text-xs console-muted leading-relaxed">
                             {t('login.note')}
                             <br />
                             {t('login.lookup_hint')}

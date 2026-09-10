@@ -25,6 +25,7 @@ import { DroidSyncModal } from './DroidSyncModal';
 import { OpenCodeSyncModal } from './OpenCodeSyncModal';
 import { useProxyModels } from '../../hooks/useProxyModels';
 import GroupedSelect from '../common/GroupedSelect';
+import { useSecretVisibility } from './SecretInput';
 
 interface CliSyncCardProps {
     proxyUrl: string;
@@ -45,7 +46,7 @@ interface CliStatus {
 }
 
 export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) => {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
     const [statuses, setStatuses] = useState<Record<CliAppType, CliStatus | null>>({
         Claude: null,
         Codex: null,
@@ -82,6 +83,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
         fileName: string,
         allFiles: string[]
     } | null>(null);
+    const configVisibility = useSecretVisibility(viewingConfig);
     const [restoreConfirmApp, setRestoreConfirmApp] = useState<CliAppType | null>(null);
     const [syncConfirmApp, setSyncConfirmApp] = useState<CliAppType | null>(null);
     const [openCodeSyncModal, setOpenCodeSyncModal] = useState(false);
@@ -262,10 +264,10 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
         const isAppSyncing = syncing[app];
 
         return (
-            <div className="flex flex-col bg-white/50 dark:bg-gray-800/40 rounded-xl border border-gray-100 dark:border-white/5 p-4 shadow-sm hover:shadow-lg hover:border-blue-200/50 dark:hover:border-blue-500/30 transition-all duration-300 group">
+            <div className="flex min-w-0 flex-col rounded-xl border border-[var(--console-border)] bg-[var(--console-surface)] p-4">
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-y-3 gap-x-2 mb-4">
                     <div className="flex items-center gap-3 min-w-0">
-                        <div className="p-2.5 bg-gray-50 dark:bg-base-300 rounded-lg shrink-0 group-hover:scale-110 transition-transform duration-300">
+                        <div className="p-2.5 bg-[var(--console-surface-muted)] rounded-lg shrink-0">
                             {icon}
                         </div>
                         <div className="min-w-0">
@@ -429,15 +431,19 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
 
             {/* Config Viewer Modal */}
             {viewingConfig && (
-                <div className="fixed inset-0 z-[300] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-in fade-in duration-200">
-                    <div className="bg-white dark:bg-base-100 rounded-2xl shadow-2xl border border-gray-200 dark:border-base-300 w-full max-w-2xl overflow-hidden animate-in zoom-in-95 duration-200">
-                        <div className="px-6 py-4 border-b border-gray-100 dark:border-base-200 flex items-center justify-between bg-gray-50/50 dark:bg-base-200/50">
+                <div className="fixed inset-0 z-[300] flex items-center justify-center p-4 bg-black/50" onKeyDown={(event) => {
+                    if (event.key === 'Escape') setViewingConfig(null);
+                }} onBlur={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) configVisibility.setRevealed(false);
+                }}>
+                    <div role="dialog" aria-modal="true" aria-label={t('proxy.cli_sync.modal.view_title', { name: viewingConfig.app })} className="rounded-xl shadow-xl border border-[var(--console-border)] bg-[var(--console-surface)] w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+                        <div className="px-6 py-4 border-b border-[var(--console-border)] flex flex-wrap gap-3 items-center justify-between">
                             <div>
                                 <h3 className="font-bold text-gray-900 dark:text-base-content flex items-center gap-2">
                                     <CodeXml size={18} className="text-blue-500" />
                                     {t('proxy.cli_sync.modal.view_title', { name: viewingConfig.app })}
                                 </h3>
-                                <div className="mt-2 flex gap-2">
+                                <div className="mt-2 flex flex-wrap gap-2">
                                     {viewingConfig.allFiles.map(file => (
                                         <button
                                             key={file}
@@ -455,7 +461,14 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                                 </div>
                             </div>
                             <div className="flex items-center gap-2">
+                                <button type="button" autoFocus className="console-button" aria-pressed={configVisibility.revealed} onClick={(event) => { event.currentTarget.focus(); configVisibility.setRevealed(!configVisibility.revealed); }}>
+                                    <Eye size={16} />
+                                    {configVisibility.revealed
+                                        ? t('console.hide_secret', { defaultValue: i18n.language.startsWith('zh') ? '隐藏敏感信息' : 'Hide secret' })
+                                        : t('console.reveal_secret', { defaultValue: i18n.language.startsWith('zh') ? '显示 30 秒' : 'Reveal for 30 seconds' })}
+                                </button>
                                 <button
+                                    aria-label={t('proxy.config.btn_copy')}
                                     onClick={async () => {
                                         const success = await copyToClipboard(viewingConfig.content);
                                         if (success) {
@@ -467,6 +480,7 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                                     <Copy size={16} />
                                 </button>
                                 <button
+                                    aria-label={t('common.close')}
                                     onClick={() => setViewingConfig(null)}
                                     className="btn btn-ghost btn-sm hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/20"
                                 >
@@ -475,9 +489,9 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                             </div>
                         </div>
                         <div className="p-6">
-                            <div className="bg-gray-900 rounded-xl p-4 overflow-auto max-h-[50vh] border border-gray-800 shadow-inner">
-                                <pre className="text-xs font-mono text-gray-300 leading-relaxed">
-                                    {viewingConfig.content}
+                            <div className="rounded-xl p-4 overflow-auto max-h-[50vh] border border-[var(--console-border)] bg-[var(--console-surface-muted)]">
+                                <pre className="text-xs font-mono text-[var(--console-text)] leading-relaxed whitespace-pre-wrap break-all">
+                                    {configVisibility.revealed ? viewingConfig.content : t('console.config_hidden', { defaultValue: i18n.language.startsWith('zh') ? '配置文件可能包含密钥，内容默认隐藏。可临时显示，或直接复制完整配置。' : 'This file may contain credentials. Reveal it temporarily, or copy the complete configuration without displaying it.' })}
                                 </pre>
                             </div>
                         </div>

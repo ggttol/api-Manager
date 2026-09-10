@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../utils/request';
 import { isTauri } from '../utils/env';
@@ -37,6 +37,9 @@ import { listAccounts } from '../services/accountService';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import AdvancedThinking from '../components/settings/AdvancedThinking';
 import { CircuitBreakerConfig } from '../types/config';
+import { PageHeader } from '../components/common/ConsolePage';
+import { SecretInput, useSecretVisibility } from '../components/proxy/SecretInput';
+import { Link } from 'react-router-dom';
 
 interface ProxyStatus {
     running: boolean;
@@ -62,6 +65,7 @@ interface CollapsibleCardProps {
     defaultExpanded?: boolean;
     rightElement?: React.ReactNode;
     allowInteractionWhenDisabled?: boolean;
+    hidden?: boolean;
 }
 
 function CollapsibleCard({
@@ -73,33 +77,28 @@ function CollapsibleCard({
     defaultExpanded = false,
     rightElement,
     allowInteractionWhenDisabled = false,
+    hidden = false,
 }: CollapsibleCardProps) {
     const [isExpanded, setIsExpanded] = useState(defaultExpanded);
     const { t } = useTranslation();
+    const contentId = useId();
 
     return (
-        <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700/50 overflow-hidden transition-all duration-200 hover:shadow-md">
-            <div
-                className="px-5 py-4 flex items-center justify-between cursor-pointer bg-gray-50/50 dark:bg-gray-800/50 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
-                onClick={(e) => {
-                    // Prevent toggle when clicking the switch or right element
-                    if ((e.target as HTMLElement).closest('.no-expand')) return;
-                    setIsExpanded(!isExpanded);
-                }}
-            >
-                <div className="flex items-center gap-3">
-                    <div className="text-gray-500 dark:text-gray-400">
+        <div hidden={hidden} className="rounded-xl border border-[var(--console-border)] bg-[var(--console-surface)] overflow-hidden">
+            <div className="px-5 py-4 flex flex-wrap gap-3 items-center justify-between">
+                <button type="button" className="flex min-w-0 items-center gap-3 text-left" aria-expanded={isExpanded} aria-controls={contentId} onClick={() => setIsExpanded(!isExpanded)}>
+                    <span className="text-gray-500 dark:text-gray-400">
                         {icon}
-                    </div>
+                    </span>
                     <span className="font-medium text-sm text-gray-900 dark:text-gray-100">
                         {title}
                     </span>
                     {enabled !== undefined && (
-                        <div className={cn('text-xs px-2 py-0.5 rounded-full', enabled ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-gray-100 text-gray-500 dark:bg-gray-600/50 dark:text-gray-300')}>
+                        <span className={cn('text-xs px-2 py-0.5 rounded-full', enabled ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-gray-100 text-gray-500 dark:bg-gray-600/50 dark:text-gray-300')}>
                             {enabled ? t('common.enabled') : t('common.disabled')}
-                        </div>
+                        </span>
                     )}
-                </div>
+                </button>
 
                 <div className="flex items-center gap-4 no-expand">
                     {rightElement}
@@ -108,6 +107,7 @@ function CollapsibleCard({
                         <div className="flex items-center" onClick={(e) => e.stopPropagation()}>
                             <input
                                 type="checkbox"
+                                aria-label={title}
                                 className="toggle toggle-sm bg-gray-200 dark:bg-gray-700 border-gray-300 dark:border-gray-600 checked:bg-blue-500 checked:border-blue-500"
                                 checked={enabled}
                                 onChange={(e) => onToggle(e.target.checked)}
@@ -116,6 +116,11 @@ function CollapsibleCard({
                     )}
 
                     <button
+                        type="button"
+                        aria-label={title}
+                        aria-expanded={isExpanded}
+                        aria-controls={contentId}
+                        onClick={() => setIsExpanded(!isExpanded)}
                         className={cn('p-1 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-200', isExpanded ? 'rotate-180' : '')}
                     >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -126,8 +131,9 @@ function CollapsibleCard({
             </div>
 
             <div
-                className={`transition-all duration-300 ease-in-out border-t border-gray-100 dark:border-base-200 ${isExpanded ? 'max-h-[2000px] opacity-100' : 'max-h-0 opacity-0 overflow-hidden'
-                    }`}
+                id={contentId}
+                hidden={!isExpanded}
+                className="border-t border-[var(--console-border)]"
             >
                 <div className="p-5 relative">
                     {/* Overlay when disabled */}
@@ -145,7 +151,15 @@ function CollapsibleCard({
 }
 
 export default function ApiProxy() {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
+    const [activeSection, setActiveSection] = useState('service');
+    const sections = [
+        { id: 'service', label: t('console.gateway_service', { defaultValue: i18n.language.startsWith('zh') ? '服务与认证' : 'Service & authentication' }) },
+        { id: 'routing', label: t('console.gateway_routing', { defaultValue: i18n.language.startsWith('zh') ? '路由与调度' : 'Routing & scheduling' }) },
+        { id: 'advanced', label: t('console.gateway_advanced', { defaultValue: i18n.language.startsWith('zh') ? '高级设置' : 'Advanced settings' }) },
+        { id: 'integration', label: t('console.gateway_integration', { defaultValue: i18n.language.startsWith('zh') ? '模型与集成' : 'Models & integration' }) },
+    ];
+    const exampleVisibility = useSecretVisibility(activeSection);
 
     const { models } = useProxyModels();
 
@@ -950,11 +964,11 @@ export default function ApiProxy() {
     };
 
 
-    const getPythonExample = (modelId: string) => {
+    const getPythonExample = (modelId: string, includeSecret = false) => {
         const port = status.running ? status.port : (appConfig?.proxy.port || 8045);
         // 推荐使用 127.0.0.1 以避免部分环境 IPv6 解析延迟问题
         const baseUrl = `http://127.0.0.1:${port}/v1`;
-        const apiKey = appConfig?.proxy.api_key || 'YOUR_API_KEY';
+        const apiKey = includeSecret ? (appConfig?.proxy.api_key || 'YOUR_API_KEY') : 'YOUR_API_KEY';
 
         // 1. Anthropic Protocol
         if (selectedProtocol === 'anthropic') {
@@ -1061,8 +1075,48 @@ print(response.choices[0].message.content)`;
     });
 
     return (
-        <div className="h-full w-full overflow-y-auto overflow-x-hidden">
-            <div className="p-5 space-y-4 max-w-7xl mx-auto">
+        <div className="console-page console-page-scroll h-full overflow-x-hidden">
+            <div className="space-y-5">
+                <PageHeader
+                    title={t('nav.proxy')}
+                    description={t('console.gateway_description', { defaultValue: i18n.language.startsWith('zh') ? '管理服务认证、模型路由和客户端集成。配置沿用即时保存，密钥编辑需单独确认。' : 'Manage authentication, model routing, and client integrations. Settings retain automatic saving; credential edits require confirmation.' })}
+                    actions={<div className="console-toolbar">
+                        <span className="text-sm console-muted">{status.running ? `${t('proxy.status.running')} · ${status.active_accounts} ${t('common.accounts')}` : t('proxy.status.stopped')}</span>
+                        <button className={status.running ? 'console-button !text-red-600 dark:!text-red-400' : 'console-button-primary'} onClick={handleToggle} disabled={loading || !appConfig}>
+                            <Power size={16} />
+                            {loading ? t('proxy.status.processing') : status.running ? t('proxy.action.stop') : t('proxy.action.start')}
+                        </button>
+                    </div>}
+                />
+                <div className="console-tabs" role="tablist" aria-label={t('proxy.config.title')}>
+                    {sections.map((section, index) => <button
+                        key={section.id}
+                        id={`gateway-tab-${section.id}`}
+                        type="button"
+                        role="tab"
+                        aria-selected={activeSection === section.id}
+                        aria-controls="gateway-section"
+                        tabIndex={activeSection === section.id ? 0 : -1}
+                        className="console-tab"
+                        onClick={() => setActiveSection(section.id)}
+                        onKeyDown={(event) => {
+                            let next = index;
+                            if (event.key === 'ArrowRight') next = (index + 1) % sections.length;
+                            else if (event.key === 'ArrowLeft') next = (index + sections.length - 1) % sections.length;
+                            else if (event.key === 'Home') next = 0;
+                            else if (event.key === 'End') next = sections.length - 1;
+                            else return;
+                            event.preventDefault();
+                            setActiveSection(sections[next].id);
+                            document.getElementById(`gateway-tab-${sections[next].id}`)?.focus();
+                        }}
+                    >{section.label}</button>)}
+                </div>
+                <div id="gateway-section" role="tabpanel" aria-labelledby={`gateway-tab-${activeSection}`} tabIndex={0} className="space-y-5">
+                {activeSection === 'integration' && <div className="console-panel flex flex-wrap items-center justify-between gap-3">
+                    <p className="text-sm console-muted">{t('console.gateway_integration_help', { defaultValue: i18n.language.startsWith('zh') ? '选择协议与模型后复制示例，或同步到本地 CLI 工具。' : 'Choose a protocol and model to copy an example, or sync a local CLI client.' })}</p>
+                    <Link to="/api-guide" className="console-button">{t('console.gateway_guide', { defaultValue: i18n.language.startsWith('zh') ? '查看接入指南' : 'Open integration guide' })}</Link>
+                </div>}
 
                 {/* Loading State */}
                 {configLoading && (
@@ -1104,40 +1158,17 @@ print(response.choices[0].message.content)`;
 
                 {/* 配置区 */}
                 {!configLoading && !configError && appConfig && (
-                    <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200">
-                        <div className="px-4 py-2.5 border-b border-gray-100 dark:border-base-200 flex items-center justify-between">
+                    <div hidden={activeSection !== 'service'} className="rounded-xl border border-[var(--console-border)] bg-[var(--console-surface)]">
+                        <div className="px-5 py-4 border-b border-[var(--console-border)] flex items-center justify-between">
                             <div className="flex items-center gap-4">
                                 <h2 className="text-base font-semibold flex items-center gap-2 text-gray-900 dark:text-base-content">
                                     <Settings size={18} />
                                     {t('proxy.config.title')}
                                 </h2>
-                                {/* 状态指示器 */}
-                                <div className="flex items-center gap-2 pl-4 border-l border-gray-200 dark:border-base-300">
-                                    <div className={`w-2 h-2 rounded-full ${status.running ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`} />
-                                    <span className={`text-xs font-medium ${status.running ? 'text-green-600' : 'text-gray-500'}`}>
-                                        {status.running
-                                            ? `${t('proxy.status.running')} (${status.active_accounts} ${t('common.accounts')})`
-                                            : t('proxy.status.stopped')}
-                                    </span>
-                                </div>
                             </div>
 
-                            {/* 控制按钮 */}
-                            <div className="flex items-center gap-2">
-                                <button
-                                    onClick={handleToggle}
-                                    disabled={loading || !appConfig}
-                                    className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors flex items-center gap-2 ${status.running
-                                        ? 'bg-red-50 to-red-600 text-red-600 hover:bg-red-100 border border-red-200'
-                                        : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm shadow-blue-500/30'
-                                        } ${(loading || !appConfig) ? 'opacity-50 cursor-not-allowed' : ''}`}
-                                >
-                                    <Power size={14} />
-                                    {loading ? t('proxy.status.processing') : (status.running ? t('proxy.action.stop') : t('proxy.action.start'))}
-                                </button>
-                            </div>
                         </div>
-                        <div className="p-3 space-y-3">
+                        <div className="p-5 space-y-5">
                             {/* 监听端口、超时和自启动 */}
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                                 <div>
@@ -1331,8 +1362,9 @@ print(response.choices[0].message.content)`;
                                     </span>
                                 </label>
                                 <div className="flex gap-2">
-                                    <input
-                                        type="text"
+                                    <SecretInput
+                                        resetKey={activeSection}
+                                        aria-label={t('proxy.config.api_key')}
                                         value={isEditingApiKey ? tempApiKey : (appConfig.proxy.api_key)}
                                         onChange={(e) => isEditingApiKey && setTempApiKey(e.target.value)}
                                         readOnly={!isEditingApiKey}
@@ -1406,12 +1438,13 @@ print(response.choices[0].message.content)`;
                                     </span>
                                 </label>
                                 <div className="flex gap-2">
-                                    <input
-                                        type="text"
-                                        value={isEditingAdminPassword ? tempAdminPassword : (appConfig.proxy.admin_password || t('proxy.config.admin_password_default', { defaultValue: '(Same as API Key)' }))}
+                                    <SecretInput
+                                        resetKey={activeSection}
+                                        aria-label={t('proxy.config.admin_password')}
+                                        value={isEditingAdminPassword ? tempAdminPassword : (appConfig.proxy.admin_password || '')}
                                         onChange={(e) => isEditingAdminPassword && setTempAdminPassword(e.target.value)}
                                         readOnly={!isEditingAdminPassword}
-                                        placeholder={t('proxy.config.admin_password_placeholder', { defaultValue: 'Enter new password or leave empty to use API Key' })}
+                                        placeholder={isEditingAdminPassword ? t('proxy.config.admin_password_placeholder', { defaultValue: 'Enter new password or leave empty to use API Key' }) : t('proxy.config.admin_password_default', { defaultValue: '(Same as API Key)' })}
                                         className={`flex-1 px-2.5 py-1.5 border border-gray-300 dark:border-base-200 rounded-lg text-xs font-mono ${isEditingAdminPassword
                                             ? 'bg-white dark:bg-base-200 text-gray-900 dark:text-base-content'
                                             : 'bg-gray-50 dark:bg-base-300 text-gray-600 dark:text-gray-400'
@@ -1521,11 +1554,12 @@ print(response.choices[0].message.content)`;
                 {/* External Providers Integration */}
                 {
                     !configLoading && !configError && appConfig && (
-                        <div className="space-y-4">
+                        <div hidden={activeSection === 'service'} className="space-y-4">
                             <CollapsibleCard
+                                hidden={activeSection !== 'integration'}
                                 title={t('proxy.cli_sync.title', { defaultValue: 'CLI Sync' })}
                                 icon={<Terminal size={18} className="text-gray-500" />}
-                                defaultExpanded={false}
+                                defaultExpanded={true}
                             >
                                 <CliSyncCard
                                     proxyUrl={status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`}
@@ -1535,6 +1569,7 @@ print(response.choices[0].message.content)`;
 
                             {/* z.ai (GLM) Dispatcher */}
                             <CollapsibleCard
+                                hidden={activeSection !== 'routing'}
                                 title={t('proxy.config.zai.title')}
                                 icon={<Zap size={18} className="text-amber-500" />}
                                 enabled={!!appConfig.proxy.zai?.enabled}
@@ -1580,8 +1615,9 @@ print(response.choices[0].message.content)`;
                                                 </span>
                                             )}
                                         </label>
-                                        <input
-                                            type="password"
+                                        <SecretInput
+                                            resetKey={activeSection}
+                                            aria-label={t('proxy.config.zai.api_key')}
                                             value={appConfig.proxy.zai?.api_key || ''}
                                             onChange={(e) => updateZaiGeneralConfig({ api_key: e.target.value })}
                                             placeholder="sk-..."
@@ -1636,7 +1672,7 @@ print(response.choices[0].message.content)`;
                                                 <Settings size={12} />
                                                 {t('proxy.config.zai.models.advanced_title')}
                                             </summary>
-                                            <div className="mt-2 space-y-2 p-2 bg-gray-50 dark:bg-base-200/50 rounded-lg">
+                                            <div className="mt-2 space-y-2 p-2 bg-gray-50 dark:bg-base-200 rounded-lg">
                                                 {/* Advanced Mapping Table */}
                                                 {Object.entries(zaiModelMapping).map(([from, to]) => (
                                                     <div key={from} className="flex items-center gap-2">
@@ -1698,6 +1734,7 @@ print(response.choices[0].message.content)`;
 
                             {/* MCP System */}
                             <CollapsibleCard
+                                hidden={activeSection !== 'advanced'}
                                 title={t('proxy.config.zai.mcp.title')}
                                 icon={<Puzzle size={18} className="text-blue-500" />}
                                 enabled={!!appConfig.proxy.zai?.mcp?.enabled}
@@ -1760,6 +1797,7 @@ print(response.choices[0].message.content)`;
 
                             {/* Account Scheduling & Rotation */}
                             <CollapsibleCard
+                                hidden={activeSection !== 'routing'}
                                 title={t('proxy.config.scheduling.title')}
                                 icon={<RefreshCw size={18} className="text-indigo-500" />}
                             >
@@ -1929,6 +1967,7 @@ print(response.choices[0].message.content)`;
 
                             {/* Advanced Thinking & Global Config */}
                             <CollapsibleCard
+                                hidden={activeSection !== 'advanced'}
                                 title={t('settings.advanced_thinking.title', { defaultValue: 'Advanced Thinking & Global Config' })}
                                 icon={<BrainCircuit size={18} className="text-pink-500" />}
                             >
@@ -1940,6 +1979,7 @@ print(response.choices[0].message.content)`;
 
                             {/* 实验性设置 */}
                             <CollapsibleCard
+                                hidden={activeSection !== 'advanced'}
                                 title={t('proxy.config.experimental.title')}
                                 icon={<Sparkles size={18} className="text-purple-500" />}
                             >
@@ -2046,6 +2086,7 @@ print(response.choices[0].message.content)`;
                             {/* 公网访问 (Cloudflared) - 仅在桌面端显示 */}
                             {isTauri() && (
                                 <CollapsibleCard
+                                    hidden={activeSection !== 'advanced'}
                                     title={t('proxy.cloudflared.title', { defaultValue: 'Public Access (Cloudflared)' })}
                                     icon={<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-orange-500"><path d="M12 2L2 7l10 5 10-5-10-5z" /><path d="M2 17l10 5 10-5" /><path d="M2 12l10 5 10-5" /></svg>}
                                     enabled={cfStatus.running}
@@ -2156,8 +2197,9 @@ print(response.choices[0].message.content)`;
                                                         <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
                                                             {t('proxy.cloudflared.token', { defaultValue: 'Tunnel Token' })}
                                                         </label>
-                                                        <input
-                                                            type="password"
+                                                        <SecretInput
+                                                            resetKey={activeSection}
+                                                            aria-label={t('proxy.cloudflared.token')}
                                                             value={cfToken}
                                                             onChange={(e) => setCfToken(e.target.value)}
                                                             onBlur={() => {
@@ -2250,7 +2292,7 @@ print(response.choices[0].message.content)`;
                 {/* 模型路由中心 */}
                 {
                     !configLoading && !configError && appConfig && (
-                        <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden">
+                        <div hidden={activeSection !== 'routing'} className="rounded-xl border border-[var(--console-border)] bg-[var(--console-surface)] overflow-hidden">
                             <div className="px-4 py-3 border-b border-gray-100 dark:border-gray-700/50 bg-gray-50/50 dark:bg-gray-800/50">
                                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                                     <div className="flex-1">
@@ -2550,15 +2592,15 @@ print(response.choices[0].message.content)`;
                 {/* 多协议支持信息 */}
                 {
                     !configLoading && !configError && appConfig && (
-                        <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden">
+                        <div hidden={activeSection !== 'integration'} className="rounded-xl border border-[var(--console-border)] bg-[var(--console-surface)] overflow-hidden">
                             <div className="p-3">
                                 <div className="flex items-center gap-3 mb-3">
-                                    <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-md">
-                                        <Code size={16} className="text-white" />
+                                    <div className="w-8 h-8 rounded-lg bg-[var(--console-primary-soft)] text-[var(--console-primary)] flex items-center justify-center">
+                                        <Code size={16} />
                                     </div>
                                     <div>
                                         <h3 className="text-base font-bold text-gray-900 dark:text-base-content">
-                                            🔗 {t('proxy.multi_protocol.title')}
+                                            {t('proxy.multi_protocol.title')}
                                         </h3>
                                         <p className="text-[10px] text-gray-500 dark:text-gray-400">
                                             {t('proxy.multi_protocol.subtitle')}
@@ -2665,7 +2707,7 @@ print(response.choices[0].message.content)`;
                 {/* 支持模型与集成 */}
                 {
                     !configLoading && !configError && appConfig && (
-                        <div className="bg-white dark:bg-base-100 rounded-xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden mt-4">
+                        <div hidden={activeSection !== 'integration'} className="rounded-xl border border-[var(--console-border)] bg-[var(--console-surface)] overflow-hidden">
                             <div className="px-4 py-2.5 border-b border-gray-100 dark:border-base-200">
                                 <h2 className="text-base font-bold text-gray-900 dark:text-base-content flex items-center gap-2">
                                     <Terminal size={18} />
@@ -2675,7 +2717,7 @@ print(response.choices[0].message.content)`;
 
                             <div className="grid grid-cols-1 lg:grid-cols-3 gap-0 lg:divide-x dark:divide-gray-700">
                                 {/* 左侧：模型列表 */}
-                                <div className="col-span-2 p-0">
+                                <div className="lg:col-span-2 min-w-0 p-0">
                                     <div className="overflow-x-auto">
                                         <table className="table w-full">
                                             <thead className="bg-gray-50/50 dark:bg-gray-800/50 text-gray-500 dark:text-gray-400">
@@ -2717,10 +2759,17 @@ print(response.choices[0].message.content)`;
                                 </div>
 
                                 {/* 右侧：代码预览 */}
-                                <div className="col-span-1 bg-gray-900 text-blue-100 flex flex-col h-[400px] lg:h-auto">
-                                    <div className="p-3 border-b border-gray-800 flex items-center justify-between">
+                                <div className="col-span-1 min-w-0 bg-[var(--console-surface-muted)] text-[var(--console-text)] flex flex-col h-[400px] lg:h-auto" onBlur={(event) => {
+                                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) exampleVisibility.setRevealed(false);
+                                }}>
+                                    <div className="p-3 border-b border-[var(--console-border)] flex flex-wrap gap-2 items-center justify-between">
                                         <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">{t('proxy.multi_protocol.quick_integration')}</span>
-                                        <div className="flex gap-2">
+                                        <div className="flex flex-wrap gap-2">
+                                            <button type="button" className="console-button text-xs" aria-pressed={exampleVisibility.revealed} onClick={(event) => { event.currentTarget.focus(); exampleVisibility.setRevealed(!exampleVisibility.revealed); }}>
+                                                {exampleVisibility.revealed
+                                                    ? t('console.hide_secret', { defaultValue: i18n.language.startsWith('zh') ? '隐藏敏感信息' : 'Hide secret' })
+                                                    : t('console.reveal_secret', { defaultValue: i18n.language.startsWith('zh') ? '显示 30 秒' : 'Reveal for 30 seconds' })}
+                                            </button>
                                             {/* 这里可以放 cURL/Python 切换，或者直接默认显示 Python，根据 selectedProtocol 决定 */}
                                             <span className="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-400 border border-blue-500/30">
                                                 {selectedProtocol === 'anthropic' ? 'Python (Anthropic SDK)' : (selectedProtocol === 'gemini' ? 'Python (Google GenAI)' : 'Python (OpenAI SDK)')}
@@ -2730,17 +2779,18 @@ print(response.choices[0].message.content)`;
                                     <div className="flex-1 relative overflow-hidden group">
                                         <div className="absolute inset-0 overflow-auto scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
                                             <pre className="p-4 text-[10px] font-mono leading-relaxed">
-                                                {getPythonExample(selectedModelId)}
+                                                {getPythonExample(selectedModelId, exampleVisibility.revealed)}
                                             </pre>
                                         </div>
                                         <button
-                                            onClick={() => copyToClipboardHandler(getPythonExample(selectedModelId), 'example-code')}
-                                            className="absolute top-4 right-4 p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors text-white opacity-0 group-hover:opacity-100"
+                                            onClick={() => copyToClipboardHandler(getPythonExample(selectedModelId, true), 'example-code')}
+                                            aria-label={t('proxy.config.btn_copy')}
+                                            className="absolute top-4 right-4 console-button"
                                         >
                                             {copied === 'example-code' ? <CheckCircle size={16} /> : <Copy size={16} />}
                                         </button>
                                     </div>
-                                    <div className="p-3 bg-gray-800/50 border-t border-gray-800 text-[10px] text-gray-400">
+                                    <div className="p-3 bg-[var(--console-surface-muted)] border-t border-[var(--console-border)] text-xs console-muted">
                                         {t('proxy.multi_protocol.click_tip')}
                                     </div>
                                 </div>
@@ -2748,6 +2798,7 @@ print(response.choices[0].message.content)`;
                         </div>
                     )
                 }
+                </div>
                 {/* 各种对话框 */}
                 <ModalDialog
                     isOpen={isResetConfirmOpen}

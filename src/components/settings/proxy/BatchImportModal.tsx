@@ -183,7 +183,7 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
                     )}
                 </div>
 
-                <div className="p-6 border-t border-gray-100 dark:border-base-200 flex justify-end gap-3 bg-gray-50 dark:bg-base-200/50 rounded-b-2xl">
+                <div className="p-6 border-t border-gray-100 dark:border-base-200 flex justify-end gap-3 bg-gray-50 dark:bg-base-200 rounded-b-2xl">
                     <button
                         onClick={onClose}
                         className="px-5 py-2.5 rounded-xl border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 font-medium hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"

@@ -16,6 +16,7 @@ import { isTauri } from '../utils/env';
 
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
+import { PageHeader } from '../components/common/ConsolePage';
 
 
 function Settings() {
@@ -101,12 +102,13 @@ function Settings() {
             .then(path => setDataDirPath(path))
             .catch(err => console.error('Failed to get data dir:', err));
 
-        // 获取真实的开机自启状态
-        invoke<boolean>('is_auto_launch_enabled')
-            .then(enabled => {
-                setFormData(prev => ({ ...prev, auto_launch: enabled }));
-            })
-            .catch(err => console.error('Failed to get auto launch status:', err));
+        if (isTauri()) {
+            invoke<boolean>('is_auto_launch_enabled')
+                .then(enabled => {
+                    setFormData(prev => ({ ...prev, auto_launch: enabled }));
+                })
+                .catch(err => console.error('Failed to get auto launch status:', err));
+        }
 
         // 获取应用真实版本号
         if (isTauri()) {
@@ -312,79 +314,29 @@ function Settings() {
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto">
-            <div className="p-5 space-y-4 max-w-7xl mx-auto">
-                {/* 顶部工具栏：Tab 导航和保存按钮 */}
-                <div className="flex justify-between items-center">
-                    {/* Tab 导航 - 采用顶部导航栏样式：外层灰色容器 */}
-                    <div className="flex items-center gap-1 bg-gray-100 dark:bg-base-200 rounded-full p-1 w-fit">
+        <div className="console-page console-page-scroll h-full">
+            <div className="space-y-5">
+                <PageHeader
+                    title={t('nav.settings')}
+                    description={t('console.settings_description', { defaultValue: i18n.language.startsWith('zh') ? '管理控制台偏好、账号策略与服务设置。' : 'Manage console preferences, account policies, and service settings.' })}
+                    actions={<button type="button" className="console-button console-button-primary" onClick={handleSave}><Save size={16} />{t('settings.save')}</button>}
+                />
+                <nav className="console-tabs flex flex-wrap gap-1" aria-label={t('nav.settings')}>
+                    {(['general', 'account', 'proxy', 'advanced', 'debug', 'about'] as const).map(tab => (
                         <button
-                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'general'
-                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
-                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
-                                }`}
-                            onClick={() => setActiveTab('general')}
+                            key={tab}
+                            type="button"
+                            className={`console-tab ${activeTab === tab ? 'active' : ''}`}
+                            aria-current={activeTab === tab ? 'page' : undefined}
+                            onClick={() => setActiveTab(tab)}
                         >
-                            {t('settings.tabs.general')}
+                            {t(`settings.tabs.${tab}`)}
                         </button>
-                        <button
-                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'account'
-                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
-                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
-                                }`}
-                            onClick={() => setActiveTab('account')}
-                        >
-                            {t('settings.tabs.account')}
-                        </button>
-                        <button
-                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'proxy'
-                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
-                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
-                                }`}
-                            onClick={() => setActiveTab('proxy')}
-                        >
-                            {t('settings.tabs.proxy')}
-                        </button>
-                        <button
-                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'advanced'
-                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
-                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
-                                }`}
-                            onClick={() => setActiveTab('advanced')}
-                        >
-                            {t('settings.tabs.advanced')}
-                        </button>
-                        <button
-                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'debug'
-                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
-                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
-                                }`}
-                            onClick={() => setActiveTab('debug')}
-                        >
-                            {t('settings.tabs.debug')}
-                        </button>
-                        <button
-                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'about'
-                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
-                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
-                                }`}
-                            onClick={() => setActiveTab('about')}
-                        >
-                            {t('settings.tabs.about')}
-                        </button>
-                    </div>
-
-                    <button
-                        className="px-4 py-2 bg-blue-500 text-white text-sm rounded-lg hover:bg-blue-600 transition-colors flex items-center gap-2 shadow-sm"
-                        onClick={handleSave}
-                    >
-                        <Save className="w-4 h-4" />
-                        {t('settings.save')}
-                    </button>
-                </div>
+                    ))}
+                </nav>
 
                 {/* 设置表单 */}
-                <div className="bg-white dark:bg-base-100 rounded-2xl p-6 shadow-sm border border-gray-100 dark:border-base-200">
+                <div className="console-panel min-w-0">
                     {/* 通用设置 */}
                     {activeTab === 'general' && (
                         <div className="space-y-6">
@@ -435,14 +387,10 @@ function Settings() {
                             </div>
 
                             {/* 开机自动启动 */}
+                            {isTauri() && (
                             <div>
                                 <div className="flex justify-between items-center mb-2">
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content">{t('settings.general.auto_launch')}</label>
-                                    {!isTauri() && (
-                                        <span className="text-xs text-orange-500 dark:text-orange-400">
-                                            {t('settings.web_mode_limitation', '(Web 模式不支持)')}
-                                        </span>
-                                    )}
                                 </div>
                                 <select
                                     className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
@@ -464,6 +412,7 @@ function Settings() {
                                 </select>
                                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.auto_launch_desc')}</p>
                             </div>
+                            )}
 
                                 {/* 菜单显示设置 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-6 mt-6">
@@ -488,7 +437,10 @@ function Settings() {
                                             const isSettings = item.path === '/settings';
 
                                             return (
-                                                <div
+                                                <button
+                                                    type="button"
+                                                    aria-pressed={isVisible}
+                                                    disabled={isSettings}
                                                     key={item.path}
                                                     onClick={async () => {
                                                         if (!isSettings) {
@@ -551,12 +503,12 @@ function Settings() {
                                                     <span className={`font-medium text-sm ${isVisible ? 'text-blue-900 dark:text-blue-100' : 'text-gray-500'}`}>
                                                         {item.label}
                                                     </span>
-                                                </div>
+                                                </button>
                                             );
                                         })}
                                     </div>
                                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-4 flex items-center gap-1.5">
-                                        <div className="w-1.5 h-1.5 rounded-full bg-gray-400"></div>
+                                        <span className="w-1.5 h-1.5 shrink-0 rounded-full bg-gray-400" />
                                         {t('settings.menu.selected_items_note')}
                                     </p>
                                 </div>
@@ -720,12 +672,13 @@ function Settings() {
                         <>
                             <div className="space-y-4">
                                 {/* 默认导出路径 */}
+                                {isTauri() && (
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.export_path')}</label>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-wrap gap-2">
                                         <input
                                             type="text"
-                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={formData.default_export_path || t('settings.advanced.export_path_placeholder')}
                                             readOnly
                                         />
@@ -737,43 +690,34 @@ function Settings() {
                                                 {t('common.clear')}
                                             </button>
                                         )}
-                                        {isTauri() ? (
                                             <button
                                                 className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
                                                 onClick={handleSelectExportPath}
                                             >
                                                 {t('settings.advanced.select_btn')}
                                             </button>
-                                        ) : (
-                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
-                                            </span>
-                                        )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.default_export_path_desc')}</p>
                                 </div>
+                                )}
 
                                 {/* 数据目录 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">{t('settings.advanced.data_dir')}</label>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-wrap gap-2">
                                         <input
                                             type="text"
-                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={dataDirPath}
                                             readOnly
                                         />
-                                        {isTauri() ? (
+                                        {isTauri() && (
                                             <button
                                                 className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
                                                 onClick={handleOpenDataDir}
                                             >
                                                 {t('settings.advanced.open_btn')}
                                             </button>
-                                        ) : (
-                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
-                                            </span>
                                         )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.data_dir_desc')}</p>
@@ -784,10 +728,10 @@ function Settings() {
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_path')}
                                     </label>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-wrap gap-2">
                                         <input
                                             type="text"
-                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={formData.antigravity_executable || ''}
                                             placeholder={t('settings.advanced.antigravity_path_placeholder')}
                                             onChange={(e) => setFormData({ ...formData, antigravity_executable: e.target.value })}
@@ -806,17 +750,13 @@ function Settings() {
                                         >
                                             {t('settings.advanced.detect_btn')}
                                         </button>
-                                        {isTauri() ? (
+                                        {isTauri() && (
                                             <button
                                                 className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
                                                 onClick={handleSelectAntigravityPath}
                                             >
                                                 {t('settings.advanced.select_btn')}
                                             </button>
-                                        ) : (
-                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
-                                            </span>
                                         )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
@@ -825,14 +765,15 @@ function Settings() {
                                 </div>
 
                                 {/* Antigravity CLI (agy) 程序路径 */}
+                                {isTauri() && (
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_cli_path', 'Antigravity CLI (agy) Path')}
                                     </label>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-wrap gap-2">
                                         <input
                                             type="text"
-                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={formData.antigravity_cli_executable || ''}
                                             placeholder={t('settings.advanced.antigravity_cli_path_placeholder', '未设置 (将使用自动探测)')}
                                             onChange={(e) => setFormData({ ...formData, antigravity_cli_executable: e.target.value })}
@@ -851,18 +792,12 @@ function Settings() {
                                         >
                                             {t('settings.advanced.detect_btn')}
                                         </button>
-                                        {isTauri() ? (
                                             <button
                                                 className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
                                                 onClick={handleSelectAntigravityCliPath}
                                             >
                                                 {t('settings.advanced.select_btn')}
                                             </button>
-                                        ) : (
-                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
-                                            </span>
-                                        )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
                                         {t('settings.advanced.antigravity_cli_path_desc', '设置您的命令行客户端 (agy) 的可执行文件路径，用于一键解除账号限制。')}
@@ -896,16 +831,17 @@ function Settings() {
                                         </button>
                                     </div>
                                 </div>
+                                )}
 
                                 {/* Antigravity IDE 程序路径 */}
                                 <div>
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_ide_path', 'Antigravity IDE Path')}
                                     </label>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-wrap gap-2">
                                         <input
                                             type="text"
-                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={formData.antigravity_ide_executable || ''}
                                             placeholder={t('settings.advanced.antigravity_ide_path_placeholder', 'D:\\Antigravity\\Antigravity.exe')}
                                             onChange={(e) => setFormData({ ...formData, antigravity_ide_executable: e.target.value })}
@@ -918,17 +854,13 @@ function Settings() {
                                                 {t('common.clear')}
                                             </button>
                                         )}
-                                        {isTauri() ? (
+                                        {isTauri() && (
                                             <button
                                                 className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
                                                 onClick={handleSelectAntigravityIdePath}
                                             >
                                                 {t('settings.advanced.select_btn')}
                                             </button>
-                                        ) : (
-                                            <span className="self-center text-xs text-gray-400 dark:text-gray-500 italic px-2">
-                                                {t('settings.web_mode_limitation', '(Web 模式不支持)')}
-                                            </span>
                                         )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
@@ -941,10 +873,10 @@ function Settings() {
                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                         {t('settings.advanced.antigravity_args')}
                                     </label>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-wrap gap-2">
                                         <input
                                             type="text"
-                                            className="flex-1 px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                             value={formData.antigravity_args ? formData.antigravity_args.join(' ') : ''}
                                             placeholder={t('settings.advanced.antigravity_args_placeholder')}
                                             onChange={(e) => {
@@ -1050,10 +982,10 @@ function Settings() {
                                                     <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
                                                         {t('settings.advanced.debug_log_dir')}
                                                     </label>
-                                                    <div className="flex gap-2">
+                                                    <div className="flex flex-wrap gap-2">
                                                         <input
                                                             type="text"
-                                                            className="flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                                            className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
                                                             value={formData.proxy?.debug_logging?.output_dir || ''}
                                                             placeholder={`${dataDirPath.replace(/\/$/, '')}/debug_logs`}
                                                             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({
@@ -1255,26 +1187,26 @@ function Settings() {
                                 {/* Branding Section */}
                                 <div className="text-center space-y-4">
                                     <div className="relative inline-block group">
-                                        <div className="absolute inset-0 bg-blue-500/20 rounded-3xl blur-xl group-hover:blur-2xl transition-all duration-500"></div>
                                         <img
                                             src="/icon.svg"
                                             alt="API Manager Logo"
-                                            className="relative w-24 h-24 rounded-3xl shadow-2xl transform group-hover:scale-105 transition-all duration-500 rotate-3 group-hover:rotate-6 object-cover bg-white dark:bg-black"
+                                            className="relative w-20 h-20 rounded-2xl border border-gray-200 dark:border-base-300 object-cover bg-white dark:bg-black"
                                         />
                                     </div>
 
                                     <div>
-                                        <h3 className="text-3xl font-black text-gray-900 dark:text-base-content tracking-tight mb-2">{t('common.app_name', 'API Manager')}</h3>
-                                        <div className="flex items-center justify-center gap-2 text-sm">
+                                        <h3 className="text-3xl font-bold text-gray-900 dark:text-base-content tracking-tight mb-2">API Manager</h3>
+                                        <div className="flex flex-wrap items-center justify-center gap-2 text-sm">
                                             v{appVersion}
                                             <span className="text-gray-400 dark:text-gray-600">•</span>
                                             <span className="text-gray-500 dark:text-gray-400">{t('settings.branding.subtitle')}</span>
+                                            <span className="text-gray-500 dark:text-gray-400">· Antigravity Manager</span>
                                         </div>
                                     </div>
                                 </div>
 
                                 {/* Cards Grid - Now 5 columns */}
-                                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 w-full max-w-6xl px-4">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4 w-full">
                                     {/* Author Card */}
                                     <div className="bg-white dark:bg-base-100 p-4 rounded-2xl border border-gray-100 dark:border-base-300 shadow-sm hover:shadow-md hover:border-blue-200 dark:hover:border-blue-800 transition-all group flex flex-col items-center text-center gap-3">
                                         <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-xl group-hover:scale-110 transition-transform duration-300">
@@ -1333,7 +1265,7 @@ function Settings() {
                                     </a>
 
                                     {/* Support Card */}
-                                    <div
+                                    <button type="button"
                                         onClick={() => setIsSupportModalOpen(true)}
                                         className="bg-white dark:bg-base-100 p-4 rounded-2xl border border-gray-100 dark:border-base-300 shadow-sm hover:shadow-md hover:border-pink-200 dark:hover:border-pink-800 transition-all group flex flex-col items-center text-center gap-3 cursor-pointer"
                                     >
@@ -1344,11 +1276,11 @@ function Settings() {
                                             <div className="text-xs text-gray-400 uppercase tracking-wider font-semibold mb-1">{t('settings.about.support_title')}</div>
                                             <div className="font-bold text-gray-900 dark:text-base-content">{t('settings.about.support_btn')}</div>
                                         </div>
-                                    </div>
+                                    </button>
                                 </div>
 
                                 {/* Tech Stack Badges */}
-                                <div className="flex gap-2 justify-center">
+                                <div className="flex flex-wrap gap-2 justify-center">
                                     <div className="px-3 py-1 bg-gray-50 dark:bg-base-200 rounded-lg text-xs font-medium text-gray-500 dark:text-gray-400 border border-gray-100 dark:border-base-300">
                                         Tauri v2
                                     </div>
@@ -1362,7 +1294,7 @@ function Settings() {
 
                             </div>
 
-                            <div className="text-center text-[10px] text-gray-300 dark:text-gray-600 mt-auto pb-2">
+                            <div className="text-center text-xs text-gray-500 dark:text-gray-400 mt-8 pb-2">
                                 {t('settings.about.copyright')}
                             </div>
                         </div>

@@ -143,7 +143,7 @@ export default function AccountErrorDialog({ account, onClose }: AccountErrorDia
                     <label className="text-[10px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-wider block mb-1.5 ml-1">
                         {t('accounts.account')}
                     </label>
-                    <div className="text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-base-200/50 px-4 py-2.5 rounded-xl border border-gray-100 dark:border-base-200 shadow-sm">
+                    <div className="text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-50 dark:bg-base-200 px-4 py-2.5 rounded-xl border border-gray-100 dark:border-base-200 shadow-sm">
                         {account.email}
                     </div>
                 </div>
@@ -274,7 +274,7 @@ export default function AccountErrorDialog({ account, onClose }: AccountErrorDia
                                         <ol className="list-decimal pl-4 space-y-2 text-[11px] text-gray-600 dark:text-gray-400 marker:text-gray-400 font-medium">
                                             <li>
                                                 {t('accounts.fix_guide.step2_li1_prefix', '先执行清除命令退出旧认证：')}
-                                                <div className="bg-gray-100 dark:bg-base-300/50 mt-1 px-2 py-1.5 rounded text-red-600 dark:text-red-400 inline-block font-mono">
+                                                <div className="bg-gray-100 dark:bg-base-300 mt-1 px-2 py-1.5 rounded text-red-600 dark:text-red-400 inline-block font-mono">
                                                     gcloud auth revoke {account.email || 'your-email@gmail.com'}
                                                 </div>
                                             </li>

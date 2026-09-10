@@ -131,7 +131,7 @@ const QuotaProtection = ({ config, onChange }: QuotaProtectionProps) => {
                                             flex items-center justify-between p-2 rounded-lg border cursor-pointer transition-all duration-200
                                             ${isSelected
                                                 ? 'bg-rose-50 dark:bg-rose-900/10 border-rose-200 dark:border-rose-800/50 text-rose-700 dark:text-rose-400'
-                                                : 'bg-gray-50/50 dark:bg-base-200/50 border-gray-100 dark:border-base-300/50 text-gray-500 hover:border-gray-200 dark:hover:border-base-300'}
+                                                : 'bg-gray-50/50 dark:bg-base-200 border-gray-100 dark:border-base-300 text-gray-500 hover:border-gray-200 dark:hover:border-base-300'}
                                         `}
                                     >
                                         <span className="text-[11px] font-medium truncate pr-2">

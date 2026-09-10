@@ -64,7 +64,7 @@ export default function CircuitBreaker({
             </div>
 
             {/* 零配额持续熔断开关 */}
-            <div className="flex items-center justify-between p-3 bg-gray-50/50 dark:bg-base-200/50 rounded-xl border border-gray-100 dark:border-base-300/50">
+            <div className="flex items-center justify-between p-3 bg-gray-50/50 dark:bg-base-200 rounded-xl border border-gray-100 dark:border-base-300">
                 <div className="space-y-0.5">
                     <div className="text-sm font-bold text-gray-900 dark:text-gray-100">
                         {t("proxy.config.circuit_breaker.lock_on_zero_quota", { defaultValue: "Lock on Zero Quota (5h / Weekly)" })}

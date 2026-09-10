@@ -22,7 +22,7 @@ interface SecurityMonitorConfig {
 export const SecurityConfig: React.FC = () => {
     const { t } = useTranslation();
     const [config, setConfig] = useState<SecurityMonitorConfig | null>(null);
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
 
     useEffect(() => {
@@ -57,20 +57,20 @@ export const SecurityConfig: React.FC = () => {
     };
 
     if (loading) {
-        return <div className="p-10 text-center"><span className="loading loading-spinner"></span></div>;
+        return <div role="status" className="p-10 text-center text-gray-500">{t('common.loading')}</div>;
     }
 
     if (!config) {
-        return <div className="p-10 text-center text-error">{t('security.config.load_error')}</div>;
+        return <div role="alert" className="p-10 text-center space-y-4 text-error"><p>{t('security.config.load_error')}</p><button className="console-button" onClick={loadConfig}>{t('common.refresh')}</button></div>;
     }
 
     return (
-        <div className="p-6 max-w-4xl mx-auto space-y-8 h-full overflow-y-auto">
-            <div className="flex items-center justify-between">
+        <div className="p-4 md:p-5 w-full max-w-4xl mx-auto space-y-5 h-full min-h-0 overflow-y-auto">
+            <div className="console-toolbar justify-between">
                 <h2 className="text-xl font-bold">{t('security.config.title')}</h2>
                 <button
                     onClick={handleSave}
-                    className="btn btn-primary gap-2"
+                    className="console-button console-button-primary"
                     disabled={saving}
                 >
                     {saving ? <span className="loading loading-spinner loading-xs"></span> : <Save size={18} />}
@@ -79,8 +79,8 @@ export const SecurityConfig: React.FC = () => {
             </div>
 
             {/* Blacklist Settings */}
-            <div className="card bg-base-100 border border-gray-200 dark:border-base-300 shadow-sm">
-                <div className="card-body">
+            <div className="console-panel">
+                <div className="space-y-3">
                     <h3 className="card-title flex items-center gap-2 text-red-500">
                         <Shield size={24} />
                         {t('security.config.blacklist_title')}
@@ -123,8 +123,8 @@ export const SecurityConfig: React.FC = () => {
             </div>
 
             {/* Whitelist Settings */}
-            <div className="card bg-base-100 border border-gray-200 dark:border-base-300 shadow-sm">
-                <div className="card-body">
+            <div className="console-panel">
+                <div className="space-y-3">
                     <h3 className="card-title flex items-center gap-2 text-green-500">
                         <ShieldCheck size={24} />
                         {t('security.config.whitelist_title')}
@@ -144,7 +144,7 @@ export const SecurityConfig: React.FC = () => {
                             />
                             <span className="label-text font-medium">{t('security.config.enable_whitelist')}</span>
                         </label>
-                        <div className="text-xs text-gray-500 ml-14 mt-1 bg-yellow-50 dark:bg-yellow-900/20 p-2 rounded flex items-start gap-2">
+                        <div className="text-xs text-gray-500 mt-2 bg-yellow-50 dark:bg-yellow-900/20 p-3 rounded flex items-start gap-2">
                             <AlertTriangle size={14} className="mt-0.5 text-yellow-600 dark:text-yellow-400 shrink-0" />
                             {t('security.config.whitelist_warning')}
                         </div>

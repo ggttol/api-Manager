@@ -35,11 +35,13 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
     const { t } = useTranslation();
     const [stats, setStats] = useState<IpStatsResponse | null>(null);
     const [tokenStats, setTokenStats] = useState<IpTokenStats[]>([]);
-    const [loading, setLoading] = useState(false);
+    const [loading, setLoading] = useState(true);
+    const [loadError, setLoadError] = useState(false);
     const [timeRange, setTimeRange] = useState<number>(24);
 
     const loadStats = async () => {
         setLoading(true);
+        setLoadError(false);
         try {
             const [statsData, tokenData] = await Promise.all([
                 invoke<IpStatsResponse>('get_ip_stats'),
@@ -48,6 +50,7 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
             setStats(statsData);
             setTokenStats(tokenData || []);
         } catch (e) {
+            setLoadError(true);
             console.error('Failed to load stats', e);
         } finally {
             setLoading(false);
@@ -69,22 +72,23 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
     };
 
     if (loading && !stats) {
-        return <div className="p-10 text-center"><span className="loading loading-spinner"></span></div>;
+        return <div role="status" className="p-10 text-center text-gray-500">{t('common.loading')}</div>;
     }
 
     if (!stats) {
-        return <div className="p-10 text-center text-gray-500">{t('security.stats.no_data')}</div>;
+        return <div role={loadError ? 'alert' : 'status'} className="p-10 text-center text-gray-500">{loadError ? t('common.load_failed') : t('security.stats.no_data')}</div>;
     }
 
     const maxReqCount = Math.max(...tokenStats.map(ip => ip.request_count), 1);
 
     return (
-        <div className="h-full flex flex-col overflow-hidden">
-            <div className="flex-1 overflow-y-scroll p-6 space-y-6">
+        <div className="h-full min-h-0 min-w-0 flex flex-col overflow-hidden">
+            <div className="flex-1 min-w-0 overflow-y-auto p-4 md:p-5 space-y-5">
+                {loadError && <div role="alert" className="text-sm text-error">{t('common.load_failed')}</div>}
 
                 {/* Overview Cards */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <div className="stat bg-white dark:bg-base-200 shadow rounded-xl border border-gray-100 dark:border-base-300">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="console-panel stat min-w-0">
                         <div className="stat-figure text-blue-500">
                             <Activity size={32} />
                         </div>
@@ -93,7 +97,7 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
                         <div className="stat-desc">{t('security.stats.total_requests_desc')}</div>
                     </div>
 
-                    <div className="stat bg-white dark:bg-base-200 shadow rounded-xl border border-gray-100 dark:border-base-300">
+                    <div className="console-panel stat min-w-0">
                         <div className="stat-figure text-purple-500">
                             <Users size={32} />
                         </div>
@@ -102,7 +106,7 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
                         <div className="stat-desc">{t('security.stats.unique_ips_desc')}</div>
                     </div>
 
-                    <div className="stat bg-white dark:bg-base-200 shadow rounded-xl border border-gray-100 dark:border-base-300">
+                    <div className="console-panel stat min-w-0">
                         <div className="stat-figure text-red-500">
                             <ShieldAlert size={32} />
                         </div>
@@ -114,8 +118,8 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
 
                 <div className="w-full">
                     {/* Combined IP Stats */}
-                    <div className="bg-white dark:bg-base-200 rounded-xl shadow-sm border border-gray-100 dark:border-base-300 overflow-hidden">
-                        <div className="p-4 border-b border-gray-100 dark:border-base-300 flex items-center justify-between gap-2">
+                    <div className="console-panel !p-0 min-w-0 overflow-hidden">
+                        <div className="console-toolbar p-4 border-b border-[var(--console-border)] justify-between">
                             <div className="flex items-center gap-2">
                                 <Globe size={20} className="text-blue-500" />
                                 <h3 className="font-bold text-lg">{t('security.stats.ip_activity_token_usage')} ({getTimeRangeLabel()})</h3>
@@ -140,7 +144,7 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
                             </div>
                         </div>
                         <div className="overflow-x-auto">
-                            <table className="table w-full">
+                            <table className="table table-sm w-full min-w-[800px] text-sm">
                                 <thead>
                                     <tr>
                                         <th className="w-12">{t('security.stats.rank')}</th>
@@ -177,7 +181,7 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
                                                         </div>
                                                         <div className="w-full bg-gray-100 dark:bg-base-300 rounded-full h-1.5">
                                                             <div
-                                                                className="bg-blue-500 h-1.5 rounded-full transition-all duration-500"
+                                                                className="bg-blue-500 h-1.5 rounded-full"
                                                                 style={{ width: `${percentage}%` }}
                                                             ></div>
                                                         </div>
