@@ -13,8 +13,14 @@ pub async fn service_status_middleware(
 ) -> Response {
     let path = request.uri().path();
 
-    // Always allow Admin API, internal endpoints and Auth callback
-    if path.starts_with("/api/") || path.starts_with("/internal/") || path == "/auth/callback" || path == "/health" {
+    // Pause inference, not the management UI or its static assets.
+    let inference = path.starts_with("/v1/")
+        || path.starts_with("/v1beta/")
+        || path.starts_with("/codex/v1/")
+        || path == "/responses"
+        || path.starts_with("/responses/")
+        || path.starts_with("/mcp/");
+    if !inference {
         return next.run(request).await;
     }
 

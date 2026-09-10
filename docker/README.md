@@ -2,6 +2,23 @@
 
 本目錄包含 Antigravity Manager 的原生 Headless Docker 部署方案。該方案支持完整的 Web 管理界面、API 反代以及數據持久化，無需複雜的 VNC 或桌面環境。
 
+## API Manager Codex 修改版
+
+上游的 `lbjlaq/antigravity-manager:latest` **不包含**本仓库新增的 Codex 通道。部署此功能需要从当前源码构建镜像，并只替换现有 Compose 服务的 `image`，保留原有环境变量、网络、端口与数据卷：
+
+```bash
+docker build --build-arg GIT_REVISION="$(git rev-parse HEAD)" \
+  -f docker/Dockerfile -t api-manager:codex .
+```
+
+网络受限时可加 `--build-arg USE_MIRROR=true`。构建使用锁定的 Cargo 依赖，镜像带有源码地址与提交号标签。默认 Dockerfile 同时构建前端和后端，不依赖本地 `dist/`。
+
+升级前备份完整数据卷及原 Compose 文件，保留旧镜像标签；SQLite 应在服务停止时复制或使用 SQLite 在线备份。Codex 数据位于数据卷内的 `codex/`，其中 `key` 与 `accounts.enc.json` 必须共同备份，不可提交 Git。请为 `WEB_PASSWORD` 设置独立管理密码，使用 HTTPS 或 SSH 隧道管理授权。
+
+升级后检查 `/health`、原 Google 账号列表与 `/codex` 页面，再进行设备码授权或导入。未授权时 `/codex/v1/models` 和推理请求返回无可用账号错误，这是明确失败而非假模型目录。完成授权后，选择实际模型并复制页面生成的 Codex 客户端配置。详见 [Codex API](../docs/API_REFERENCE.md#codex-订阅通道-api-manager)。
+
+需要回滚时，将 Compose `image` 改为保留的旧镜像并重建容器；若必须恢复数据，先停服务，再恢复完整备份。不要覆盖正在使用的凭据或 SQLite 文件。
+
 ## 🆕 本版本部署方案（本地前端構建復用）
 適用於「前端近期不改、後端經常調整」的場景。思路是先在本地生成 `dist/`，Docker 只編譯後端並直接拷貝 `dist/`，大幅縮短構建時間並降低前端構建風險。
 

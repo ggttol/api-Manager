@@ -3,6 +3,19 @@ const isTauri = typeof window !== 'undefined' && (!!(window as any).__TAURI_INTE
 
 // 命令到 API 的映射
 const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'DELETE' | 'PATCH' }> = {
+  // Codex subscription management is HTTP-only.
+  'codex_list_accounts': { url: '/api/codex/accounts', method: 'GET' },
+  'codex_import_account': { url: '/api/codex/accounts/import', method: 'POST' },
+  'codex_update_account': { url: '/api/codex/accounts/:id', method: 'PATCH' },
+  'codex_delete_account': { url: '/api/codex/accounts/:id', method: 'DELETE' },
+  'codex_activate_account': { url: '/api/codex/accounts/:id/activate', method: 'POST' },
+  'codex_refresh_account': { url: '/api/codex/accounts/:id/refresh', method: 'POST' },
+  'codex_account_usage': { url: '/api/codex/accounts/:id/usage', method: 'GET' },
+  'codex_models': { url: '/api/codex/models', method: 'GET' },
+  'codex_start_device_auth': { url: '/api/codex/auth/device', method: 'POST' },
+  'codex_device_auth_status': { url: '/api/codex/auth/device/:id', method: 'GET' },
+  'codex_cancel_device_auth': { url: '/api/codex/auth/device/:id', method: 'DELETE' },
+
   // Accounts
   'list_accounts': { url: '/api/accounts', method: 'GET' },
   'get_current_account': { url: '/api/accounts/current', method: 'GET' },
@@ -165,7 +178,13 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_account_proxy_binding': { url: '/api/proxy/pool/binding/:accountId', method: 'GET' },
 };
 
-export async function request<T>(cmd: string, args?: any): Promise<T> {
+export async function request<T>(cmd: string, inputArgs?: unknown, requestOptions?: { signal?: AbortSignal }): Promise<T> {
+  // Command callers can supply typed interfaces without a string index signature.
+  const args = inputArgs as Record<string, unknown> | undefined;
+  const isCodex = cmd.startsWith('codex_');
+  if (isCodex && isTauri) {
+    throw new Error('Codex management is available in the server web interface only.');
+  }
   // 1. Tauri 环境：直接使用 invoke ...
   if (isTauri) {
     try {
@@ -206,6 +225,8 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
 
   const options: RequestInit = {
     method: mapping.method,
+    signal: requestOptions?.signal,
+    ...(isCodex ? { cache: 'no-store' as const } : {}),
     headers: {
       'Content-Type': 'application/json',
       ...(apiKey ? {
@@ -261,11 +282,14 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
     try {
       return JSON.parse(text) as T;
     } catch (e) {
+      if (isCodex) throw new Error('Invalid JSON response from Codex management API.');
       console.warn(`Failed to parse JSON response for [${cmd}]:`, text);
       return text as unknown as T; // Fallback for plain text responses
     }
   } catch (error) {
-    console.error(`Web Fetch Error [${cmd}]:`, error);
+    if (!isCodex && !(error instanceof DOMException && error.name === 'AbortError')) {
+      console.error(`Web Fetch Error [${cmd}]:`, error);
+    }
     throw error;
   }
 }

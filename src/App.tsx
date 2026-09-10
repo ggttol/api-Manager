@@ -11,6 +11,7 @@ import Security from './pages/Security';
 import ThemeManager from './components/common/ThemeManager';
 import UserToken from './pages/UserToken';
 import { ApiKeyFun } from './pages/ApiKeyFun';
+import Codex from './pages/Codex';
 import { UpdateNotification } from './components/UpdateNotification';
 import DebugConsole from './components/debug/DebugConsole';
 import { useEffect, useState } from 'react';
@@ -38,6 +39,10 @@ const router = createBrowserRouter([
       {
         path: 'api-proxy',
         element: <ApiProxy />,
+      },
+      {
+        path: 'codex',
+        element: <Codex />,
       },
       {
         path: 'monitor',

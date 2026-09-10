@@ -165,17 +165,9 @@ pub async fn internal_start_proxy_service(
     let active_accounts = token_manager.load_accounts().await.unwrap_or(0);
 
     if active_accounts == 0 {
-        let zai_enabled = config.zai.enabled
-            && !matches!(config.zai.dispatch_mode, crate::proxy::ZaiDispatchMode::Off);
-        if !zai_enabled {
-            tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
-            return Ok(ProxyStatus {
-                running: false,
-                port: config.port,
-                base_url: format!("http://127.0.0.1:{}", config.port),
-                active_accounts: 0,
-            });
-        }
+        // Provider availability is checked by its handler, not by the shared listener.
+        // In particular, a Codex-only deployment must start without Google accounts.
+        tracing::info!("Antigravity account pool is empty; other providers and account onboarding remain available");
     }
 
     let mut instance_lock = state.instance.write().await;

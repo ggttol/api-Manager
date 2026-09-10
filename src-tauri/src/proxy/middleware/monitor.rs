@@ -487,7 +487,9 @@ pub async fn monitor_middleware(
         .map(|s| s.to_string());
 
     // Determine protocol from URL path
-    let protocol = if uri.contains("/v1/messages") {
+    let protocol = if uri.starts_with("/codex/") {
+        Some("codex".to_string())
+    } else if uri.contains("/v1/messages") {
         Some("anthropic".to_string())
     } else if uri.contains("/v1beta/models") {
         Some("gemini".to_string())

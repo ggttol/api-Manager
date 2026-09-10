@@ -1,3 +1,15 @@
+# API Manager
+
+本仓库是 [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) 的修改版，保留原有 Antigravity 服务，并增加服务端 Codex / ChatGPT 订阅接入。原作者署名和 `CC-BY-NC-SA-4.0` 许可证保持不变；Fork 不授予额外商业使用权限。
+
+打开 Web 后台的 **Codex** 页面，可使用设备码授权或导入 Codex 的 `auth.json`，管理独立账号、刷新授权、查询真实用量和模型目录。客户端使用独立的 `/codex/v1` HTTP Responses 入口，不经过 GPT → Gemini 模型映射。请使用页面生成的客户端配置，并在终端设置自己的网关密钥；不要分发管理员密码或订阅 Token。
+
+凭据导入和授权必须通过可信 HTTPS 或 SSH 隧道完成。Codex 凭据加密保存在数据目录的 `codex/` 子目录中，备份时必须同时保存 `key` 和 `accounts.enc.json`；密钥与密文同盘不能防御整机失陷。会话绑定保存在内存，重启后无法识别的续接会明确报错，需要开启新会话。此接入不提供 WebSocket，也不保证上游订阅接口的长期兼容性或第三方共享使用授权。
+
+完整路由、鉴权与运行边界见 [API Reference](docs/API_REFERENCE.md#codex-订阅通道-api-manager)。
+
+---
+
 # Antigravity Tools 🚀
 > 专业级 AI 账号管理与协议代理系统 (v4.7.0)
 <div align="center">

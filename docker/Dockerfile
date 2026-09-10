@@ -83,11 +83,14 @@ WORKDIR /app/src-tauri
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
-    cargo build --release --bin antigravity-tools && \
+    cargo build --locked --release --bin antigravity-tools && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
 
 # --- Final Runtime Stage ---
 FROM debian:bookworm-slim
+ARG GIT_REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/ggttol/api-Manager" \
+      org.opencontainers.image.revision="${GIT_REVISION}"
 ARG USE_MIRROR=auto
 WORKDIR /app
 

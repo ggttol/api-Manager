@@ -87,6 +87,7 @@ pub fn take_pending_delete_accounts() -> Vec<String> {
 #[derive(Clone)]
 pub struct AppState {
     pub token_manager: Arc<TokenManager>,
+    pub codex: Arc<crate::proxy::codex::CodexManager>,
     pub custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     pub request_timeout: u64, // API 请求超时(秒)
     #[allow(dead_code)]
@@ -411,6 +412,7 @@ pub struct AxumServer {
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
     upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
+    codex: Arc<crate::proxy::codex::CodexManager>,
     security_state: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,
     zai_state: Arc<RwLock<crate::proxy::ZaiConfig>>,
     experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
@@ -446,6 +448,9 @@ impl AxumServer {
             *proxy = new_config.clone();
         }
         // [HOT-RELOAD] Rebuild default HTTP client with new upstream proxy
+        if let Err(error) = self.codex.update_proxy(Some(new_config.clone())).await {
+            tracing::error!("Failed to update Codex upstream proxy: {}", error);
+        }
         self.upstream.rebuild_default_client(Some(new_config)).await;
         // Stale per-proxy clients may also be affected (e.g. fallback path)
         self.upstream.clear_client_cache();
@@ -556,6 +561,10 @@ impl AxumServer {
 
         let state = AppState {
             token_manager: token_manager.clone(),
+            codex: Arc::new(crate::proxy::codex::CodexManager::new(
+                account::get_data_dir()?,
+                Some(upstream_proxy.clone()),
+            )?),
             custom_mapping: custom_mapping_state.clone(),
             request_timeout,
             thought_signature_map: Arc::new(tokio::sync::Mutex::new(
@@ -603,6 +612,7 @@ impl AxumServer {
 
         // 1. 构建主 AI 代理路由 (遵循 auth_mode 配置)
         let proxy_routes = Router::new()
+            .nest("/codex/v1", crate::proxy::codex::proxy_routes())
             .route("/health", get(health_check_handler))
             .route("/healthz", get(health_check_handler))
             // OpenAI Protocol
@@ -695,6 +705,7 @@ impl AxumServer {
 
         // 2. 构建管理 API (强制鉴权)
         let admin_routes = Router::new()
+            .nest("/codex", crate::proxy::codex::admin_routes())
             .route("/health", get(health_check_handler))
             .route(
                 "/accounts",
@@ -995,6 +1006,7 @@ impl AxumServer {
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
             upstream: state.upstream.clone(),
+            codex: state.codex.clone(),
             security_state,
             zai_state,
             experimental: experimental_state.clone(),
