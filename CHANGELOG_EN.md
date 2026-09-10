@@ -2,6 +2,12 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Codex Anthropic Messages compatibility
+
+Added `/codex/v1/messages` for the isolated Codex account pool: text, images, incremental SSE, and tool round trips reuse existing authorization, proxying, and account isolation. Private reasoning remains server-side behind scoped tool handles. Added Anthropic authentication error envelopes and corrected monitor tool-argument assembly and cached-input totals. Exact `count_tokens` explicitly returns `501`; the guide and API Reference disclose output-budget and other compatibility differences.
+
+The bilingual integration guide now generates Anthropic curl and Claude Code configuration from the live Codex catalog, using the correct `/codex` base URL and environment-only key references. Verified official SDK text/image/streamed-tool calls, a real Claude Code 2.1.263 Read-tool round trip, desktop/mobile/dark-mode presentation, and clipboard behavior. All 15 Codex and 5 middleware regressions passed; native Responses remains operational.
+
 ## Codex full-history recovery
 
 Fixed plain assistant messages in complete conversation history being treated as account-bound continuation, which caused `409` after a service restart. Text history can establish a new binding; unknown response IDs, encrypted state, tool outputs, and unavailable pinned accounts remain protected. Regression coverage includes restart recovery and unknown-state rejection; production streaming and non-streaming inference both returned `200`.

@@ -303,13 +303,25 @@ fn value_as_u32(value: Option<&Value>) -> Option<u32> {
 }
 
 fn extract_input_tokens(usage: &Value) -> Option<u32> {
-    value_as_u32(
+    let input = value_as_u32(
         usage
             .get("prompt_tokens")
             .or_else(|| usage.get("input_tokens"))
             .or_else(|| usage.get("total_input_tokens"))
             .or_else(|| usage.get("promptTokenCount")),
-    )
+    )?;
+    // Anthropic reports uncached input separately; monitor totals include all input.
+    // OpenAI-style consolidated logs already include cache hits in prompt_tokens.
+    if usage.get("prompt_tokens").is_none() && usage.get("input_tokens").is_some() {
+        return Some(
+            input
+                .saturating_add(value_as_u32(usage.get("cache_read_input_tokens")).unwrap_or(0))
+                .saturating_add(
+                    value_as_u32(usage.get("cache_creation_input_tokens")).unwrap_or(0),
+                ),
+        );
+    }
+    Some(input)
 }
 
 fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
@@ -686,7 +698,7 @@ pub async fn monitor_middleware(
 
                                     // Tool use input delta
                                     if let Some(delta_json) =
-                                        delta.get("input_json_delta").and_then(|v| v.as_str())
+                                        delta.get("partial_json").and_then(|v| v.as_str())
                                     {
                                         if idx < tool_calls.len() && !tool_calls[idx].is_null() {
                                             let old_args = tool_calls[idx]["function"]["arguments"]
@@ -708,17 +720,6 @@ pub async fn monitor_middleware(
                                     // Text content
                                     if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                                         response_content.push_str(text);
-                                    }
-                                }
-                            }
-                            Some("message_delta") => {
-                                if let Some(delta) = json.get("delta") {
-                                    if let Some(usage) = delta.get("usage") {
-                                        if let Some(output_tokens) =
-                                            usage.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            log.output_tokens = Some(output_tokens as u32);
-                                        }
                                     }
                                 }
                             }
@@ -788,13 +789,14 @@ pub async fn monitor_middleware(
                         if let Some(usage) = json
                             .get("usage")
                             .or(json.get("usageMetadata"))
+                            .or(json.get("message").and_then(|m| m.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
+                            log.input_tokens = extract_input_tokens(usage).or(log.input_tokens);
+                            log.output_tokens = extract_output_tokens(usage).or(log.output_tokens);
+                            cached_tokens = extract_cached_tokens(usage).or(cached_tokens);
+                            log.cached_tokens = cached_tokens.or(log.cached_tokens);
                             reasoning_tokens =
                                 reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
 
@@ -947,7 +949,10 @@ pub async fn monitor_middleware(
             // [FIX #3325] Fallback input token estimation for stream responses
             if log.input_tokens.is_none() {
                 if let Some(ref req_body) = log.request_body {
-                    let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
+                    let estimated =
+                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(
+                            req_body,
+                        );
                     if estimated > 0 {
                         log.input_tokens = Some(estimated);
                     }
@@ -1046,7 +1051,7 @@ pub async fn monitor_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::next_chunk_while_receiver_open;
+    use super::{extract_input_tokens, next_chunk_while_receiver_open};
     use futures::stream;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -1060,6 +1065,20 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn cache_buckets_are_counted_once_in_monitor_input_totals() {
+        let anthropic = serde_json::json!({
+            "input_tokens": 11, "cache_read_input_tokens": 19,
+            "cache_creation_input_tokens": 7
+        });
+        let consolidated = serde_json::json!({
+            "prompt_tokens": 37, "cache_read_input_tokens": 19,
+            "prompt_tokens_details": {"cached_tokens": 19}
+        });
+        assert_eq!(extract_input_tokens(&anthropic), Some(37));
+        assert_eq!(extract_input_tokens(&consolidated), Some(37));
     }
 
     #[tokio::test]

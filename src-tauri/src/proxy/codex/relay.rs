@@ -19,10 +19,10 @@ use super::{auth, now, parse_json, store::Record, CodexError, CodexManager};
 use crate::proxy::server::AppState;
 
 const MAX_SESSIONS: usize = 8192;
-const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub(super) const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_EVENT: usize = 32 * 1024 * 1024;
-const MAX_COLLECTED: usize = 64 * 1024 * 1024;
-const STREAM_IDLE: Duration = Duration::from_secs(300);
+pub(super) const MAX_COLLECTED: usize = 64 * 1024 * 1024;
+pub(super) const STREAM_IDLE: Duration = Duration::from_secs(300);
 
 struct Pin {
     account_id: String,
@@ -31,12 +31,14 @@ struct Pin {
 #[derive(Default)]
 pub(super) struct SessionCache {
     pins: HashMap<[u8; 32], Pin>,
+    pub(super) anthropic_tools: super::anthropic::ToolCache,
 }
 
 impl SessionCache {
     fn prune(&mut self) {
         self.pins
             .retain(|_, pin| pin.touched.elapsed() < SESSION_TTL);
+        self.anthropic_tools.prune();
     }
     fn lookup(&mut self, key: &[u8; 32]) -> Option<String> {
         self.pins.get_mut(key).map(|pin| {
@@ -70,7 +72,7 @@ impl SessionCache {
     }
 }
 
-fn scope(headers: &HeaderMap) -> [u8; 32] {
+pub(super) fn scope(headers: &HeaderMap) -> [u8; 32] {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -88,7 +90,7 @@ fn scope(headers: &HeaderMap) -> [u8; 32] {
         .unwrap_or("");
     Sha256::digest(token.as_bytes()).into()
 }
-fn session_key(scope: &[u8; 32], kind: &str, id: &str) -> [u8; 32] {
+pub(super) fn session_key(scope: &[u8; 32], kind: &str, id: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(scope);
     hash.update(kind.as_bytes());
@@ -170,10 +172,33 @@ async fn select_account(
     body: &Value,
     scope: &[u8; 32],
 ) -> Result<String, CodexError> {
+    select_account_inner(manager, headers, body, scope, None, false).await
+}
+
+// Only the Messages mapper may opt into self-contained tool replay. Native Responses retains
+// its strict continuation guard, including for arbitrary function_call_output input.
+pub(super) async fn select_messages_account(
+    manager: &CodexManager,
+    headers: &HeaderMap,
+    body: &Value,
+    scope: &[u8; 32],
+    tool_account: Option<String>,
+) -> Result<String, CodexError> {
+    select_account_inner(manager, headers, body, scope, tool_account, true).await
+}
+
+async fn select_account_inner(
+    manager: &CodexManager,
+    headers: &HeaderMap,
+    body: &Value,
+    scope: &[u8; 32],
+    tool_account: Option<String>,
+    self_contained_messages: bool,
+) -> Result<String, CodexError> {
     let keys = identifiers(headers, body, scope)?;
     let mut sessions = manager.sessions.lock().await;
     sessions.prune();
-    let mut pinned: Option<String> = None;
+    let mut pinned = tool_account;
     for key in &keys {
         if let Some(id) = sessions.lookup(key) {
             if pinned.as_ref().is_some_and(|pinned| pinned != &id) {
@@ -193,7 +218,7 @@ async fn select_account(
             return Err(CodexError::new(StatusCode::CONFLICT, "Unknown or expired Codex previous_response_id; restart the conversation with full input"));
         }
     }
-    if pinned.is_none() && continuation(headers, body) {
+    if pinned.is_none() && continuation(headers, body) && !self_contained_messages {
         return Err(CodexError::new(StatusCode::CONFLICT, "Codex continuation has no known account affinity; restart the conversation with a new session ID"));
     }
     let id = match pinned {
@@ -288,7 +313,7 @@ fn response_headers(upstream: &HeaderMap) -> HeaderMap {
     result.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     result
 }
-fn metadata(response: &mut Response, record: &Record, model: &str) {
+pub(super) fn metadata(response: &mut Response, record: &Record, model: &str) {
     // Local monitor fields are never copied from caller/upstream identity headers.
     if let Ok(value) = HeaderValue::from_str(
         record
@@ -303,7 +328,7 @@ fn metadata(response: &mut Response, record: &Record, model: &str) {
         response.headers_mut().insert("x-mapped-model", value);
     }
 }
-fn json_response(status: StatusCode, headers: HeaderMap, value: Value) -> Response {
+pub(super) fn json_response(status: StatusCode, headers: HeaderMap, value: Value) -> Response {
     let mut response = (status, Json(value)).into_response();
     response.headers_mut().extend(headers);
     response.headers_mut().insert(
@@ -374,7 +399,7 @@ async fn proxy(
         Ok(record) => record,
         Err(error) => return error.into_response(),
     };
-    let result = forward(manager, id, headers, &mut body, caller_scope, compact).await;
+    let result = forward(manager, id, headers, &mut body, caller_scope, compact, None).await;
     let mut response = match result {
         Ok(response) => response,
         Err(error) => error.into_response(),
@@ -383,13 +408,14 @@ async fn proxy(
     response
 }
 
-async fn forward(
+pub(super) async fn forward(
     manager: Arc<CodexManager>,
     id: String,
     headers: HeaderMap,
     body: &mut Value,
     scope: [u8; 32],
     compact: bool,
+    messages: Option<super::anthropic::ResponseOptions>,
 ) -> Result<Response, CodexError> {
     let object = body
         .as_object_mut()
@@ -480,6 +506,9 @@ async fn forward(
                 &CodexError::upstream_status(status, "Codex upstream request failed"),
             )
             .await?;
+        if messages.is_some() {
+            error = super::anthropic::upstream_error(status, &error);
+        }
         return Ok(json_response(status, outbound_headers, error));
     }
     {
@@ -494,6 +523,18 @@ async fn forward(
             record.account.last_used_at = Some(now());
             record.account.last_error = None;
         }
+    }
+    if let Some(options) = messages {
+        return super::anthropic::respond(
+            upstream,
+            manager,
+            scope,
+            id,
+            record,
+            outbound_headers,
+            options,
+        )
+        .await;
     }
     let is_sse = is_sse_response(&upstream);
     if is_sse && !outbound_headers.contains_key(header::CONTENT_TYPE) {
@@ -515,7 +556,7 @@ async fn forward(
     }
     if !streaming || compact {
         let (collected_status, mut value) =
-            collect_response(upstream, &manager, &scope, &id).await?;
+            collect_response(upstream, &manager, &scope, &id, false).await?;
         record.tokens.redact(&mut value);
         if compact {
             value["object"] = json!("response.compaction");
@@ -549,7 +590,7 @@ async fn forward(
     Ok(response)
 }
 
-async fn remember_response(
+pub(super) async fn remember_response(
     manager: &CodexManager,
     scope: &[u8; 32],
     account_id: &str,
@@ -572,13 +613,20 @@ async fn remember_response(
 // Only the observer/collector parses SSE. Streaming clients receive original chunks, including tools,
 // encrypted reasoning, unknown event types, comments and [DONE], byte-for-byte.
 #[derive(Default)]
-struct SseParser {
+pub(super) struct SseParser {
     line: Vec<u8>,
     data: Vec<u8>,
     after_cr: bool,
+    strict: bool,
 }
 impl SseParser {
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, CodexError> {
+    pub(super) fn strict() -> Self {
+        Self {
+            strict: true,
+            ..Self::default()
+        }
+    }
+    pub(super) fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, CodexError> {
         let mut events = Vec::new();
         for &byte in bytes {
             if self.after_cr && byte == b'\n' {
@@ -596,9 +644,15 @@ impl SseParser {
                         if self.data != b"[DONE]" {
                             // SSE permits non-JSON extension/heartbeat data. This is an observer,
                             // not a wire validator; non-stream collection still requires a terminal JSON response.
-                            if let Ok(event) = serde_json::from_slice(&self.data) {
-                                events.push(event);
+                            match serde_json::from_slice(&self.data) {
+                                Ok(event) => events.push(event),
+                                Err(_) if self.strict => {
+                                    events.push(json!({"type":"gateway.invalid_json"}))
+                                }
+                                Err(_) => {}
                             }
+                        } else if self.strict {
+                            events.push(json!({"type":"gateway.unexpected_done"}));
                         }
                         self.data.clear();
                     }
@@ -622,7 +676,7 @@ impl SseParser {
     }
 }
 
-fn is_sse_response(response: &reqwest::Response) -> bool {
+pub(super) fn is_sse_response(response: &reqwest::Response) -> bool {
     // Responses is explicitly requested with stream=true. Some subscription edges omit
     // Content-Type; retain that negotiated contract.
     response
@@ -634,14 +688,19 @@ fn is_sse_response(response: &reqwest::Response) -> bool {
         })
 }
 
-async fn collect_response(
+pub(super) async fn collect_response(
     upstream: reqwest::Response,
     manager: &CodexManager,
     scope: &[u8; 32],
     account_id: &str,
+    strict: bool,
 ) -> Result<(StatusCode, Value), CodexError> {
     let mut source = upstream.bytes_stream();
-    let mut parser = SseParser::default();
+    let mut parser = if strict {
+        SseParser::strict()
+    } else {
+        SseParser::default()
+    };
     let mut total = 0usize;
     let mut completed_items = BTreeMap::new();
     while let Some(chunk) = tokio::time::timeout(STREAM_IDLE, source.next())
@@ -692,6 +751,7 @@ async fn collect_response(
                     return Ok((StatusCode::OK, response));
                 }
                 Some("error") => return Ok((StatusCode::BAD_GATEWAY, event)),
+                Some("gateway.invalid_json" | "gateway.unexpected_done") => return Err(CodexError::upstream("Codex stream contained malformed data or ended before its terminal response")),
                 _ => {}
             }
         }
@@ -772,9 +832,10 @@ mod tests {
                 .unwrap();
             assert!(!response.headers().contains_key(header::CONTENT_TYPE));
             assert!(is_sse_response(&response));
-            let (status, output) = collect_response(response, &manager, &[0; 32], "account-1")
-                .await
-                .unwrap();
+            let (status, output) =
+                collect_response(response, &manager, &[0; 32], "account-1", false)
+                    .await
+                    .unwrap();
             assert_eq!(status, StatusCode::OK);
             assert_eq!(output, terminal);
         }
@@ -783,7 +844,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let error = collect_response(truncated, &manager, &[0; 32], "account-1")
+        let error = collect_response(truncated, &manager, &[0; 32], "account-1", false)
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);

@@ -2,7 +2,7 @@
 
 本仓库是 [Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager) 的修改版，保留原有 Antigravity 服务，并增加服务端 Codex / ChatGPT 订阅接入。原作者署名和 `CC-BY-NC-SA-4.0` 许可证保持不变；Fork 不授予额外商业使用权限。
 
-打开 Web 后台的 **Codex** 页面，可使用设备码授权或导入 Codex 的 `auth.json`，管理独立账号、刷新授权、查询真实用量和模型目录。客户端使用独立的 `/codex/v1` HTTP Responses 入口，不经过 GPT → Gemini 模型映射。请使用页面生成的客户端配置，并在终端设置自己的网关密钥；不要分发管理员密码或订阅 Token。
+打开 Web 后台的 **Codex** 页面，可使用设备码授权或导入 Codex 的 `auth.json`，管理独立账号、刷新授权、查询真实用量和模型目录。客户端可使用 `/codex/v1/responses` 原生 Responses，或 `/codex/v1/messages` Anthropic Messages 兼容协议，均不经过 GPT → Gemini 模型映射。**接入指南 → Codex → Anthropic Messages → Claude Code** 提供可复制配置；Anthropic 客户端 Base URL 为 `/codex`，不是 `/codex/v1`。兼容协议使用 Codex 模型，不是 Claude 原生推理；输出预算等差异在指南中说明。请在终端设置自己的网关密钥，不要分发管理员密码或订阅 Token。
 
 凭据导入和授权必须通过可信 HTTPS 或 SSH 隧道完成。Codex 凭据加密保存在数据目录的 `codex/` 子目录中，备份时必须同时保存 `key` 和 `accounts.enc.json`；密钥与密文同盘不能防御整机失陷。会话绑定保存在内存，重启后无法识别的续接会明确报错，需要开启新会话。此接入不提供 WebSocket，也不保证上游订阅接口的长期兼容性或第三方共享使用授权。
 

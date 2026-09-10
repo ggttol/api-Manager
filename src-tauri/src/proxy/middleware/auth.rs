@@ -4,20 +4,44 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::proxy::{ProxyAuthMode, ProxySecurityConfig};
 
+fn is_codex_anthropic(path: &str) -> bool {
+    matches!(
+        path,
+        "/codex/v1/messages" | "/codex/v1/messages/count_tokens"
+    )
+}
+
 /// API Key 认证中间件 (代理接口使用，遵循 auth_mode)
 pub async fn auth_middleware(
     state: State<Arc<RwLock<ProxySecurityConfig>>>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
-    auth_middleware_internal(state, request, next, false).await
+) -> Result<Response, Response> {
+    let anthropic = is_codex_anthropic(request.uri().path());
+    auth_middleware_internal(state, request, next, false)
+        .await
+        .map_err(|status| {
+            if anthropic {
+                let kind = if status == StatusCode::UNAUTHORIZED {
+                    "authentication_error"
+                } else {
+                    "api_error"
+                };
+                (status, axum::Json(serde_json::json!({
+                    "type": "error",
+                    "error": {"type": kind, "message": status.canonical_reason().unwrap_or("Authentication failed")}
+                }))).into_response()
+            } else {
+                status.into_response()
+            }
+        })
 }
 
 /// 管理接口认证中间件 (管理接口使用，强制严格鉴权)
@@ -211,13 +235,20 @@ async fn auth_middleware_internal(
             Ok((false, reason)) => {
                 let reason_str = reason.unwrap_or_else(|| "Access denied".to_string());
                 tracing::warn!("UserToken rejected: {}", reason_str);
-                let body = serde_json::json!({
-                    "error": {
-                        "message": reason_str,
-                        "type": "token_rejected",
-                        "code": "token_rejected"
-                    }
-                });
+                let body = if is_codex_anthropic(&path) {
+                    serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "permission_error", "message": reason_str}
+                    })
+                } else {
+                    serde_json::json!({
+                        "error": {
+                            "message": reason_str,
+                            "type": "token_rejected",
+                            "code": "token_rejected"
+                        }
+                    })
+                };
                 let response = axum::response::Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("Content-Type", "application/json")
@@ -252,29 +283,77 @@ mod tests {
     use crate::proxy::ProxyAuthMode;
 
     #[tokio::test]
-    async fn test_admin_auth_with_password() {
+    async fn codex_messages_auth_uses_anthropic_errors_and_accepts_api_key_header() {
+        use axum::{
+            body::{to_bytes, Body},
+            routing::post,
+            Router,
+        };
+        use tower::ServiceExt;
+
         let security = Arc::new(RwLock::new(ProxySecurityConfig {
             auth_mode: ProxyAuthMode::Strict,
-            api_key: "sk-api".to_string(),
-            admin_password: Some("admin123".to_string()),
+            api_key: "gateway-key".into(),
+            admin_password: Some("admin-password".into()),
             allow_lan_access: true,
             port: 8045,
             security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
         }));
-
-        // 模拟请求 - 管理接口使用正确的管理密码
-        let req = Request::builder()
-            .header("Authorization", "Bearer admin123")
-            .uri("/admin/stats")
-            .body(axum::body::Body::empty())
+        let app = Router::new()
+            .route(
+                "/codex/v1/messages",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route("/v1/messages", post(|| async { StatusCode::NO_CONTENT }))
+            .layer(axum::middleware::from_fn_with_state(
+                security,
+                auth_middleware,
+            ));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/codex/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
 
-        // 此测试由于涉及 Next 中间件调用比较复杂,主要验证核心逻辑
-        // 我们在 auth_middleware_internal 基础上做了逻辑校验即可
-    }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/codex/v1/messages")
+                    .header("x-api-key", "gateway-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    #[test]
-    fn test_auth_placeholder() {
-        assert!(true);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

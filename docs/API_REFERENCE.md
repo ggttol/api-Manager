@@ -70,6 +70,18 @@ requires_openai_auth = false
 | GET | `/codex/v1/models` | 将实际可用模型目录转换为 OpenAI 模型列表 |
 | POST | `/codex/v1/responses` | 原生 Responses；保留工具、推理与 SSE 事件；上游 `store=false` |
 | POST | `/codex/v1/responses/compact` | 通过当前官方 Responses `compaction_trigger` 协议生成加密压缩项，汇总为 JSON 返回 |
+| POST | `/codex/v1/messages` | Anthropic Messages 兼容；文本、图片、自定义工具往返、非流式及增量 SSE |
+| POST | `/codex/v1/messages/count_tokens` | 返回 Anthropic 格式 `501`；没有可用的准确上游计数接口，不伪造计数 |
+
+### Anthropic SDK / Claude Code
+
+Base URL 使用 `http://127.0.0.1:8045/codex`（远程使用可信 HTTPS 或 SSH 隧道），客户端自行追加 `/v1/messages`。模型必须来自 `/codex/v1/models`，不支持将 Claude/Gemini 别名当作 Codex 原生模型。鉴权可使用 `x-api-key` 或 Bearer 网关 Key；管理员密码不是推理凭据。Google 原有 `/v1/messages` 不变。
+
+在 Web **接入指南 → Codex → Anthropic Messages** 加载并选择模型，可复制 cURL 或 Claude Code 配置。Claude Code 使用 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`；指南同时设置三种默认模型别名及子代理模型，避免客户端自动请求 `claude-*`。
+
+协议差异：正整数 `max_tokens` 仅兼容接收，订阅上游不接受 `max_output_tokens`，不保证这个输出硬上限；thinking 预算映射为推理强度，cache_control 为自动缓存提示。响应 `x-codex-compatibility` 头说明这些差异。不会输出 Claude 签名思维块或推理摘要。采样参数、非空 stop_sequences、结构化 output_config.format、assistant 预填充、Claude 签名回放、文档/PDF、服务端工具与未支持的上下文编辑会明确报错，不静默丢弃。
+
+工具 ID 是网关生成的随机句柄，按调用密钥及原账号隔离，关联的 Codex 推理状态只留在服务器内存。必须原样回传 tool_use ID；未知、过期、跨密钥或混合账号的句柄返回 `409`，原账号失效返回 `503`。空闲 24 小时或服务重启后，旧网关工具历史不能续接。文本历史不依赖这些句柄；普通完整文字历史可以重新建立绑定。
 
 同一会话绑定同一账号，绑定同时按下游密钥隔离。更换首选账号只影响新会话；已绑定账号被禁用或删除时明确失败，不将续接静默转给其他账号。绑定最多保留 8192 项、闲置 24 小时，进程重启会清空；未知续接返回 `409`，需要新建会话。只允许在未输出响应前对同一账号的 HTTP `401` 刷新重试一次，不在流式输出后重放请求。
 
