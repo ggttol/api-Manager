@@ -96,13 +96,12 @@ pub async fn get_user_token_summary() -> Result<UserTokenStats, String> {
         users.insert(t.username.clone());
     }
 
-    // 这里简单返回一些数据，请求数最好从数据库聚合查询
-    // 目前仅作为演示，请求数暂不精确统计今日的
+    let today_requests = user_token_db::get_today_request_count()?;
 
     Ok(UserTokenStats {
         total_tokens: tokens.len(),
         active_tokens,
         total_users: users.len(),
-        today_requests: 0, // TODO: Implement daily stats query
+        today_requests,
     })
 }

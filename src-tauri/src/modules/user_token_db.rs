@@ -302,6 +302,24 @@ pub fn list_tokens() -> Result<Vec<UserToken>, String> {
 
     Ok(tokens)
 }
+/// Count requests authenticated with any user token since server-local midnight.
+pub fn get_today_request_count() -> Result<i64, String> {
+    let start_of_today = Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| midnight.and_local_timezone(Local).earliest())
+        .ok_or_else(|| "Failed to determine the start of the local day".to_string())?
+        .timestamp();
+    let conn = connect_db()?;
+
+    conn.query_row(
+        "SELECT COUNT(*) FROM token_usage_logs WHERE request_time >= ?1",
+        params![start_of_today],
+        |row| row.get(0),
+    )
+    .map_err(|e| format!("Failed to query today's token requests: {}", e))
+}
+
 
 /// 获取单个令牌信息
 pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
