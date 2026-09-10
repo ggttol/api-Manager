@@ -3,6 +3,7 @@
 mod anthropic;
 mod auth;
 mod relay;
+mod scheduler;
 mod store;
 
 use crate::proxy::{config::UpstreamProxyConfig, server::AppState};
@@ -31,6 +32,7 @@ struct CodexError {
     status: StatusCode,
     message: String,
     revoked: bool,
+    retry_after: Option<i64>,
 }
 
 impl CodexError {
@@ -39,6 +41,7 @@ impl CodexError {
             status,
             message: message.into(),
             revoked: false,
+            retry_after: None,
         }
     }
     fn bad_request(message: impl Into<String>) -> Self {
@@ -70,19 +73,37 @@ impl CodexError {
             format!("{message} (upstream HTTP {})", status.as_u16()),
         )
     }
+    fn cooling(until: i64, message: &str) -> Self {
+        let mut error = Self::new(StatusCode::TOO_MANY_REQUESTS, message);
+        error.retry_after = Some(until.saturating_sub(now()).max(1));
+        error
+    }
+
+    fn headers(&self) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(seconds) = self.retry_after {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                headers.insert(header::RETRY_AFTER, value);
+            }
+        }
+        headers
+    }
     fn revoked() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: "Codex refresh token expired, was reused, or was revoked; sign in again"
                 .into(),
             revoked: true,
+            retry_after: None,
         }
     }
 }
 
 impl IntoResponse for CodexError {
     fn into_response(self) -> Response {
+        let headers = self.headers();
         let mut response = (self.status, Json(json!({"error": self.message}))).into_response();
+        response.headers_mut().extend(headers);
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -121,6 +142,8 @@ pub struct CodexManager {
     inner: Mutex<Inner>,
     imports: Mutex<()>,
     sessions: Mutex<relay::SessionCache>,
+    #[cfg(test)]
+    responses_url: Option<reqwest::Url>,
 }
 
 impl CodexManager {
@@ -142,6 +165,8 @@ impl CodexManager {
             }),
             imports: Mutex::new(()),
             sessions: Mutex::new(relay::SessionCache::default()),
+            #[cfg(test)]
+            responses_url: None,
         })
     }
 
@@ -195,15 +220,63 @@ impl CodexManager {
 
     async fn preferred_account(&self) -> Result<String, CodexError> {
         let inner = self.inner.lock().await;
-        let preferred =
-            inner.accounts.active_account_id.as_deref().and_then(|id| {
-                inner.accounts.accounts.iter().find(|record| {
-                    record.account.id == id && record.account.enabled && record.verified
-                })
-            });
-        preferred.or_else(|| inner.accounts.accounts.iter().find(|record| record.account.enabled && record.verified))
-            .map(|record| record.account.id.clone())
-            .ok_or_else(|| CodexError::unavailable("No enabled Codex subscription account; authorize one in the Codex administration page"))
+        scheduler::select(&inner.accounts, &Default::default(), now())
+    }
+
+    async fn note_cooldown(
+        &self,
+        id: &str,
+        cooldown: &scheduler::Cooldown,
+    ) -> Result<(), CodexError> {
+        let mut inner = self.inner.lock().await;
+        let mut accounts = inner.accounts.clone();
+        if let Some(record) = accounts
+            .accounts
+            .iter_mut()
+            .find(|record| record.account.id == id)
+        {
+            scheduler::apply(&mut record.account, cooldown, now());
+            record.quota_version += 1;
+            self.commit_accounts(&mut inner, accounts)?;
+        }
+        Ok(())
+    }
+
+    async fn note_usage(&self, snapshot: &Record, value: &Value) -> Result<(), CodexError> {
+        let mut inner = self.inner.lock().await;
+        let mut accounts = inner.accounts.clone();
+        let Some(record) = accounts
+            .accounts
+            .iter_mut()
+            .find(|record| record.account.id == snapshot.account.id)
+        else {
+            return Ok(());
+        };
+        if record.tokens.access_token != snapshot.tokens.access_token {
+            return Ok(());
+        }
+        // An older admin lookup must not clear a quota failure observed while it was in flight.
+        let may_recover = record.quota_version == snapshot.quota_version;
+        let observation = scheduler::usage(value, now());
+        let exhausted = matches!(&observation, scheduler::Usage::Exhausted(_));
+        let before = (
+            record.account.cooldown_until,
+            record.account.cooldown_reason.clone(),
+            record.account.last_error.clone(),
+        );
+        scheduler::apply_usage(&mut record.account, observation, now(), may_recover);
+        if exhausted
+            || before
+                != (
+                    record.account.cooldown_until,
+                    record.account.cooldown_reason.clone(),
+                    record.account.last_error.clone(),
+                )
+        {
+            record.quota_version += 1;
+            self.commit_accounts(&mut inner, accounts)?;
+        }
+        Ok(())
     }
 
     async fn note_error(&self, id: &str, error: &CodexError) -> Result<(), CodexError> {
@@ -322,6 +395,17 @@ impl CodexManager {
                     CodexError::upstream("Unable to reach the Codex subscription backend")
                 })?;
         }
+        if response.status() == StatusCode::TOO_MANY_REQUESTS && url == auth::USAGE_URL {
+            let headers = response.headers().clone();
+            let raw = auth::read_bounded(response, auth::JSON_LIMIT).await?;
+            let value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let cooldown = scheduler::from_429(&headers, &value, now());
+            self.note_cooldown(id, &cooldown).await?;
+            return Err(CodexError::cooling(
+                cooldown.until,
+                "Codex subscription usage is temporarily rate-limited",
+            ));
+        }
         if !response.status().is_success() {
             let error = CodexError::upstream_status(
                 response.status(),
@@ -332,6 +416,9 @@ impl CodexManager {
         }
         let mut value = auth::json_body(response).await?;
         record.tokens.redact(&mut value);
+        if url == auth::USAGE_URL {
+            self.note_usage(&record, &value).await?;
+        }
         Ok(value)
     }
 
@@ -369,12 +456,23 @@ impl CodexManager {
             if let Some(label) = label {
                 record.account.label = label;
             }
+            if verified {
+                scheduler::apply_usage(
+                    &mut record.account,
+                    scheduler::usage(usage, now()),
+                    now(),
+                    // Device verification has no pre-request quota version. Only an explicit
+                    // version-checked usage/refresh observation may recover an existing account.
+                    false,
+                );
+                record.quota_version += 1;
+            }
             record.account.clone()
         } else {
             if accounts.accounts.len() >= 128 {
                 return Err(CodexError::bad_request("Codex account limit reached (128)"));
             }
-            let account = Account {
+            let mut account = Account {
                 id: uuid::Uuid::new_v4().to_string(),
                 email: tokens.email(),
                 label: label.unwrap_or_else(|| "ChatGPT subscription".into()),
@@ -388,11 +486,17 @@ impl CodexManager {
                 } else {
                     Some("Unverified credentials; refresh to verify before enabling".into())
                 },
+                cooldown_until: None,
+                cooldown_reason: None,
             };
+            if verified {
+                scheduler::apply_usage(&mut account, scheduler::usage(usage, now()), now(), true);
+            }
             accounts.accounts.push(Record {
                 account: account.clone(),
                 tokens,
                 verified,
+                quota_version: 0,
             });
             account
         };
@@ -494,6 +598,14 @@ impl CodexManager {
         record.account.plan_type =
             auth::clean_metadata(usage.get("plan_type").and_then(Value::as_str), 64)
                 .or_else(|| record.tokens.plan_type());
+        let may_recover = record.quota_version == verified_record.quota_version;
+        scheduler::apply_usage(
+            &mut record.account,
+            scheduler::usage(usage, now()),
+            now(),
+            may_recover,
+        );
+        record.quota_version += 1;
         let result = record.account.clone();
         self.commit_accounts(&mut inner, accounts)?;
         Ok(result)
@@ -862,6 +974,140 @@ pub fn proxy_routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observed_usage_controls_cooldown_and_stale_admin_recovery_cannot_clear_new_quota_failure(
+    ) {
+        let fixture = relay::tests::Fixture::new(vec![relay::tests::Reply::ok("resp-reset")]).await;
+        let until = now() + 120;
+        let before = fixture.manager.record(&fixture.first, true).await.unwrap();
+        fixture.manager.note_usage(&before, &json!({"rate_limit":{"allowed":false,"limit_reached":true,
+            "primary_window":{"used_percent":100,"reset_at":until},"secondary_window":{"used_percent":25,"reset_at":until+604800}}})).await.unwrap();
+        assert_eq!(
+            fixture.manager.preferred_account().await.unwrap(),
+            fixture.second
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .record(&fixture.first, true)
+                .await
+                .unwrap()
+                .account
+                .cooldown_until,
+            Some(until)
+        );
+        let available = json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":4}}});
+        fixture
+            .manager
+            .note_usage(&before, &available)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.manager.preferred_account().await.unwrap(),
+            fixture.second
+        );
+        let stale_same_window = fixture.manager.record(&fixture.first, true).await.unwrap();
+        fixture
+            .manager
+            .note_cooldown(
+                &fixture.first,
+                &scheduler::Cooldown {
+                    until,
+                    reason: "quota_exhausted",
+                },
+            )
+            .await
+            .unwrap();
+        fixture
+            .manager
+            .note_usage(&stale_same_window, &available)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.manager.preferred_account().await.unwrap(),
+            fixture.second
+        );
+        let observed = fixture.manager.record(&fixture.first, true).await.unwrap();
+        fixture
+            .manager
+            .note_usage(&observed, &available)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.manager.preferred_account().await.unwrap(),
+            fixture.first
+        );
+        let restored = CodexManager::new(fixture.temp.path().to_path_buf(), None).unwrap();
+        assert!(restored
+            .record(&fixture.first, true)
+            .await
+            .unwrap()
+            .account
+            .cooldown_until
+            .is_none());
+
+        fixture
+            .manager
+            .note_cooldown(
+                &fixture.first,
+                &scheduler::Cooldown {
+                    until,
+                    reason: "quota_exhausted",
+                },
+            )
+            .await
+            .unwrap();
+        // Device verification finishes outside the account lock: a stale available result
+        // must not resurrect an existing account after a newer inference quota failure.
+        fixture
+            .manager
+            .upsert_account(
+                &mut *fixture.manager.inner.lock().await,
+                before.tokens.clone(),
+                None,
+                &available,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.manager.preferred_account().await.unwrap(),
+            fixture.second
+        );
+        {
+            let inner = fixture.manager.inner.lock().await;
+            assert_eq!(
+                scheduler::select(&inner.accounts, &Default::default(), until + 1).unwrap(),
+                fixture.first
+            );
+        }
+        // An expired cooldown remains useful metadata but eligibility recovers without any store write.
+        fixture.manager.inner.lock().await.accounts.accounts[0]
+            .account
+            .cooldown_until = Some(now() - 1);
+        let response = fixture
+            .responses(
+                axum::http::HeaderMap::new(),
+                json!({"model":"native","input":"after reset"}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-account-email"],
+            fixture.first.as_str()
+        );
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .await
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            ["first-workspace"]
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_device_cannot_commit_credentials() {

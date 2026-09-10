@@ -18,6 +18,8 @@ type Account = {
     expires_at: number | null;
     last_used_at: number | null;
     last_error: string | null;
+    cooldown_until?: number | null;
+    cooldown_reason?: string | null;
 };
 type AccountList = { accounts: Account[]; active_account_id: string | null };
 type DeviceStatus = 'pending' | 'completed' | 'failed' | 'cancelled' | 'expired';
@@ -121,6 +123,7 @@ export default function Codex() {
     const modelLoad = useRef<AbortController | null>(null);
     const usageLoad = useRef<AbortController | null>(null);
     const quotaLoads = useRef(new Map<string, AbortController>());
+    const pendingQuotaLoads = useRef(0);
     const [deleting, setDeleting] = useState<Account | null>(null);
     const [editing, setEditing] = useState<Account | null>(null);
     const [editLabel, setEditLabel] = useState('');
@@ -131,6 +134,7 @@ export default function Codex() {
     const [deviceStarting, setDeviceStarting] = useState(false);
     const [deviceError, setDeviceError] = useState('');
     const [now, setNow] = useState(Date.now());
+    const hasActiveCooldown = accounts.accounts.some(account => (account.cooldown_until ?? 0) * 1000 > Math.max(now, Date.now()));
     const deviceDialog = useRef<HTMLDialogElement>(null);
     const deviceOpen = deviceStarting || device !== null || deviceError !== '';
 
@@ -145,6 +149,36 @@ export default function Codex() {
         }
     }, []);
 
+    const refreshAccountList = useCallback(async () => {
+        accountLoad.current?.abort();
+        const controller = new AbortController();
+        accountLoad.current = controller;
+        setAccountsLoading(true);
+        setAccountsError('');
+        try {
+            const next = await call<AccountList>('codex_list_accounts', undefined, controller);
+            setAccounts(next);
+            return next;
+        } catch (error) {
+            if (!aborted(error)) setAccountsError(errorMessage(error));
+            return null;
+        } finally {
+            if (mounted.current && !controller.signal.aborted) setAccountsLoading(false);
+        }
+    }, [call]);
+
+    const fetchUsage = useCallback(async (account: Account, controller: AbortController) => {
+        pendingQuotaLoads.current += 1;
+        try {
+            return await call<unknown>('codex_account_usage', { id: account.id }, controller);
+        } finally {
+            pendingQuotaLoads.current -= 1;
+            // Usage updates server cooldowns. Refresh once after the whole in-flight batch,
+            // without starting another quota batch or replacing a newer account-list response.
+            if (pendingQuotaLoads.current === 0 && mounted.current) void refreshAccountList();
+        }
+    }, [call, refreshAccountList]);
+
     const loadAccountQuota = useCallback(async (account: Account) => {
         quotaLoads.current.get(account.id)?.abort();
         const controller = new AbortController();
@@ -154,7 +188,7 @@ export default function Codex() {
             [account.id]: { ...current[account.id], loading: true, error: undefined },
         }));
         try {
-            const value = await call<unknown>('codex_account_usage', { id: account.id }, controller);
+            const value = await fetchUsage(account, controller);
             const data = accountQuota(value);
             if (!data) throw new Error('Codex usage response has no rate-limit windows.');
             if (mounted.current) {
@@ -170,24 +204,14 @@ export default function Codex() {
         } finally {
             if (quotaLoads.current.get(account.id) === controller) quotaLoads.current.delete(account.id);
         }
-    }, [call]);
+    }, [fetchUsage]);
 
     const loadAccounts = useCallback(async () => {
-        accountLoad.current?.abort();
-        const controller = new AbortController();
-        accountLoad.current = controller;
-        setAccountsLoading(true);
-        setAccountsError('');
-        try {
-            const next = await call<AccountList>('codex_list_accounts', undefined, controller);
-            setAccounts(next);
+        const next = await refreshAccountList();
+        if (next) {
             for (const account of next.accounts) void loadAccountQuota(account);
-        } catch (error) {
-            if (!aborted(error)) setAccountsError(errorMessage(error));
-        } finally {
-            if (mounted.current && !controller.signal.aborted) setAccountsLoading(false);
         }
-    }, [call, loadAccountQuota]);
+    }, [refreshAccountList, loadAccountQuota]);
 
     const loadModels = useCallback(async () => {
         modelLoad.current?.abort();
@@ -258,10 +282,10 @@ export default function Codex() {
     }, [!!usage]);
 
     useEffect(() => {
-        if (!device || device.status !== 'pending') return;
+        if (desktop || (!hasActiveCooldown && device?.status !== 'pending')) return;
         const timer = window.setInterval(() => setNow(Date.now()), 1000);
         return () => window.clearInterval(timer);
-    }, [device?.id, device?.status]);
+    }, [desktop, hasActiveCooldown, device?.status]);
 
     useEffect(() => {
         if (!device || device.status !== 'pending') return;
@@ -426,7 +450,7 @@ export default function Codex() {
         usageLoad.current = controller;
         setUsage({ account, loading: true });
         try {
-            const data = await call<unknown>('codex_account_usage', { id: account.id }, controller);
+            const data = await fetchUsage(account, controller);
             setUsage({ account, loading: false, data });
             const quota = accountQuota(data);
             if (quota) setAccountQuotas(current => ({ ...current, [account.id]: { loading: false, data: quota } }));
@@ -463,6 +487,7 @@ export default function Codex() {
             </div>
             <section className={panel} aria-labelledby="codex-accounts-title">
                 <div className="console-toolbar justify-between"><div><h2 id="codex-accounts-title" className="text-lg font-semibold flex items-center gap-2"><Users size={20} />{t('codex.accounts')} <span className="text-sm console-muted tabular-nums">{accounts.accounts.length}</span></h2><p className="text-xs console-muted mt-1">{t('common.enabled')}: {accounts.accounts.filter(account => account.enabled).length} · {t('common.disabled')}: {accounts.accounts.filter(account => !account.enabled).length}</p></div><button className="console-button" disabled={accountsLoading || !!busy} onClick={() => void loadAccounts()}><RefreshCw size={15} className={accountsLoading ? 'animate-spin' : ''} />{t('common.refresh')}</button></div>
+                <p className="mt-3 text-sm leading-6 console-muted">{t('codex.failover_help')}</p>
                 {accounts.accounts.length > 0 && <div className="relative mt-4"><Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 console-muted" /><input type="search" value={search} onChange={event => setSearch(event.target.value)} aria-label={t('accounts.search_placeholder')} placeholder={t('accounts.search_placeholder')} className="w-full rounded-lg border border-[var(--console-border)] bg-transparent pl-9 pr-3 py-2 text-sm" /></div>}
                 {accountsError && <p role="alert" className="text-error text-sm mt-3 break-words">{accountsError}</p>}
                 {accountsLoading && accounts.accounts.length === 0 ? <p role="status" className="py-8 text-center console-muted">{t('common.loading')}</p> : accounts.accounts.length === 0 && !accountsError ? <div className="py-10 text-center"><Users size={32} className="mx-auto mb-3 console-muted" /><p className="font-medium">{t('codex.no_accounts')}</p><p className="text-sm console-muted mt-1">{t('console.codex_empty_help', { defaultValue: i18n.language.startsWith('zh') ? '导入 auth.json 或使用设备登录来添加订阅账号。' : 'Import auth.json or use device sign-in to add a subscription account.' })}</p><button className="console-button console-button-primary mt-4" onClick={() => setAddOpen(true)}><Plus size={16} />{t('codex.add_account')}</button></div> : null}
@@ -470,13 +495,15 @@ export default function Codex() {
                 <div className="grid xl:grid-cols-2 gap-4 mt-4">
                     {accounts.accounts.filter(account => `${account.label} ${account.email ?? ''} ${account.id}`.toLowerCase().includes(search.toLowerCase())).map(account => {
                         const quota = accountQuotas[account.id];
+                        const cooling = (account.cooldown_until ?? 0) * 1000 > Math.max(now, Date.now());
                         const quotaWindows = quota?.data ? [
                             { key: 'five-hour', label: t('codex.five_hour_limit'), window: quota.data.fiveHour },
                             { key: 'weekly', label: t('codex.weekly_limit'), window: quota.data.weekly },
                         ].filter((item): item is { key: string; label: string; window: RateLimitWindow } => item.window !== null) : [];
                         return <article key={account.id} className="border border-[var(--console-border)] bg-[var(--console-surface)] rounded-xl p-4 sm:p-5 min-w-0">
-                        <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="font-semibold break-words">{account.label || account.email || account.id}</h3>{account.email && account.email !== account.label && <p className="text-sm text-gray-500 break-all">{account.email}</p>}</div><div className="flex flex-wrap gap-1">{accounts.active_account_id === account.id && <span className="badge badge-primary badge-outline gap-1"><Check size={12} />{t('codex.preferred')}</span>}<span className={`badge ${account.enabled ? 'badge-success badge-outline' : 'badge-ghost'}`}>{t(account.enabled ? 'common.enabled' : 'common.disabled')}</span></div></div>
+                        <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><h3 className="font-semibold break-words">{account.label || account.email || account.id}</h3>{account.email && account.email !== account.label && <p className="text-sm text-gray-500 break-all">{account.email}</p>}</div><div className="flex flex-wrap gap-1">{accounts.active_account_id === account.id && <span title={t('codex.preferred_help')} className="badge badge-primary badge-outline gap-1"><Check size={12} />{t('codex.preferred')}</span>}<span className={`badge ${account.enabled ? 'badge-success badge-outline' : 'badge-ghost'}`}>{t(account.enabled ? 'common.enabled' : 'common.disabled')}</span>{cooling && <span className="badge badge-warning badge-outline">{t('codex.cooldown_skipped')}</span>}</div></div>
                         <dl className="text-xs grid grid-cols-1 sm:grid-cols-2 gap-2 mt-4 text-gray-500 dark:text-gray-400"><div><dt>{t('codex.plan')}</dt><dd className="text-base-content mt-0.5">{account.plan_type || t('codex.not_available')}</dd></div><div><dt>{t('codex.expires')}</dt><dd className="text-base-content mt-0.5">{date(account.expires_at)}</dd></div><div><dt>{t('codex.last_used')}</dt><dd className="text-base-content mt-0.5">{date(account.last_used_at)}</dd></div></dl>
+                        {cooling && <div role="status" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200"><p className="font-medium">{t(account.cooldown_reason === 'quota_exhausted' ? 'codex.cooldown_quota' : account.cooldown_reason === 'rate_limited' ? 'codex.cooldown_rate' : 'codex.cooldown_temporary')}</p><p className="break-words">{t('codex.cooldown_until', { time: date(account.cooldown_until ?? null) })}</p></div>}
                         <div className="mt-4">
                             {quota?.loading ? <div role="status">
                                 <div className="h-24 animate-pulse rounded-lg bg-gray-100 dark:bg-base-200" />

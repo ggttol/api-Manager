@@ -10,12 +10,12 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use super::{auth, now, parse_json, store::Record, CodexError, CodexManager};
+use super::{auth, now, parse_json, scheduler, store::Record, CodexError, CodexManager};
 use crate::proxy::server::AppState;
 
 const MAX_SESSIONS: usize = 8192;
@@ -27,11 +27,14 @@ pub(super) const STREAM_IDLE: Duration = Duration::from_secs(300);
 struct Pin {
     account_id: String,
     touched: Instant,
+    version: u64,
+    migrated: bool,
 }
 #[derive(Default)]
 pub(super) struct SessionCache {
     pins: HashMap<[u8; 32], Pin>,
     pub(super) anthropic_tools: super::anthropic::ToolCache,
+    next_version: u64,
 }
 
 impl SessionCache {
@@ -61,15 +64,107 @@ impl SessionCache {
                 "Codex session cache is full; wait for inactive sessions to expire",
             ));
         }
+        self.next_version += 1;
         self.pins.insert(
             key,
             Pin {
                 account_id: account_id.to_string(),
                 touched: Instant::now(),
+                version: self.next_version,
+                migrated: false,
             },
         );
         Ok(())
     }
+
+    fn aliases(
+        &mut self,
+        keys: &[[u8; 32]],
+        account: &str,
+    ) -> Result<Vec<([u8; 32], u64)>, CodexError> {
+        let new_keys = keys
+            .iter()
+            .filter(|key| !self.pins.contains_key(*key))
+            .count();
+        if self.pins.len() + new_keys > MAX_SESSIONS {
+            return Err(CodexError::unavailable(
+                "Codex session cache is full; wait for inactive sessions to expire",
+            ));
+        }
+        let mut result = Vec::with_capacity(keys.len());
+        let migrated = keys.iter().any(|key| {
+            self.pins
+                .get(key)
+                .is_some_and(|pin| pin.migrated || pin.account_id != account)
+        });
+        for key in keys {
+            self.next_version += 1;
+            self.pins.insert(
+                *key,
+                Pin {
+                    account_id: account.to_string(),
+                    touched: Instant::now(),
+                    version: self.next_version,
+                    migrated,
+                },
+            );
+            result.push((*key, self.next_version));
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct Selection {
+    pub id: String,
+    keys: Vec<([u8; 32], u64)>,
+    portable: bool,
+}
+
+impl Selection {
+    fn validate(&self, sessions: &SessionCache) -> Result<(), CodexError> {
+        if self.keys.iter().any(|(key, version)| {
+            sessions
+                .pins
+                .get(key)
+                .is_none_or(|pin| pin.account_id != self.id || pin.version != *version)
+        }) {
+            return Err(CodexError::new(StatusCode::CONFLICT,
+                "Codex session changed while this request was in flight; retry with consistent full conversation input"));
+        }
+        Ok(())
+    }
+
+    async fn ready(
+        &mut self,
+        manager: &CodexManager,
+        visited: &HashSet<String>,
+    ) -> Result<(), CodexError> {
+        // Account eligibility and session CAS share a short lock boundary, never network I/O.
+        let inner = manager.inner.lock().await;
+        let mut sessions = manager.sessions.lock().await;
+        self.validate(&sessions)?;
+        let record = inner.accounts.accounts.iter().find(|record| record.account.id == self.id)
+            .filter(|record| record.account.enabled && record.verified)
+            .ok_or_else(|| CodexError::unavailable("The pinned Codex account is unavailable; this conversation cannot move to another account"))?;
+        if scheduler::cooling(&record.account, now()).is_some() || visited.contains(&self.id) {
+            if !self.portable {
+                return Err(bound_cooldown(
+                    record.account.cooldown_until.unwrap_or(now() + 60),
+                ));
+            }
+            let next = scheduler::select(&inner.accounts, visited, now())?;
+            let keys: Vec<_> = self.keys.iter().map(|(key, _)| *key).collect();
+            self.keys = sessions.aliases(&keys, &next)?;
+            self.id = next;
+        }
+        Ok(())
+    }
+}
+
+fn bound_cooldown(until: i64) -> CodexError {
+    CodexError::cooling(until,
+        "This Codex conversation contains account-bound response, tool, or encrypted state and cannot fail over; wait for its account quota to reset or start a new conversation with full text and no private state")
 }
 
 pub(super) fn scope(headers: &HeaderMap) -> [u8; 32] {
@@ -137,6 +232,8 @@ fn identifiers(
             result.push(session_key(scope, kind, value));
         }
     }
+    result.sort_unstable();
+    result.dedup();
     Ok(result)
 }
 
@@ -166,12 +263,93 @@ fn continuation(headers: &HeaderMap, body: &Value) -> bool {
             })
 }
 
+// Private state has immutable issuer pins, independent of movable session/cache aliases.
+fn private_identifiers(headers: &HeaderMap, body: &Value, scope: &[u8; 32]) -> Vec<[u8; 32]> {
+    let mut keys = Vec::new();
+    if let Some(turn) = headers
+        .get("x-codex-turn-state")
+        .and_then(|value| value.to_str().ok())
+    {
+        keys.push(session_key(scope, "turn", turn));
+    }
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            let identity =
+                if let Some(encrypted) = item.get("encrypted_content").and_then(Value::as_str) {
+                    Some(("encrypted", encrypted))
+                } else {
+                    match item.get("type").and_then(Value::as_str) {
+                        Some(kind) if kind.ends_with("_call_output") => item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(|id| ("call", id)),
+                        Some("item_reference" | "reasoning" | "compaction") => item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(|id| ("item", id)),
+                        _ if item.get("role").and_then(Value::as_str) == Some("tool") => item
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)
+                            .map(|id| ("call", id)),
+                        _ => None,
+                    }
+                };
+            if let Some((kind, value)) = identity {
+                keys.push(session_key(scope, kind, value));
+            }
+        }
+    }
+    keys
+}
+
+fn portable_input(headers: &HeaderMap, body: &Value) -> bool {
+    if continuation(headers, body) {
+        return false;
+    }
+    match body.get("input") {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(items)) => items.iter().all(|item| {
+            item.get("id").is_none()
+                && item.get("type").is_none_or(|kind| kind == "message")
+                && item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| {
+                        matches!(role, "user" | "assistant" | "system" | "developer")
+                    })
+                && match item.get("content") {
+                    Some(Value::String(_)) => true,
+                    Some(Value::Array(parts)) => parts.iter().all(|part| {
+                        part.get("id").is_none()
+                            && part.get("file_id").is_none()
+                            && part.get("encrypted_content").is_none()
+                            && match part.get("type").and_then(Value::as_str) {
+                                Some("input_text" | "output_text" | "text") => {
+                                    part.get("text").is_some_and(Value::is_string)
+                                }
+                                Some("input_image") => {
+                                    part.get("image_url").is_some_and(Value::is_string)
+                                }
+                                Some("input_file") => part
+                                    .get("file_data")
+                                    .or_else(|| part.get("file_url"))
+                                    .is_some_and(Value::is_string),
+                                _ => false,
+                            }
+                    }),
+                    _ => false,
+                }
+        }),
+        _ => false,
+    }
+}
+
 async fn select_account(
     manager: &CodexManager,
     headers: &HeaderMap,
     body: &Value,
     scope: &[u8; 32],
-) -> Result<String, CodexError> {
+) -> Result<Selection, CodexError> {
     select_account_inner(manager, headers, body, scope, None, false).await
 }
 
@@ -183,7 +361,7 @@ pub(super) async fn select_messages_account(
     body: &Value,
     scope: &[u8; 32],
     tool_account: Option<String>,
-) -> Result<String, CodexError> {
+) -> Result<Selection, CodexError> {
     select_account_inner(manager, headers, body, scope, tool_account, true).await
 }
 
@@ -194,12 +372,46 @@ async fn select_account_inner(
     scope: &[u8; 32],
     tool_account: Option<String>,
     self_contained_messages: bool,
-) -> Result<String, CodexError> {
+) -> Result<Selection, CodexError> {
     let keys = identifiers(headers, body, scope)?;
+    let private_keys = private_identifiers(
+        headers,
+        if self_contained_messages {
+            &Value::Null
+        } else {
+            body
+        },
+        scope,
+    );
+    let portable = if self_contained_messages {
+        tool_account.is_none()
+            && !headers.contains_key("x-codex-turn-state")
+            && body.get("previous_response_id").is_none_or(Value::is_null)
+    } else {
+        portable_input(headers, body)
+    };
+    let inner = manager.inner.lock().await;
     let mut sessions = manager.sessions.lock().await;
     sessions.prune();
+    let migrated = keys
+        .iter()
+        .any(|key| sessions.pins.get(key).is_some_and(|pin| pin.migrated));
+    let immutable_origin = tool_account.is_some()
+        || body
+            .get("previous_response_id")
+            .is_some_and(|value| !value.is_null());
+    if migrated
+        && !portable
+        && ((private_keys.is_empty() && !immutable_origin)
+            || private_keys
+                .iter()
+                .any(|key| !sessions.pins.contains_key(key)))
+    {
+        return Err(CodexError::new(StatusCode::CONFLICT,
+            "Codex private state has no verified issuer after this session changed accounts; restart with full plain-text input"));
+    }
     let mut pinned = tool_account;
-    for key in &keys {
+    for key in keys.iter().chain(&private_keys) {
         if let Some(id) = sessions.lookup(key) {
             if pinned.as_ref().is_some_and(|pinned| pinned != &id) {
                 return Err(CodexError::new(
@@ -221,14 +433,22 @@ async fn select_account_inner(
     if pinned.is_none() && continuation(headers, body) && !self_contained_messages {
         return Err(CodexError::new(StatusCode::CONFLICT, "Codex continuation has no known account affinity; restart the conversation with a new session ID"));
     }
-    let id = match pinned {
-        Some(id) => {
-            manager.record(&id, true).await.map_err(|_| CodexError::unavailable("The pinned Codex account is unavailable; this conversation cannot move to another account"))?;
+    let id = if let Some(id) = pinned {
+        let record = inner.accounts.accounts.iter().find(|record| record.account.id == id)
+            .filter(|record| record.account.enabled && record.verified)
+            .ok_or_else(|| CodexError::unavailable("The pinned Codex account is unavailable; this conversation cannot move to another account"))?;
+        if let Some(until) = scheduler::cooling(&record.account, now()) {
+            if !portable {
+                return Err(bound_cooldown(until));
+            }
+            scheduler::select(&inner.accounts, &HashSet::new(), now())?
+        } else {
             id
         }
-        None => manager.preferred_account().await?,
+    } else {
+        scheduler::select(&inner.accounts, &HashSet::new(), now())?
     };
-    // Check capacity before mutation so a request with several aliases is committed all-or-nothing.
+    // Preserve versions for unchanged pins, so concurrent same-account requests do not conflict.
     let new_keys = keys
         .iter()
         .filter(|key| !sessions.pins.contains_key(*key))
@@ -238,10 +458,30 @@ async fn select_account_inner(
             "Codex session cache is full; wait for inactive sessions to expire",
         ));
     }
-    for key in keys {
-        sessions.bind(key, &id)?;
-    }
-    Ok(id)
+    let rebind = keys.iter().any(|key| {
+        sessions
+            .pins
+            .get(key)
+            .is_some_and(|pin| pin.account_id != id)
+    });
+    let keys = if rebind {
+        sessions.aliases(&keys, &id)?
+    } else {
+        for key in &keys {
+            sessions.bind(*key, &id)?;
+            if migrated {
+                sessions
+                    .pins
+                    .get_mut(key)
+                    .expect("alias was just bound")
+                    .migrated = true;
+            }
+        }
+        keys.into_iter()
+            .map(|key| (key, sessions.pins[&key].version))
+            .collect()
+    };
+    Ok(Selection { id, keys, portable })
 }
 
 fn forwarding_headers(incoming: &HeaderMap, scope: &[u8; 32]) -> HeaderMap {
@@ -382,10 +622,10 @@ async fn proxy(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
-    let model = match body.get("model").and_then(Value::as_str).filter(|model| {
+    match body.get("model").and_then(Value::as_str).filter(|model| {
         !model.is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
     }) {
-        Some(model) => model.to_string(),
+        Some(_) => {}
         None => {
             return CodexError::bad_request("A native Codex model ID is required").into_response()
         }
@@ -395,22 +635,52 @@ async fn proxy(
         Ok(id) => id,
         Err(error) => return error.into_response(),
     };
-    let selected = match manager.record(&id, true).await {
-        Ok(record) => record,
-        Err(error) => return error.into_response(),
-    };
-    let result = forward(manager, id, headers, &mut body, caller_scope, compact, None).await;
-    let mut response = match result {
+    match forward(manager, id, headers, &mut body, caller_scope, compact, None).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
-    };
-    metadata(&mut response, &selected, &model);
-    response
+    }
 }
 
 pub(super) async fn forward(
     manager: Arc<CodexManager>,
-    id: String,
+    mut selection: Selection,
+    headers: HeaderMap,
+    body: &mut Value,
+    scope: [u8; 32],
+    compact: bool,
+    messages: Option<super::anthropic::ResponseOptions>,
+) -> Result<Response, CodexError> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let is_messages = messages.is_some();
+    let result = forward_inner(
+        manager.clone(),
+        &mut selection,
+        headers,
+        body,
+        scope,
+        compact,
+        messages,
+    )
+    .await;
+    let mut response = match result {
+        Ok(response) => response,
+        Err(error) if is_messages => super::anthropic::error_response(error),
+        Err(error) => error.into_response(),
+    };
+    // Selection can change on 429. Both protocol wrappers must use the final account, including errors.
+    if let Ok(record) = manager.record(&selection.id, false).await {
+        metadata(&mut response, &record, &model);
+    }
+    Ok(response)
+}
+
+async fn forward_inner(
+    manager: Arc<CodexManager>,
+    selection: &mut Selection,
     headers: HeaderMap,
     body: &mut Value,
     scope: [u8; 32],
@@ -454,55 +724,86 @@ pub(super) async fn forward(
         serde_json::to_vec(&body).map_err(|_| CodexError::bad_request("Invalid Responses body"))?,
     );
     let forwarded = forwarding_headers(&headers, &scope);
-    let url = auth::RESPONSES_URL;
-    let mut record = manager.credentials(&id, None, true).await?;
-    let send = |record: &Record| {
-        auth::authorized(
-            &manager.client(),
-            reqwest::Method::POST,
-            url,
-            &record.tokens,
-        )
-        .headers(forwarded.clone())
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "text/event-stream")
-        .timeout(Duration::from_secs(30 * 60))
-        .body(bytes.clone())
-        .send()
-    };
-    let mut upstream = tokio::time::timeout(Duration::from_secs(300), send(&record))
-        .await
-        .map_err(|_| {
-            CodexError::upstream("Codex upstream did not respond before the gateway deadline")
-        })?
-        .map_err(|_| {
-            CodexError::upstream("Unable to reach Codex upstream; no retry was performed")
-        })?;
-    if upstream.status() == StatusCode::UNAUTHORIZED {
-        // An HTTP 401 before any downstream bytes is the only inference retry. Same account only.
-        record = manager
-            .credentials(&id, Some(&record.tokens.access_token), true)
-            .await?;
-        upstream = tokio::time::timeout(Duration::from_secs(300), send(&record))
-            .await
-            .map_err(|_| {
-                CodexError::upstream("Codex upstream did not respond after authorization refresh")
-            })?
-            .map_err(|_| {
-                CodexError::upstream("Unable to reach Codex upstream after authorization refresh")
-            })?;
-    }
-    let status = upstream.status();
-    let mut outbound_headers = response_headers(upstream.headers());
-    if !status.is_success() {
-        let raw = auth::read_bounded(upstream, auth::JSON_LIMIT).await?;
-        let mut error = serde_json::from_slice::<Value>(&raw).unwrap_or_else(|_| json!({"error": {
+    // Encode and scope exactly once: retries reuse identical bytes, including compaction injection.
+    let mut visited = HashSet::new();
+    // Bound even concurrent account imports/deletions; a changing pool cannot prolong this request.
+    let mut remaining = manager.inner.lock().await.accounts.accounts.len();
+    let (upstream, record) = loop {
+        if remaining == 0 {
+            let inner = manager.inner.lock().await;
+            return Err(match scheduler::select(&inner.accounts, &visited, now()) {
+                Err(error) => error,
+                Ok(_) => CodexError::cooling(
+                    now() + 1,
+                    "Codex quota failover reached its per-request attempt limit; retry the request",
+                ),
+            });
+        }
+        remaining -= 1;
+        selection.ready(&manager, &visited).await?;
+        let mut record = manager.credentials(&selection.id, None, true).await?;
+        selection.ready(&manager, &visited).await?;
+        if record.account.id != selection.id {
+            visited.insert(record.account.id.clone());
+            continue;
+        }
+        visited.insert(selection.id.clone());
+        let mut upstream = send(&manager, &record, &forwarded, &bytes).await?;
+        if upstream.status() == StatusCode::UNAUTHORIZED {
+            // Exactly one same-account refresh per attempted account. A second 401 is terminal.
+            record = manager
+                .credentials(&selection.id, Some(&record.tokens.access_token), true)
+                .await?;
+            selection.validate(&*manager.sessions.lock().await)?;
+            upstream = send(&manager, &record, &forwarded, &bytes).await?;
+        }
+        let status = upstream.status();
+        if status.is_success() {
+            break (upstream, record);
+        }
+        let outbound_headers = response_headers(upstream.headers());
+        let raw = match auth::read_bounded(upstream, auth::JSON_LIMIT).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    manager
+                        .note_cooldown(
+                            &selection.id,
+                            &scheduler::from_429(&outbound_headers, &Value::Null, now()),
+                        )
+                        .await?;
+                }
+                // Even a 429 whose body was interrupted is not replayed after a network error.
+                return Err(error);
+            }
+        };
+        let parsed = serde_json::from_slice::<Value>(&raw);
+        if status == StatusCode::TOO_MANY_REQUESTS && !parsed.as_ref().is_ok_and(Value::is_object) {
+            manager
+                .note_cooldown(
+                    &selection.id,
+                    &scheduler::from_429(&outbound_headers, &Value::Null, now()),
+                )
+                .await?;
+            return Err(CodexError::upstream(
+                "Codex returned a malformed quota response; no retry was performed",
+            ));
+        }
+        let mut error = parsed.unwrap_or_else(|_| json!({"error": {
             "message": format!("Codex upstream returned HTTP {} with a non-JSON body", status.as_u16()), "type": "upstream_error"
         }}));
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let cooldown = scheduler::from_429(&outbound_headers, &error, now());
+            manager.note_cooldown(&selection.id, &cooldown).await?;
+            if !selection.portable {
+                return Err(bound_cooldown(cooldown.until));
+            }
+            continue;
+        }
         record.tokens.redact(&mut error);
         manager
             .note_error(
-                &id,
+                &selection.id,
                 &CodexError::upstream_status(status, "Codex upstream request failed"),
             )
             .await?;
@@ -510,6 +811,20 @@ pub(super) async fn forward(
             error = super::anthropic::upstream_error(status, &error);
         }
         return Ok(json_response(status, outbound_headers, error));
+    };
+    let id = selection.id.clone();
+    let status = upstream.status();
+    let mut outbound_headers = response_headers(upstream.headers());
+    if let Some(turn) = upstream
+        .headers()
+        .get("x-codex-turn-state")
+        .and_then(|value| value.to_str().ok())
+    {
+        manager
+            .sessions
+            .lock()
+            .await
+            .bind(session_key(&scope, "turn", turn), &id)?;
     }
     {
         let mut inner = manager.inner.lock().await;
@@ -574,6 +889,10 @@ pub(super) async fn forward(
                 if let Some(response) = event.get("response") {
                     remember_response(&stream_manager, &scope, &id, response).await.map_err(|error| std::io::Error::other(error.message))?;
                 }
+                if let Some(item) = event.get("item") {
+                    remember_item(&mut *stream_manager.sessions.lock().await, &scope, &id, item)
+                        .map_err(|error| std::io::Error::other(error.message))?;
+                }
             }
             // Pull-based Body polling provides backpressure. Dropping the body cancels the upstream read.
             yield chunk;
@@ -590,22 +909,80 @@ pub(super) async fn forward(
     Ok(response)
 }
 
+async fn send(
+    manager: &CodexManager,
+    record: &Record,
+    forwarded: &HeaderMap,
+    bytes: &Bytes,
+) -> Result<reqwest::Response, CodexError> {
+    let client = manager.client();
+    let request = auth::authorized(
+        &client,
+        reqwest::Method::POST,
+        auth::RESPONSES_URL,
+        &record.tokens,
+    )
+    .headers(forwarded.clone())
+    .header(header::CONTENT_TYPE, "application/json")
+    .header(header::ACCEPT, "text/event-stream")
+    .timeout(Duration::from_secs(30 * 60))
+    .body(bytes.clone())
+    .build()
+    .map_err(|_| CodexError::upstream("Unable to construct Codex upstream request"))?;
+    #[cfg(test)]
+    let request = {
+        let mut request = request;
+        if let Some(url) = &manager.responses_url {
+            *request.url_mut() = url.clone();
+        }
+        request
+    };
+    tokio::time::timeout(Duration::from_secs(300), client.execute(request))
+        .await
+        .map_err(|_| CodexError::upstream("Codex upstream did not respond before the gateway deadline; no retry was performed"))?
+        .map_err(|_| CodexError::upstream("Unable to reach Codex upstream; no retry was performed"))
+}
+
 pub(super) async fn remember_response(
     manager: &CodexManager,
     scope: &[u8; 32],
     account_id: &str,
     response: &Value,
 ) -> Result<(), CodexError> {
+    let mut sessions = manager.sessions.lock().await;
     if let Some(id) = response
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty() && id.len() <= 512)
     {
-        manager
-            .sessions
-            .lock()
-            .await
-            .bind(session_key(scope, "response", id), account_id)?;
+        sessions.bind(session_key(scope, "response", id), account_id)?;
+    }
+    if let Some(items) = response.get("output").and_then(Value::as_array) {
+        for item in items {
+            remember_item(&mut sessions, scope, account_id, item)?;
+        }
+    }
+    Ok(())
+}
+
+fn remember_item(
+    sessions: &mut SessionCache,
+    scope: &[u8; 32],
+    account_id: &str,
+    item: &Value,
+) -> Result<(), CodexError> {
+    for (field, kind) in [
+        ("id", "item"),
+        ("call_id", "call"),
+        ("encrypted_content", "encrypted"),
+    ] {
+        if let Some(value) = item
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            sessions.bind(session_key(scope, kind, value), account_id)?;
+        }
     }
     Ok(())
 }
@@ -720,6 +1097,9 @@ pub(super) async fn collect_response(
             if let Some(response) = event.get("response") {
                 remember_response(manager, scope, account_id, response).await?;
             }
+            if let Some(item) = event.get("item") {
+                remember_item(&mut *manager.sessions.lock().await, scope, account_id, item)?;
+            }
             match event.get("type").and_then(Value::as_str) {
                 Some("response.output_item.done") => {
                     if let Some(index) = event.get("output_index").and_then(Value::as_u64) {
@@ -762,8 +1142,572 @@ pub(super) async fn collect_response(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    pub(in crate::proxy::codex) struct Reply {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: String,
+    }
+
+    impl Reply {
+        pub(in crate::proxy::codex) fn quota(until: i64) -> Self {
+            Self {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                headers: HeaderMap::new(),
+                body: json!({"error":{"type":"usage_limit_reached","message":"quota exhausted","resets_at":until}}).to_string(),
+            }
+        }
+
+        pub(in crate::proxy::codex) fn ok(id: &str) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: json!({"id":id,"object":"response","status":"completed",
+                    "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}],
+                    "usage":{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"cached_tokens":0}}}).to_string(),
+            }
+        }
+
+        fn sse(wire: &str) -> Self {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            Self {
+                status: StatusCode::OK,
+                headers,
+                body: wire.into(),
+            }
+        }
+    }
+
+    pub(in crate::proxy::codex) struct Fixture {
+        pub manager: Arc<CodexManager>,
+        pub first: String,
+        pub second: String,
+        pub calls: Arc<tokio::sync::Mutex<Vec<(String, Value)>>>,
+        pub temp: tempfile::TempDir,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Fixture {
+        pub(in crate::proxy::codex) async fn new(replies: Vec<Reply>) -> Self {
+            let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let requests = calls.clone();
+            let replies = Arc::new(tokio::sync::Mutex::new(VecDeque::from(replies)));
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let requests = requests.clone();
+                    let replies = replies.clone();
+                    async move {
+                        requests.lock().await.push((
+                            headers["chatgpt-account-id"].to_str().unwrap().to_string(),
+                            body,
+                        ));
+                        let reply = replies
+                            .lock()
+                            .await
+                            .pop_front()
+                            .expect("unexpected inference replay");
+                        let mut response = Response::new(Body::from(reply.body));
+                        *response.status_mut() = reply.status;
+                        *response.headers_mut() = reply.headers;
+                        if !response.headers().contains_key(header::CONTENT_TYPE) {
+                            response.headers_mut().insert(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            );
+                        }
+                        response
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let temp = tempfile::tempdir().unwrap();
+            let mut manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+            manager.responses_url = Some(format!("http://{address}/").parse().unwrap());
+            *manager.client.write() = reqwest::Client::builder().no_proxy().build().unwrap();
+            let mut ids = Vec::new();
+            for workspace in ["first-workspace", "second-workspace"] {
+                let tokens = auth::Tokens::from_auth_json(&json!({"tokens":{
+                    "access_token":format!("access-{workspace}"),"refresh_token":format!("refresh-{workspace}"),
+                    "id_token":"identity","account_id":workspace
+                }})).unwrap();
+                let account = manager
+                    .upsert_account(
+                        &mut *manager.inner.lock().await,
+                        tokens,
+                        None,
+                        &json!({}),
+                        true,
+                    )
+                    .unwrap();
+                ids.push(account.id);
+            }
+            Self {
+                manager: Arc::new(manager),
+                first: ids.remove(0),
+                second: ids.remove(0),
+                calls,
+                temp,
+                server,
+            }
+        }
+
+        pub(in crate::proxy::codex) async fn responses(
+            &self,
+            headers: HeaderMap,
+            body: Value,
+            compact: bool,
+        ) -> Response {
+            proxy(self.manager.clone(), headers, Ok(Json(body)), compact).await
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_failover_rebinds_old_plain_aliases_but_retains_response_affinity_and_preference()
+    {
+        let until = now() + 120;
+        let fixture = Fixture::new(vec![
+            Reply::quota(until),
+            Reply::ok("resp-recovered"),
+            Reply::ok("resp-next-turn"),
+        ])
+        .await;
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("old-session"));
+        let scope = scope(&headers);
+        let body = json!({"model":"native-model","prompt_cache_key":"old-cache","input":[
+            {"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"},{"role":"user","content":"Continue"}]});
+        let old = select_account(&fixture.manager, &headers, &body, &scope)
+            .await
+            .unwrap();
+        assert_eq!(old.id, fixture.first);
+        remember_response(
+            &fixture.manager,
+            &scope,
+            &fixture.first,
+            &json!({"id":"resp-original"}),
+        )
+        .await
+        .unwrap();
+        let response = fixture.responses(headers.clone(), body.clone(), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-account-email"],
+            fixture.second.as_str()
+        );
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), MAX_COLLECTED)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["object"], "response.compaction");
+        assert_eq!(value["output"][0]["content"][0]["text"], "recovered");
+        let calls = fixture.calls.lock().await;
+        assert_eq!(
+            calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),
+            ["first-workspace", "second-workspace"]
+        );
+        assert_eq!(calls[0].1, calls[1].1);
+        assert_eq!(
+            calls[1].1["prompt_cache_key"],
+            scoped_id(&scope, "cache", "old-cache")
+        );
+        assert_eq!(
+            calls[1].1["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "compaction_trigger")
+                .count(),
+            1
+        );
+        drop(calls);
+        let current = select_account(&fixture.manager, &headers, &body, &scope)
+            .await
+            .unwrap();
+        assert_eq!(current.id, fixture.second);
+        let next = fixture
+            .responses(headers.clone(), body.clone(), false)
+            .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(next.headers()["x-account-email"], fixture.second.as_str());
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .await
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            ["first-workspace", "second-workspace", "second-workspace"]
+        );
+        let mut stale = old;
+        assert_eq!(
+            stale
+                .ready(&fixture.manager, &HashSet::new())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::CONFLICT
+        );
+        let error = select_account(
+            &fixture.manager,
+            &HeaderMap::new(),
+            &json!({"previous_response_id":"resp-original"}),
+            &scope,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.retry_after.is_some());
+        assert_eq!(
+            fixture
+                .manager
+                .inner
+                .lock()
+                .await
+                .accounts
+                .active_account_id
+                .as_deref(),
+            Some(fixture.first.as_str())
+        );
+        let restarted = CodexManager::new(fixture.temp.path().to_path_buf(), None).unwrap();
+        assert_eq!(restarted.preferred_account().await.unwrap(), fixture.second);
+        assert_eq!(
+            restarted
+                .record(&fixture.first, true)
+                .await
+                .unwrap()
+                .account
+                .cooldown_until,
+            Some(until)
+        );
+    }
+
+    #[tokio::test]
+    async fn all_accounts_exhausted_return_earliest_retry_after_without_replay() {
+        let first_reset = now() + 180;
+        let second_reset = now() + 90;
+        let fixture =
+            Fixture::new(vec![Reply::quota(first_reset), Reply::quota(second_reset)]).await;
+        let response = fixture
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"hello"}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers()["x-account-email"],
+            fixture.second.as_str()
+        );
+        let retry: i64 = response.headers()[header::RETRY_AFTER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=90).contains(&retry));
+        assert!(retry >= second_reset - now());
+        assert_eq!(fixture.calls.lock().await.len(), 2);
+        let again = fixture
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"again"}),
+                false,
+            )
+            .await;
+        assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(fixture.calls.lock().await.len(), 2);
+        let mut inner = fixture.manager.inner.lock().await;
+        for record in &mut inner.accounts.accounts {
+            record.account.enabled = false;
+        }
+        drop(inner);
+        assert_eq!(
+            fixture
+                .responses(
+                    HeaderMap::new(),
+                    json!({"model":"native","input":"hello"}),
+                    false
+                )
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_migration_preserves_native_private_state_issuers() {
+        let mut first = Reply::ok("resp-before");
+        let mut value: Value = serde_json::from_str(&first.body).unwrap();
+        value["output"] = json!([
+            {"id":"item-A","type":"reasoning","encrypted_content":"encrypted-A"},
+            {"type":"function_call","call_id":"call-A","name":"read","arguments":"{}"}
+        ]);
+        first.body = value.to_string();
+        first
+            .headers
+            .insert("x-codex-turn-state", HeaderValue::from_static("turn-A"));
+        // Observe item-level SSE provenance even when the terminal response omits output.
+        let mut second = Reply::sse(&format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_item.done","item":{"id":"item-B","type":"reasoning","encrypted_content":"encrypted-B"}}),
+            json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-B","name":"read","arguments":"{}"}}),
+            json!({"type":"response.completed","response":{"id":"resp-after","output":[]}})
+        ));
+        second
+            .headers
+            .insert("x-codex-turn-state", HeaderValue::from_static("turn-B"));
+        let mut replies = vec![first, Reply::quota(now() + 120), second];
+        replies.extend((0..5).map(|_| Reply::ok("resp-continuation")));
+        let fixture = Fixture::new(replies).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", HeaderValue::from_static("migrating-session"));
+        for text in ["before quota", "after quota"] {
+            let response = fixture
+                .responses(
+                    headers.clone(),
+                    json!({"model":"native","input":text,"stream":true}),
+                    false,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), MAX_COLLECTED)
+                .await
+                .unwrap();
+        }
+        for input in [
+            json!([{"type":"reasoning","encrypted_content":"encrypted-A"}]),
+            json!([{"type":"compaction","encrypted_content":"encrypted-A"}]),
+            json!([{"type":"function_call_output","call_id":"call-A","output":"result"}]),
+            json!([{"type":"item_reference","id":"item-A"}]),
+            json!([{"type":"reasoning","encrypted_content":"unknown-private-state"}]),
+            Value::Null,
+        ] {
+            let mut headers = headers.clone();
+            if input.is_null() {
+                headers.insert("x-codex-turn-state", HeaderValue::from_static("turn-A"));
+            }
+            let response = fixture.responses(headers,
+                json!({"model":"native","input":if input.is_null() {json!("continue")} else {input}}), false).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+        assert_eq!(fixture.calls.lock().await.len(), 3);
+        // New state really issued by B remains usable; do not simply reject all private
+        // continuations after failover, which would break the next native CLI turn.
+        for input in [
+            json!([{"type":"reasoning","encrypted_content":"encrypted-B"}]),
+            json!([{"type":"compaction","encrypted_content":"encrypted-B"}]),
+            json!([{"type":"function_call_output","call_id":"call-B","output":"result"}]),
+            json!([{"type":"item_reference","id":"item-B"}]),
+            Value::Null,
+        ] {
+            let mut headers = headers.clone();
+            if input.is_null() {
+                headers.insert("x-codex-turn-state", HeaderValue::from_static("turn-B"));
+            }
+            let response = fixture.responses(headers,
+                json!({"model":"native","input":if input.is_null() {json!("continue")} else {input}}), false).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["x-account-email"],
+                fixture.second.as_str()
+            );
+        }
+        assert_eq!(fixture.calls.lock().await.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn malformed_quota_response_cools_account_without_replaying_inference() {
+        let mut malformed = Reply::quota(now() + 120);
+        malformed.body = "<html>invalid upstream response</html>".into();
+        let fixture = Fixture::new(vec![malformed, Reply::ok("must-not-replay")]).await;
+        let response = fixture
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"hello"}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(fixture.calls.lock().await.len(), 1);
+        assert_eq!(
+            fixture.manager.preferred_account().await.unwrap(),
+            fixture.second
+        );
+    }
+
+    #[tokio::test]
+    async fn account_bound_native_requests_never_migrate_on_quota_failure() {
+        for (body, turn_state) in [
+            (
+                json!({"previous_response_id":"resp-bound","input":"continue"}),
+                false,
+            ),
+            (
+                json!({"input":[{"type":"reasoning","encrypted_content":"private"}]}),
+                false,
+            ),
+            (
+                json!({"input":[{"type":"compaction","encrypted_content":"private"}]}),
+                false,
+            ),
+            (
+                json!({"input":[{"type":"function_call_output","call_id":"native-call","output":"result"}]}),
+                false,
+            ),
+            (json!({"input":"continue"}), true),
+        ] {
+            let fixture = Fixture::new(vec![Reply::quota(now() + 120)]).await;
+            let mut headers = HeaderMap::new();
+            headers.insert("session_id", HeaderValue::from_static("bound-session"));
+            if turn_state {
+                headers.insert("x-codex-turn-state", HeaderValue::from_static("private"));
+            }
+            let scope = scope(&headers);
+            fixture
+                .manager
+                .sessions
+                .lock()
+                .await
+                .bind(
+                    session_key(&scope, "session", "bound-session"),
+                    &fixture.first,
+                )
+                .unwrap();
+            remember_response(
+                &fixture.manager,
+                &scope,
+                &fixture.first,
+                &json!({"id":"resp-bound"}),
+            )
+            .await
+            .unwrap();
+            let mut body = body;
+            body["model"] = json!("native");
+            let response = fixture
+                .responses(headers.clone(), body.clone(), false)
+                .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers()["x-account-email"],
+                fixture.first.as_str()
+            );
+            assert!(response.headers().contains_key(header::RETRY_AFTER));
+            let second = fixture.responses(headers, body, false).await;
+            assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                fixture
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|call| call.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["first-workspace"]
+            );
+            assert!(fixture
+                .manager
+                .record(&fixture.second, true)
+                .await
+                .unwrap()
+                .account
+                .last_used_at
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn inference_never_replays_server_errors_network_failures_or_started_streams() {
+        let fixture = Fixture::new(vec![Reply {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            headers: HeaderMap::new(),
+            body: json!({"error":{"message":"upstream failed"}}).to_string(),
+        }])
+        .await;
+        let response = fixture
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"hello"}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(fixture.calls.lock().await.len(), 1);
+
+        let wire = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"started\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"usage_limit_reached\"}}}\n\n";
+        let streamed = Fixture::new(vec![Reply::sse(wire)]).await;
+        let response = streamed
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"hello","stream":true}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_COLLECTED)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), wire.as_bytes());
+        assert_eq!(streamed.calls.lock().await.len(), 1);
+
+        let interrupted = Fixture::new(vec![Reply::sse(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"unfinished\"}\n\n",
+        )])
+        .await;
+        let response = interrupted
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"hello"}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(interrupted.calls.lock().await.len(), 1);
+
+        let disconnected = Fixture::new(Vec::new()).await;
+        disconnected.server.abort();
+        while !disconnected.server.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let response = disconnected
+            .responses(
+                HeaderMap::new(),
+                json!({"model":"native","input":"hello"}),
+                false,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()["x-account-email"],
+            disconnected.first.as_str()
+        );
+        assert!(disconnected
+            .manager
+            .record(&disconnected.second, true)
+            .await
+            .unwrap()
+            .account
+            .last_used_at
+            .is_none());
+    }
 
     #[test]
     fn sse_utf8_crlf_multiline_and_chunk_boundaries_preserve_terminal_items() {
@@ -900,7 +1844,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selected, account.id);
+        assert_eq!(selected.id, account.id);
     }
 
     #[tokio::test]
@@ -968,7 +1912,7 @@ mod tests {
         let independent = select_account(&manager, &headers_b, &json!({}), &scope(&headers_b))
             .await
             .unwrap();
-        assert_eq!(independent, second.id);
+        assert_eq!(independent.id, second.id);
         let forwarded = forwarding_headers(&headers_a, &scope(&headers_a));
         assert!(!forwarded.contains_key(header::AUTHORIZATION));
         assert_ne!(forwarded["session_id"], headers_a["session_id"]);

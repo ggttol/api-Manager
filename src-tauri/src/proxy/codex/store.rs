@@ -26,6 +26,10 @@ pub(super) struct Account {
     pub expires_at: Option<i64>,
     pub last_used_at: Option<i64>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub cooldown_until: Option<i64>,
+    #[serde(default)]
+    pub cooldown_reason: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -34,6 +38,9 @@ pub(super) struct Record {
     pub tokens: Tokens,
     #[serde(default)]
     pub verified: bool,
+    // In-flight observation CAS only; no request survives a manager restart.
+    #[serde(skip)]
+    pub quota_version: u64,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -241,9 +248,12 @@ mod tests {
                 expires_at: None,
                 last_used_at: None,
                 last_error: None,
+                cooldown_until: None,
+                cooldown_reason: None,
             },
             tokens,
             verified: true,
+            quota_version: 0,
         };
         let dto = serde_json::to_string(&record.account).unwrap();
         assert!(!dto.contains("secret-"));

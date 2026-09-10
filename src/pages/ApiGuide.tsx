@@ -26,7 +26,7 @@ const content = {
         anthropicTokens: 'POST /codex/v1/messages/count_tokens 当前返回 HTTP 501（不支持）的 Anthropic 格式错误，不提供估算或伪造的精确 token 数。依赖请求前 token 计数的客户端功能可能不可用，响应中的实际 usage 与此不同。',
         anthropicBudget: '重要限制：max_tokens 必须为正整数，但仅作为客户端兼容字段接受，不能强制限制输出长度。ChatGPT 订阅上游不支持 max_output_tokens，实际输出预算由订阅后端控制；不要将示例的 1024 视为硬上限。',
         anthropicThinking: 'thinking 的 enabled / adaptive 仅映射到 Codex 推理设置；budget_tokens 是推理强度参考，不是精确预算。output_config.effort 的 low / medium / high / max 映射为 low / medium / high / xhigh。不会生成 Claude 签名 thinking 块或推理摘要；续接需要的隐藏推理仅保留在服务器端。',
-        anthropicSessions: '工具调用 ID 由网关生成，并绑定原账号与访问范围；tool_result 必须原样返回对应 ID，不要跨账号或网关 Key 重用。工具续接状态保存在内存中，空闲 24 小时后过期；服务器重启或状态过期后，请新建对话并用文本重述任务，不要携带旧 tool_use / tool_result。',
+        anthropicSessions: '新请求和携带完整文本上下文的请求支持自动额度切换。网关生成的工具调用 ID 则绑定原账号与访问范围；tool_result 必须原样返回对应 ID，不要跨账号或网关 Key 重用。此类工具续接遇到原账号冷却会明确报错，不会换号重放。工具续接状态保存在内存中，空闲 24 小时后过期；服务器重启或状态过期后，请新建对话并用文本重述任务，不要携带旧 tool_use / tool_result。',
         claudeTitle: '04 · 连接 Claude Code', claudeHelp: '在已设置 API_MANAGER_KEY 的同一 Bash 终端运行以下配置。三个默认模型别名和子代理都使用所选 Codex 原生模型，避免自动请求 claude-* ID；不要用 /model 或项目配置覆盖为 Claude 模型。先移除已有的其他云提供商或鉴权配置冲突。',
         claudeLaunch: '配置仅引用本地网关 Key，不需要 Anthropic API Key 或 Claude 订阅。命令在当前终端设置环境变量并启动 claude；不要提交环境变量或分享含密钥的终端输出。使用完毕请 unset ANTHROPIC_API_KEY API_MANAGER_KEY。',
         catalog: '模型目录', inference: '推理', copy: '复制', copied: '已复制', copyFailed: '复制失败，请手动选择并复制。',
@@ -43,11 +43,14 @@ const content = {
         configHelp: '将以下设置合并到用户级 ~/.codex/config.toml。model 与 model_provider 必须放在文件顶层、任何 [表] 之前；已有同名字段或 provider 表应替换而非重复追加。若设置了 CODEX_HOME，请使用该目录下的 config.toml。不要覆盖其他无关配置。',
         transport: '传输为 HTTP SSE：wire_api = "responses"，supports_websockets = false。requires_openai_auth = false 表示客户端不使用 OpenAI 登录凭据，但网关仍按其鉴权策略检查 API_MANAGER_KEY；这不代表免鉴权。',
         launch: '在已设置 API_MANAGER_KEY 的同一个终端运行 codex。env_key 写的是环境变量名称，不是密钥本身；不要把真实 Key 写进 TOML。',
-        protocolTitle: '会话与上下文压缩',
+        protocolTitle: '自动切换、会话与上下文',
+        failoverTitle: '额度不足时自动选择其他账号',
+        failover: 'Responses 与 Anthropic Messages 共用自动切换：先选已启用、已授权且未冷却的首选账号，否则选择其他可用账号。上游返回 429 后将原账号暂时跳过，并为可安全迁移的请求尝试其他可用账号，不在账号之间循环重试；401 仍允许在同一账号刷新授权后重试一次。首选标记保持您的设置，不随实际处理账号改变。冷却时间依据上游重置时间或 Retry-After；无法确定时使用有限的等待时间，并不代表额度已恢复。账号保持启用，到期后自动恢复候选资格。',
+        failoverLimits: '所有可用账号都在冷却时返回 429，并用 Retry-After 给出最早可重试时间；没有启用的账号时返回 503。网络错误、上游 5xx 或已经向客户端输出的流不会跨账号重放。',
         compactTitle: '原生压缩与兼容适配', compact: '当前 Codex 原生协议通过 /codex/v1/responses 的 input 中的 {"type":"compaction_trigger"} 触发压缩。/codex/v1/responses/compact 是网关适配器：追加此原生触发项、收集上游响应，并返回 object 为 response.compaction 的 JSON。它不是独立的上游 /compact 服务，也不是 Google 兼容入口的压缩逻辑。',
         compactNote: '让客户端管理压缩上下文；不要将其他账号或旧会话的加密 reasoning / compaction 内容复制到新会话。',
-        affinityTitle: '同一会话固定到同一账号', affinity: '网关根据会话标识、prompt_cache_key 和 previous_response_id 维护账号亲和性。会话中途不会静默切换账号；更改首选账号只影响新会话。固定账号被禁用、删除或不可用时，旧会话会报错。',
-        restart: '亲和性保存在服务器内存中，重启或过期后旧会话不能可靠续接。遇到未知 previous_response_id 或丢失亲和性的错误，请开启全新对话、使用新会话 ID，并重新提供原始任务文本；不要携带旧响应 ID、turn-state 或加密上下文。',
+        affinityTitle: '可迁移的文本与不可迁移的账号状态', affinity: '普通文本请求只要携带继续任务所需的完整文本上下文，即使沿用 session_id 或 prompt_cache_key，也可在原账号额度不足或限流后安全重新绑定到其他可用账号，不必手动新建对话。此操作不会迁移旧响应 ID 或工具句柄。previous_response_id、x-codex-turn-state、加密 reasoning / compaction 项和网关工具续接状态始终绑定原账号；原账号冷却时，此类请求会明确报错，而不是把私有状态发送到另一个账号。',
+        restart: '账号亲和性与工具续接状态保存在服务器内存中。重启或过期后，旧的账号绑定状态不能可靠续接。只有遇到未知 previous_response_id、丢失的绑定状态或过期工具句柄时，才需要新建对话、使用新会话 ID 并重新提供原始任务文本；不要携带旧响应 ID、turn-state、加密上下文或旧 tool_use / tool_result。普通完整文本请求的额度切换不要求这一步。',
     },
     en: {
         title: 'Integration guide', subtitle: 'Choose an endpoint, prepare your key, and connect your client.', badge: 'Current server',
@@ -68,7 +71,7 @@ const content = {
         anthropicTokens: 'POST /codex/v1/messages/count_tokens currently returns an Anthropic-shaped HTTP 501 unsupported error, not an estimate or fabricated exact count. Client features requiring preflight token counting may not work. Actual response usage is separate.',
         anthropicBudget: 'Important limit: max_tokens must be a positive integer, but is accepted only for client compatibility and cannot enforce an output length limit. The ChatGPT subscription upstream rejects max_output_tokens; its backend controls the actual output budget. The example’s 1024 is not a hard cap.',
         anthropicThinking: 'enabled / adaptive thinking maps to Codex reasoning settings; budget_tokens is an advisory effort tier, not an exact budget. output_config.effort low / medium / high / max maps to low / medium / high / xhigh. No Claude-signed thinking blocks or reasoning summaries are produced. Hidden reasoning needed for continuation stays on the server.',
-        anthropicSessions: 'Gateway-issued tool IDs are bound to the original account and access scope. Return the exact matching ID in tool_result; do not reuse it across accounts or gateway keys. Tool continuation state is in memory and expires after 24 idle hours. After a server restart or state expiry, start a new conversation and restate the task as text without old tool_use / tool_result blocks.',
+        anthropicSessions: 'New requests and requests carrying their complete text context support automatic quota failover. Gateway-issued tool IDs remain bound to the original account and access scope. Return the exact matching ID in tool_result; do not reuse it across accounts or gateway keys. These tool continuations fail explicitly while the original account is cooling down, rather than replaying elsewhere. Tool continuation state is in memory and expires after 24 idle hours. After a server restart or state expiry, start a new conversation and restate the task as text without old tool_use / tool_result blocks.',
         claudeTitle: '04 · Connect Claude Code', claudeHelp: 'Run this configuration in the same Bash terminal where API_MANAGER_KEY is set. All three default model aliases and subagents use the selected native Codex model so they do not automatically request claude-* IDs. Do not override them with Claude models via /model or project settings. Remove conflicts with existing cloud-provider or authentication configuration first.',
         claudeLaunch: 'This references your local gateway key, not an Anthropic API key or Claude subscription. The commands set environment variables in this terminal and launch claude. Never commit these variables or share terminal output containing secrets. Run unset ANTHROPIC_API_KEY API_MANAGER_KEY when finished.',
         catalog: 'Model catalog', inference: 'Inference', copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed. Please select and copy the text manually.',
@@ -85,11 +88,14 @@ const content = {
         configHelp: 'Merge these settings into your user-level ~/.codex/config.toml. Put model and model_provider at the top level, before any [table]. Replace existing matching fields or provider tables rather than appending duplicates. If CODEX_HOME is set, use config.toml in that directory. Preserve unrelated settings.',
         transport: 'Transport is HTTP SSE: wire_api = "responses", supports_websockets = false. requires_openai_auth = false prevents the client from using OpenAI login credentials; the gateway still checks API_MANAGER_KEY according to its authentication policy. It does not mean authentication is disabled.',
         launch: 'Run codex in the same terminal where API_MANAGER_KEY is set. env_key names the environment variable, not the secret itself. Never put the real key in TOML.',
-        protocolTitle: 'Sessions and context compaction',
+        protocolTitle: 'Failover, sessions and context',
+        failoverTitle: 'Automatic account failover on quota exhaustion',
+        failover: 'Responses and Anthropic Messages share automatic failover. The preferred account is selected when enabled, authorized and not cooling down; otherwise another eligible account is used. An upstream 429 temporarily skips that account and retries safely portable requests with other eligible accounts without cycling back. A 401 still permits one authorization-refresh retry on the same account. Your preferred setting does not change with the account actually serving a request. Cooldown uses upstream reset times or Retry-After, with a bounded waiting period when unknown; expiry is not a guarantee of restored quota. Accounts stay enabled and become eligible again automatically at expiry.',
+        failoverLimits: 'When all eligible accounts are cooling down, the gateway returns 429 with Retry-After for the earliest retry window. No enabled accounts returns 503. Network errors, upstream 5xx responses and streams already delivering output to the client are not replayed across accounts.',
         compactTitle: 'Native compaction and the compatibility adapter', compact: 'The current native Codex protocol triggers compaction with {"type":"compaction_trigger"} in the input to /codex/v1/responses. /codex/v1/responses/compact is a gateway adapter: it appends that native trigger, collects the upstream response, and returns JSON with object set to response.compaction. It is not a separate upstream /compact service or the Google-compatible compaction path.',
         compactNote: 'Let the client manage compacted context. Do not copy encrypted reasoning or compaction items from another account or an old session into a new conversation.',
-        affinityTitle: 'One conversation stays with one account', affinity: 'The gateway maintains account affinity using session identifiers, prompt_cache_key, and previous_response_id. It never silently switches an ongoing conversation to another account. Changing the preferred account affects new conversations; disabling, deleting, or losing a pinned account causes the old conversation to fail.',
-        restart: 'Affinity is held in server memory. After a restart or expiry, an old conversation cannot be reliably resumed. For unknown previous_response_id or missing-affinity errors, start a fresh conversation with a new session ID and restate the original task as text. Do not reuse old response IDs, turn-state, or encrypted context.',
+        affinityTitle: 'Portable text versus account-bound state', affinity: 'Ordinary text requests that include the complete text context needed to continue can safely rebind to another eligible account after quota exhaustion or rate limiting, even with an existing session_id or prompt_cache_key. There is no need to manually start a new chat. This does not move old response IDs or tool handles. previous_response_id, x-codex-turn-state, encrypted reasoning / compaction items and gateway tool continuation state stay bound to the original account. These requests fail explicitly while that account is cooling down, rather than sending private state to another account.',
+        restart: 'Account affinity and tool continuation state are held in server memory. After a restart or expiry, old account-bound state cannot be reliably resumed. For unknown previous_response_id, missing bound state or expired tool handles, start a fresh conversation with a new session ID and restate the original task as text. Do not reuse old response IDs, turn-state, encrypted context or old tool_use / tool_result blocks. Ordinary complete-text quota failover does not require this step.',
     },
 };
 
@@ -224,7 +230,7 @@ export default function ApiGuide() {
                 <a className="console-tab" href="#guide-endpoints">{text.endpointsTitle}</a>
                 <a className="console-tab" href="#guide-setup">{text.setupTitle}</a>
                 <a className="console-tab" href={client !== 'curl' ? '#guide-codex' : '#guide-examples'}>{client !== 'curl' ? clientTitle : text.examplesTitle}</a>
-                {example === 'codex' && <a className="console-tab" href="#guide-sessions">{text.protocolTitle}</a>}
+                {isCodex && <a className="console-tab" href="#guide-sessions">{text.protocolTitle}</a>}
             </nav>
 
             <section className={`${panel} space-y-5 scroll-mt-4`} aria-labelledby="guide-endpoints">
@@ -307,10 +313,13 @@ export default function ApiGuide() {
                 </section>
             )}
 
-            {example === 'codex' && <section className={`${panel} scroll-mt-4`} aria-labelledby="guide-sessions">
+            {isCodex && <section className={`${panel} scroll-mt-4`} aria-labelledby="guide-sessions">
                 <h2 id="guide-sessions" className="flex items-center gap-2 text-lg font-semibold"><Workflow size={20} className="text-violet-500" />{text.protocolTitle}</h2>
                 <div className="mt-4 space-y-3">
-                    <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300"><summary className="cursor-pointer text-sm font-semibold">{text.compactTitle}</summary><p className={`${paragraph} mt-3 break-words`}>{text.compact}</p><p className={`${paragraph} mt-3`}>{text.compactNote}</p></details>
+                    <h3 className="text-sm font-semibold">{text.failoverTitle}</h3>
+                    <p className={paragraph}>{text.failover}</p>
+                    <p className={paragraph}>{text.failoverLimits}</p>
+                    {example === 'codex' && <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300"><summary className="cursor-pointer text-sm font-semibold">{text.compactTitle}</summary><p className={`${paragraph} mt-3 break-words`}>{text.compact}</p><p className={`${paragraph} mt-3`}>{text.compactNote}</p></details>}
                     <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300"><summary className="cursor-pointer text-sm font-semibold">{text.affinityTitle}</summary><p className={`${paragraph} mt-3`}>{text.affinity}</p><p className={`${paragraph} mt-3`}>{text.restart}</p></details>
                 </div>
             </section>}

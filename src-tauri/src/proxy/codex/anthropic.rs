@@ -646,8 +646,8 @@ fn error_type(status: StatusCode) -> &'static str {
 fn error_value(error: &CodexError) -> Value {
     json!({"type":"error", "error":{"type":error_type(error.status), "message":error.message}})
 }
-fn error_response(error: CodexError) -> Response {
-    relay::json_response(error.status, HeaderMap::new(), error_value(&error))
+pub(super) fn error_response(error: CodexError) -> Response {
+    relay::json_response(error.status, error.headers(), error_value(&error))
 }
 pub(super) fn upstream_error(status: StatusCode, value: &Value) -> Value {
     let message = value
@@ -722,12 +722,7 @@ async fn messages_inner(
         Ok(id) => id,
         Err(error) => return error_response(error),
     };
-    let record = match manager.record(&id, true).await {
-        Ok(record) => record,
-        Err(error) => return error_response(error),
-    };
-    let model = mapped.options.model.clone();
-    let mut response = match relay::forward(
+    match relay::forward(
         manager,
         id,
         headers,
@@ -740,9 +735,7 @@ async fn messages_inner(
     {
         Ok(response) => response,
         Err(error) => error_response(error),
-    };
-    relay::metadata(&mut response, &record, &model);
-    response
+    }
 }
 
 fn upstream_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, CodexError> {
@@ -1393,7 +1386,155 @@ pub(super) async fn respond(
 
 #[cfg(test)]
 mod tests {
+    use super::super::relay::tests::{Fixture, Reply};
     use super::*;
+
+    #[tokio::test]
+    async fn messages_quota_failover_preserves_final_metadata_in_unary_and_streaming_modes() {
+        for stream in [false, true] {
+            let fixture = Fixture::new(vec![
+                Reply::quota(super::super::now() + 120),
+                Reply::ok("resp-messages"),
+                Reply::ok("resp-messages-next"),
+            ])
+            .await;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "session_id",
+                HeaderValue::from_static("old-messages-session"),
+            );
+            let scope = relay::scope(&headers);
+            let mut body = request(json!([{"role":"user","content":"Hello"}]));
+            body["stream"] = json!(stream);
+            // Simulate an existing ordinary conversation, rather than only a new unpinned request.
+            let mapped = map_request(body.clone(), &scope, &mut ToolCache::default()).unwrap();
+            let old = relay::select_messages_account(
+                &fixture.manager,
+                &headers,
+                &mapped.body,
+                &scope,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(old.id, fixture.first);
+            let response = messages_inner(
+                fixture.manager.clone(),
+                headers.clone(),
+                Ok(Json(body.clone())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["x-account-email"],
+                fixture.second.as_str()
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), relay::MAX_COLLECTED)
+                .await
+                .unwrap();
+            if stream {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("\"text\":\"recovered\""));
+                assert!(text.contains("message_stop"));
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    value["content"],
+                    json!([{"type":"text","text":"recovered"}])
+                );
+                assert_eq!(value["stop_reason"], "end_turn");
+            }
+            let next = messages_inner(fixture.manager.clone(), headers, Ok(Json(body))).await;
+            assert_eq!(next.status(), StatusCode::OK);
+            assert_eq!(next.headers()["x-account-email"], fixture.second.as_str());
+            assert_eq!(
+                fixture
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|call| call.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["first-workspace", "second-workspace", "second-workspace"]
+            );
+            assert_eq!(
+                fixture
+                    .manager
+                    .inner
+                    .lock()
+                    .await
+                    .accounts
+                    .active_account_id
+                    .as_deref(),
+                Some(fixture.first.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_gateway_tool_handles_never_fail_over_even_without_encrypted_reasoning() {
+        for reasoning in [false, true] {
+            let fixture = Fixture::new(vec![Reply::quota(super::super::now() + 120)]).await;
+            let scope = relay::scope(&HeaderMap::new());
+            let mut output = Vec::new();
+            if reasoning {
+                output.push(json!({"type":"reasoning","encrypted_content":"private"}));
+            }
+            output.push(json!({"type":"function_call","call_id":"original-call","name":"read_file","arguments":"{}"}));
+            let response = convert_response(
+                terminal(json!(output)),
+                &fixture.manager,
+                &scope,
+                &fixture.first,
+                "native",
+            )
+            .await
+            .unwrap();
+            let id = response["content"][0]["id"].as_str().unwrap();
+            let history = tool_history(id);
+            let response = messages_inner(
+                fixture.manager.clone(),
+                HeaderMap::new(),
+                Ok(Json(history.clone())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers()["x-account-email"],
+                fixture.first.as_str()
+            );
+            assert!(response.headers().contains_key(header::RETRY_AFTER));
+            let value: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), relay::MAX_COLLECTED)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["error"]["type"], "rate_limit_error");
+            let again = messages_inner(
+                fixture.manager.clone(),
+                HeaderMap::new(),
+                Ok(Json(history.clone())),
+            )
+            .await;
+            assert_eq!(again.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                fixture
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|call| call.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["first-workspace"]
+            );
+            let mapped = {
+                let mut sessions = fixture.manager.sessions.lock().await;
+                map_request(history, &scope, &mut sessions.anthropic_tools).unwrap()
+            };
+            assert_eq!(mapped.tool_account.as_deref(), Some(fixture.first.as_str()));
+        }
+    }
 
     fn request(messages: Value) -> Value {
         json!({"model":"gpt-5.6-sol", "max_tokens":1024, "messages":messages})
@@ -1507,7 +1648,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(selected, first.id);
+        assert_eq!(selected.id, first.id);
         manager
             .inner
             .lock()
@@ -1547,7 +1688,8 @@ mod tests {
                 portable.tool_account
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .id,
             second.id
         );
         let mut sessions = manager.sessions.lock().await;

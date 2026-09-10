@@ -31,17 +31,19 @@ Antigravity Gateway 是一个双重角色的服务器：
 
 | 方法 | 完整路径 | 请求或用途 |
 | :--- | :--- | :--- |
-| GET | `/api/codex/accounts` | `{accounts, active_account_id}`；时间戳为 Unix 秒 |
+| GET | `/api/codex/accounts` | `{accounts, active_account_id}`；后者是用户首选，不代表当前请求实际账号；时间戳为 Unix 秒 |
 | POST | `/api/codex/accounts/import` | `{auth_json: <auth.json 对象>, label?: string}`；不接受 API Key 账号 |
 | PATCH | `/api/codex/accounts/:id` | `{label?: string, enabled?: boolean}` |
 | DELETE | `/api/codex/accounts/:id` | 删除本地凭据；不取消 ChatGPT 订阅 |
 | POST | `/api/codex/accounts/:id/activate` | 设置新会话首选账号 |
 | POST | `/api/codex/accounts/:id/refresh` | 刷新并验证订阅凭据 |
-| GET | `/api/codex/accounts/:id/usage` | 返回实际上游用量 JSON；不估算剩余额度 |
+| GET | `/api/codex/accounts/:id/usage` | 返回实际上游用量 JSON，并同步额度冷却状态；不估算剩余额度 |
 | GET | `/api/codex/models` | 返回首选可用账号的实际模型目录 |
 | POST | `/api/codex/auth/device` | 返回 `{id, verification_url, user_code, interval, expires_at}` |
 | GET | `/api/codex/auth/device/:id` | 查询 `pending/completed/failed/cancelled/expired` |
 | DELETE | `/api/codex/auth/device/:id` | 取消授权，返回最终状态；已完成的授权不会被伪装成已取消 |
+
+账号元数据包含可空的 `cooldown_until`（Unix 秒）和 `cooldown_reason`（`quota_exhausted` / `rate_limited`）。未来的截止时间表示调度暂时跳过该账号，不会改为禁用。额度查询批次完成后，Web 账号池重新获取一次列表以显示最新状态；客户端本地计时移除到期提示，不轮询上游。
 
 设备码由后端按发行方间隔轮询，15 分钟超时；用户可能需要在 ChatGPT 安全设置中启用设备码授权。若当前网络不能访问 OpenAI 授权端点，请先解决上游网络问题，或在可信环境使用官方 Codex 登录后导入授权文件。导入会先安全保存禁用、未验证的凭据，再调用上游验证；验证失败时账号保持禁用，并显示错误，之后可用“刷新授权”重试。不要让多个程序并发刷新同一份授权缓存。
 
@@ -81,9 +83,17 @@ Base URL 使用 `http://127.0.0.1:8045/codex`（远程使用可信 HTTPS 或 SSH
 
 协议差异：正整数 `max_tokens` 仅兼容接收，订阅上游不接受 `max_output_tokens`，不保证这个输出硬上限；thinking 预算映射为推理强度，cache_control 为自动缓存提示。响应 `x-codex-compatibility` 头说明这些差异。不会输出 Claude 签名思维块或推理摘要。采样参数、非空 stop_sequences、结构化 output_config.format、assistant 预填充、Claude 签名回放、文档/PDF、服务端工具与未支持的上下文编辑会明确报错，不静默丢弃。
 
-工具 ID 是网关生成的随机句柄，按调用密钥及原账号隔离，关联的 Codex 推理状态只留在服务器内存。必须原样回传 tool_use ID；未知、过期、跨密钥或混合账号的句柄返回 `409`，原账号失效返回 `503`。空闲 24 小时或服务重启后，旧网关工具历史不能续接。文本历史不依赖这些句柄；普通完整文字历史可以重新建立绑定。
+工具 ID 是网关生成的随机句柄，按调用密钥及原账号隔离，关联的 Codex 推理状态只留在服务器内存。必须原样回传 tool_use ID；未知、过期、跨密钥或混合账号的句柄返回 `409`，原账号失效返回 `503`、原账号冷却返回 `429`，均不跨账号重试。空闲 24 小时或服务重启后，旧网关工具历史不能续接。普通完整文字历史可以重新建立绑定；经适配器验证的完整外部工具历史不依赖网关句柄。
 
-同一会话绑定同一账号，绑定同时按下游密钥隔离。更换首选账号只影响新会话；已绑定账号被禁用或删除时明确失败，不将续接静默转给其他账号。绑定最多保留 8192 项、闲置 24 小时，进程重启会清空；未知续接返回 `409`，需要新建会话。只允许在未输出响应前对同一账号的 HTTP `401` 刷新重试一次，不在流式输出后重放请求。
+### 额度冷却与账号切换
+
+Responses 与 Anthropic Messages 共用默认开启的独立 Codex 调度。新会话优先使用已启用、已验证且不在冷却期的首选账号，否则按账号池顺序选择其他可用账号。收到完整、合法 JSON 的上游 HTTP `429`，且尚未向客户端输出时，可安全迁移的请求会尝试其他候选账号，不回头重复尝试已访问账号；同一账号遇到 `401` 仍允许刷新授权后重试一次。账号池全部冷却时返回 `429` 和最早候选恢复时间对应的 `Retry-After`；没有已启用且已验证账号时返回 `503`。
+
+冷却状态与账号凭据一起持久化，优先采用实际上游耗尽窗口、错误中的重置时间和 `Retry-After`；没有可用重置时间时，已知额度耗尽等待 300 秒，其他 `429` 等待 60 秒。未耗尽的周窗口不会延长未知 5 小时窗口的冷却。到期只恢复候选资格，不代表保证有额度；版本校验后的真实额度查询可以提前确认额度恢复，旧的查询或设备授权结果不能清除更新的额度失败。自动切换不修改 `active_account_id` 或 `enabled`。
+
+普通完整文字历史遇到额度耗尽可沿用原始 `session_id` / `prompt_cache_key` 切换账号；后续请求继续使用切换后的绑定。缓存键规范化及压缩触发项只处理一次，各账号尝试发送同一请求体。响应 ID、加密推理、压缩项、原生工具回传、turn-state 和网关工具句柄不随这些别名移动；原生私有状态另存按调用密钥隔离的不可变来源绑定。已切换别名与旧账号状态混用，或不能证明私有状态来源时返回 `409`；新账号实际签发并已记录的状态仍可在新账号继续使用。
+
+更换首选只影响未绑定请求；被禁用或删除的已绑定账号明确失败。原生会话、响应及私有状态绑定共用 8192 项上限、闲置 24 小时，进程重启会清空；无法识别的私有续接返回 `409`，应使用完整文字上下文重新开始。网络错误、格式损坏或读取中断的响应、上游 `5xx`、已向客户端开始输出的流均不跨账号重放；HTTP `200` 流中的额度错误事件也不会触发重放。
 
 HTTP 代理不是托管 Codex 执行器：终端工具、工作目录、沙箱和审批仍在客户端。此实现不支持 WebSocket、后台 Responses 任务或 FedRAMP 专用上游。上游订阅权益、限流、地区与工作区权限仍然生效；成功登录不构成第三方转售或共享授权。
 

@@ -2,6 +2,12 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Codex quota failover
+
+Responses and Anthropic Messages now share preferred-first Codex quota scheduling. Complete HTTP `429` errors cool the exhausted account and retry safely portable requests against other eligible accounts without cycling back or changing the user's preferred/enabled settings. Cooldowns persist, recover through fresh usage observations or expiry, and return `429` with the earliest `Retry-After` when the pool is cooling. The bilingual account pool and guide expose cooldown reasons, recovery times, and the retry boundaries.
+
+Existing text sessions retain their raw session/cache identifiers across failover. Immutable issuer bindings keep old encrypted/tool state away from the replacement account while permitting state actually issued by that replacement. Fixed unrelated nonexhausted reset windows extending cooldowns, stale device verification clearing newer quota failures, and malformed `429` responses being replayed. All 25 Codex and 5 middleware regressions passed. Fault-injected real HTTP upstreams exercised A `429` → B `200`, bounded attempts and isolation; deployed Responses, full-text continuation and Anthropic inference returned `200` without artificially exhausting production accounts.
+
 ## Codex Anthropic Messages compatibility
 
 Added `/codex/v1/messages` for the isolated Codex account pool: text, images, incremental SSE, and tool round trips reuse existing authorization, proxying, and account isolation. Private reasoning remains server-side behind scoped tool handles. Added Anthropic authentication error envelopes and corrected monitor tool-argument assembly and cached-input totals. Exact `count_tokens` explicitly returns `501`; the guide and API Reference disclose output-budget and other compatibility differences.
