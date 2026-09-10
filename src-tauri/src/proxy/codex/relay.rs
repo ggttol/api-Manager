@@ -409,22 +409,24 @@ async fn forward(
         );
     }
     if compact {
-        // Compact uses a distinct JSON contract; unlike /responses it does not accept store/stream.
-        object.remove("store");
-        object.remove("stream");
-    } else {
-        object.insert("store".into(), Value::Bool(false));
-        object.insert("stream".into(), Value::Bool(true));
+        let input = object
+            .get_mut("input")
+            .ok_or_else(|| CodexError::bad_request("Compact input is required"))?;
+        if input.is_string() {
+            *input = json!([{"role": "user", "content": input.take()}]);
+        }
+        input
+            .as_array_mut()
+            .ok_or_else(|| CodexError::bad_request("Compact input must be text or an array"))?
+            .push(json!({"type": "compaction_trigger"}));
     }
+    object.insert("store".into(), Value::Bool(false));
+    object.insert("stream".into(), Value::Bool(true));
     let bytes = Bytes::from(
         serde_json::to_vec(&body).map_err(|_| CodexError::bad_request("Invalid Responses body"))?,
     );
     let forwarded = forwarding_headers(&headers, &scope);
-    let url = if compact {
-        auth::COMPACT_URL
-    } else {
-        auth::RESPONSES_URL
-    };
+    let url = auth::RESPONSES_URL;
     let mut record = manager.credentials(&id, None, true).await?;
     let send = |record: &Record| {
         auth::authorized(
@@ -435,14 +437,7 @@ async fn forward(
         )
         .headers(forwarded.clone())
         .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::ACCEPT,
-            if compact {
-                "application/json"
-            } else {
-                "text/event-stream"
-            },
-        )
+        .header(header::ACCEPT, "text/event-stream")
         .timeout(Duration::from_secs(30 * 60))
         .body(bytes.clone())
         .send()
@@ -498,7 +493,7 @@ async fn forward(
             record.account.last_error = None;
         }
     }
-    let is_sse = is_sse_response(&upstream, compact);
+    let is_sse = is_sse_response(&upstream);
     if is_sse && !outbound_headers.contains_key(header::CONTENT_TYPE) {
         outbound_headers.insert(
             header::CONTENT_TYPE,
@@ -511,12 +506,18 @@ async fn forward(
                 .map_err(|_| CodexError::upstream("Codex returned an invalid JSON response"))?;
         record.tokens.redact(&mut value);
         remember_response(&manager, &scope, &id, &value).await?;
+        if compact {
+            value["object"] = json!("response.compaction");
+        }
         return Ok(json_response(status, outbound_headers, value));
     }
     if !streaming || compact {
         let (collected_status, mut value) =
             collect_response(upstream, &manager, &scope, &id).await?;
         record.tokens.redact(&mut value);
+        if compact {
+            value["object"] = json!("response.compaction");
+        }
         return Ok(json_response(collected_status, outbound_headers, value));
     }
     let stream_manager = manager.clone();
@@ -619,14 +620,14 @@ impl SseParser {
     }
 }
 
-fn is_sse_response(response: &reqwest::Response, compact: bool) -> bool {
+fn is_sse_response(response: &reqwest::Response) -> bool {
     // Responses is explicitly requested with stream=true. Some subscription edges omit
-    // Content-Type; retain that negotiated contract. Compact still defaults to JSON.
+    // Content-Type; retain that negotiated contract.
     response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map_or(!compact, |value| {
+        .map_or(true, |value| {
             value.to_ascii_lowercase().starts_with("text/event-stream")
         })
 }
@@ -768,8 +769,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!response.headers().contains_key(header::CONTENT_TYPE));
-            assert!(is_sse_response(&response, false));
-            assert!(!is_sse_response(&response, true));
+            assert!(is_sse_response(&response));
             let (status, output) = collect_response(response, &manager, &[0; 32], "account-1")
                 .await
                 .unwrap();

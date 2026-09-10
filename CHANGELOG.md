@@ -8,9 +8,11 @@
 
 新增 `/codex/v1/responses`、`/responses/compact` 与模型目录，不经过原有 GPT → Gemini 别名路由。HTTP SSE 保留工具与推理事件；会话按下游密钥隔离并固定账号，禁止流式输出后的重放或静默跨账号续接。上游代理配置可热更新。
 
-修复部分 ChatGPT 订阅上游省略 `Content-Type` 时，将实际 SSE 误判为 JSON 导致 `502` 的问题。Responses 沿用已协商的 `stream=true` 契约，并补齐下游 SSE 类型头；Compact 仍按 JSON 处理。真实 HTTP 回归覆盖无类型头的工具及推理事件收集。
+修复部分 ChatGPT 订阅上游省略 `Content-Type` 时，将实际 SSE 误判为 JSON 导致 `502` 的问题。Responses 沿用已协商的 `stream=true` 契约，并补齐下游 SSE 类型头。真实 HTTP 回归覆盖无类型头的工具及推理事件收集。
 
 修复订阅 SSE 结束事件不重复携带输出时，非流式 Responses 丢失文本、推理或工具调用的问题。汇总器按输出索引保留 `response.output_item.done`，仅在结束事件输出为空时补全；完整结束输出保持原样，不重复拼接。
+
+压缩适配改用当前官方客户端的 Responses `compaction_trigger` 协议，移除返回 404 的旧上游独立压缩地址。对外 `/responses/compact` 仍返回 JSON；原生客户端也可直接通过 Responses 提交压缩触发项。
 
 修复没有 Google 账号时共享网关无法启动的问题，允许仅使用 Codex 的服务端部署；暂停推理服务时仍可访问管理页面及静态资源。原有 Antigravity 接口保持不变。
 

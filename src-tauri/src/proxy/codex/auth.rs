@@ -15,7 +15,6 @@ pub(super) const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub(super) const MODELS_URL: &str =
     "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0";
 pub(super) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-pub(super) const COMPACT_URL: &str = "https://chatgpt.com/backend-api/codex/responses/compact";
 pub(super) const JSON_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]

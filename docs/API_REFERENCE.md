@@ -69,7 +69,7 @@ requires_openai_auth = false
 | :--- | :--- | :--- |
 | GET | `/codex/v1/models` | 将实际可用模型目录转换为 OpenAI 模型列表 |
 | POST | `/codex/v1/responses` | 原生 Responses；保留工具、推理与 SSE 事件；上游 `store=false` |
-| POST | `/codex/v1/responses/compact` | 转发订阅上游的独立压缩请求 |
+| POST | `/codex/v1/responses/compact` | 通过当前官方 Responses `compaction_trigger` 协议生成加密压缩项，汇总为 JSON 返回 |
 
 同一会话绑定同一账号，绑定同时按下游密钥隔离。更换首选账号只影响新会话；已绑定账号被禁用或删除时明确失败，不将续接静默转给其他账号。绑定最多保留 8192 项、闲置 24 小时，进程重启会清空；未知续接返回 `409`，需要新建会话。只允许在未输出响应前对同一账号的 HTTP `401` 刷新重试一次，不在流式输出后重放请求。
 
