@@ -22,9 +22,15 @@ const content = {
         anthropic: 'Codex 账号 · Anthropic 兼容', anthropicHint: '通过 Anthropic Messages 兼容协议使用 ChatGPT 订阅账号可用的 Codex 原生模型；不是官方 Claude 模型推理，也不使用 Google 账号池。',
         anthropicExample: 'Codex / Anthropic Messages', accountPool: '账号池', protocol: '协议',
         anthropicBase: 'Anthropic SDK / Claude Code 的 Base URL 填写上方的 /codex，不要填 /codex/v1：客户端会追加 /v1/messages。Google 原有的 POST /v1/messages 保持独立，不会转发到 Codex。',
-        anthropicSupport: '支持文本、图片、system、自定义工具定义与选择、tool_use / tool_result 多轮往返，以及非流式响应和增量 SSE 流（含工具参数、usage 与 stop_reason）。这不是完整的 Claude 功能实现；不支持的内容或选项（如 temperature、top_p、top_k、assistant 预填充、Claude 签名推理回放）会返回 Anthropic 格式错误。',
+        anthropicSupport: '支持文本、图片、system、自定义工具定义与选择、tool_use / tool_result 多轮往返，以及非流式响应和增量 SSE 流（含工具参数、搜索结果、URL 引文、usage 与 stop_reason）。web_search_20250305 映射到 Codex 原生 web_search，不是让模型假装搜索。其他不支持的服务端工具、搜索约束或选项（如 temperature、top_p、top_k、assistant 预填充、Claude 签名推理回放）会返回 Anthropic 格式错误。',
         anthropicTokens: 'POST /codex/v1/messages/count_tokens 当前返回 HTTP 501（不支持）的 Anthropic 格式错误，不提供估算或伪造的精确 token 数。依赖请求前 token 计数的客户端功能可能不可用，响应中的实际 usage 与此不同。',
         anthropicBudget: '重要限制：max_tokens 必须为正整数，但仅作为客户端兼容字段接受，不能强制限制输出长度。ChatGPT 订阅上游不支持 max_output_tokens，实际输出预算由订阅后端控制；不要将示例的 1024 视为硬上限。',
+        anthropicSearch: '搜索限制：max_uses 仅作为保留所填次数的指令建议，不是调用次数或计费硬上限。订阅后端拒绝 max_tool_calls；响应 x-codex-compatibility 头通过 web_search_max_uses=advisory 明示此差异。不要依赖 max_uses: 8 保证最多 8 次搜索。',
+        anthropicCitations: '搜索结果及引文忠实保留上游 URL 和可用标题；来源摘录可能缺失，引用文字为空时不代表逐字原文。搜索/引文的不透明句柄绑定网关、密钥与来源账号，并非 Anthropic 加密文本。续接必须原样回传整个 assistant 内容，包括搜索结果和引文；未知、过期或外来句柄会被拒绝。状态过期或重启后，请用文本重述任务，不携带旧搜索块或引文句柄。',
+        anthropicSchema: 'output_config.format: {type: "json_schema", schema: ...} 映射为原生 text.format 的 strict JSON Schema 约束，不是提示词建议。原始 schema 原样传递；需满足上游严格模式支持的 Schema 子集，不兼容的 Schema 会明确报错，不降级为提示词生成。',
+        anthropicExamples: '可选 · 搜索与 JSON Schema 请求字段',
+        anthropicExamplesHint: '将下列字段合并到上方 cURL 的 JSON 请求体，并把 messages 改成实际任务；保留已选择的原生 model、max_tokens 和 stream。可分别使用或合并；合并时将 effort 和 format 放在同一个 output_config 中。搜索是否执行由 auto 决定，schema 示例要求输出 answer 字符串。',
+        anthropicSearchExample: 'JSON · 原生搜索（次数仅建议）', anthropicSchemaExample: 'JSON · 原生严格 Schema',
         anthropicThinking: 'thinking 的 enabled / adaptive 仅映射到 Codex 推理设置；budget_tokens 是推理强度参考，不是精确预算。output_config.effort 的 low / medium / high / max 映射为 low / medium / high / xhigh。不会生成 Claude 签名 thinking 块或推理摘要；续接需要的隐藏推理仅保留在服务器端。',
         anthropicSessions: '新请求和携带完整文本上下文的请求支持自动额度切换。网关生成的工具调用 ID 则绑定原账号与访问范围；tool_result 必须原样返回对应 ID，不要跨账号或网关 Key 重用。此类工具续接遇到原账号冷却会明确报错，不会换号重放。工具续接状态保存在内存中，空闲 24 小时后过期；服务器重启或状态过期后，请新建对话并用文本重述任务，不要携带旧 tool_use / tool_result。',
         claudeTitle: '04 · 连接 Claude Code', claudeHelp: '在已设置 API_MANAGER_KEY 的同一 Bash 终端运行以下配置。三个默认模型别名和子代理都使用所选 Codex 原生模型，避免自动请求 claude-* ID；不要用 /model 或项目配置覆盖为 Claude 模型。先移除已有的其他云提供商或鉴权配置冲突。',
@@ -67,9 +73,15 @@ const content = {
         anthropic: 'Codex accounts · Anthropic compatible', anthropicHint: 'Access native Codex models available to ChatGPT subscription accounts through the Anthropic Messages-compatible protocol. This is not official Claude inference and does not use the Google account pool.',
         anthropicExample: 'Codex / Anthropic Messages', accountPool: 'Account pool', protocol: 'Protocol',
         anthropicBase: 'For Anthropic SDKs / Claude Code, use the /codex Base URL above, not /codex/v1: the client appends /v1/messages. The existing Google POST /v1/messages remains independent and does not route to Codex.',
-        anthropicSupport: 'Supports text, images, system, custom tool definitions and choice, multi-turn tool_use / tool_result round trips, non-streaming responses, and incremental SSE (including tool arguments, usage, and stop_reason). This is not a complete Claude feature implementation. Unsupported content or options, such as temperature, top_p, top_k, assistant prefill, or Claude-signed reasoning replay, return Anthropic-shaped errors.',
+        anthropicSupport: 'Supports text, images, system, custom tool definitions and choice, multi-turn tool_use / tool_result round trips, non-streaming responses, and incremental SSE (tool arguments, search results, URL citations, usage, and stop_reason). web_search_20250305 maps to native Codex web_search, not simulated search in a prompt. Other unsupported server tools, search constraints, or options (such as temperature, top_p, top_k, assistant prefill, or Claude-signed reasoning replay) return Anthropic-shaped errors.',
         anthropicTokens: 'POST /codex/v1/messages/count_tokens currently returns an Anthropic-shaped HTTP 501 unsupported error, not an estimate or fabricated exact count. Client features requiring preflight token counting may not work. Actual response usage is separate.',
         anthropicBudget: 'Important limit: max_tokens must be a positive integer, but is accepted only for client compatibility and cannot enforce an output length limit. The ChatGPT subscription upstream rejects max_output_tokens; its backend controls the actual output budget. The example’s 1024 is not a hard cap.',
+        anthropicSearch: 'Search limit: max_uses becomes instruction guidance preserving your requested number, not a hard call or billing cap. The subscription backend rejects max_tool_calls; the x-codex-compatibility response header discloses web_search_max_uses=advisory. Do not rely on max_uses: 8 to guarantee at most eight searches.',
+        anthropicCitations: 'Search results and citations preserve upstream URLs and available titles. Source excerpts may be unavailable; empty quote text is not a verbatim quotation. Opaque search/citation handles are bound to the gateway, key, and issuer account, not Anthropic-encrypted text. Replay the entire assistant content unchanged, including search results and citations; unknown, expired, or foreign handles are rejected. After expiry or restart, restate the task as text without old search blocks or citation handles.',
+        anthropicSchema: 'output_config.format: {type: "json_schema", schema: ...} maps to native strict JSON Schema in text.format, not a prompt hint. The original schema is forwarded unchanged and must satisfy the upstream strict-mode Schema subset. Incompatible schemas fail explicitly rather than falling back to prompt-only generation.',
+        anthropicExamples: 'Optional · Search and JSON Schema request fields',
+        anthropicExamplesHint: 'Merge these fields into the cURL JSON body above and change messages to your task; retain the selected native model, max_tokens, and stream. Use either example or combine them, placing effort and format in a single output_config. auto lets the model decide whether to search; the schema example requires an answer string.',
+        anthropicSearchExample: 'JSON · Native search (advisory limit)', anthropicSchemaExample: 'JSON · Native strict schema',
         anthropicThinking: 'enabled / adaptive thinking maps to Codex reasoning settings; budget_tokens is an advisory effort tier, not an exact budget. output_config.effort low / medium / high / max maps to low / medium / high / xhigh. No Claude-signed thinking blocks or reasoning summaries are produced. Hidden reasoning needed for continuation stays on the server.',
         anthropicSessions: 'New requests and requests carrying their complete text context support automatic quota failover. Gateway-issued tool IDs remain bound to the original account and access scope. Return the exact matching ID in tool_result; do not reuse it across accounts or gateway keys. These tool continuations fail explicitly while the original account is cooling down, rather than replaying elsewhere. Tool continuation state is in memory and expires after 24 idle hours. After a server restart or state expiry, start a new conversation and restate the task as text without old tool_use / tool_result blocks.',
         claudeTitle: '04 · Connect Claude Code', claudeHelp: 'Run this configuration in the same Bash terminal where API_MANAGER_KEY is set. All three default model aliases and subagents use the selected native Codex model so they do not automatically request claude-* IDs. Do not override them with Claude models via /model or project settings. Remove conflicts with existing cloud-provider or authentication configuration first.',
@@ -106,6 +118,25 @@ const shellQuote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
 type CatalogModel = { id: string; name: string };
 type Example = 'google' | 'gemini' | 'codex' | 'anthropic';
 type Client = 'curl' | 'codex' | 'claude';
+
+const anthropicSearchFields = `{
+  "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+  "tool_choice": {"type": "auto"},
+  "output_config": {"effort": "high"}
+}`;
+const anthropicSchemaFields = `{
+  "output_config": {
+    "format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+      }
+    }
+  }
+}`;
 
 function CodeBlock({ title, code, copyLabel, copiedLabel, disabled = false, onCopy }: {
     title: string;
@@ -267,7 +298,8 @@ export default function ApiGuide() {
                 </article>
                 {isAnthropic && <div className="space-y-3">
                     <p className="break-words rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200">{text.anthropicBudget}</p>
-                    <div className="space-y-3 break-words rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm leading-6 text-blue-900 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-200"><p>{text.anthropicBase}</p><p>{text.anthropicSupport}</p><p>{text.anthropicTokens}</p><p>{text.anthropicThinking}</p><p>{text.anthropicSessions}</p></div>
+                    <p className="break-words rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-950 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-200">{text.anthropicSearch}</p>
+                    <div className="space-y-3 break-words rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm leading-6 text-blue-900 dark:border-blue-900 dark:bg-blue-950/20 dark:text-blue-200"><p>{text.anthropicBase}</p><p>{text.anthropicSupport}</p><p>{text.anthropicCitations}</p><p>{text.anthropicSchema}</p><p>{text.anthropicTokens}</p><p>{text.anthropicThinking}</p><p>{text.anthropicSessions}</p></div>
                 </div>}
                 {isCodex && <div className="space-y-3">
                     <p className={paragraph}>{text.configHint}</p>
@@ -301,6 +333,14 @@ export default function ApiGuide() {
                     <p className={`${paragraph} flex items-start gap-2`}><ArrowRight size={17} className="mt-1 shrink-0 text-blue-500" /><span>{isCodex ? text.codexModelHint : text.modelHint}</span></p>
                     {isCodex && <button type="button" className={button} onClick={() => setClient(isAnthropic ? 'claude' : 'codex')}><Terminal size={15} />{clientTitle}</button>}
                     <CodeBlock title={`POST ${endpoint.inference}`} code={inferenceCurl} disabled={isCodex && !selectedModel} {...copyProps} />
+                    {isAnthropic && <details className="rounded-xl border border-gray-200 p-4 dark:border-base-300">
+                        <summary className="cursor-pointer text-sm font-semibold">{text.anthropicExamples}</summary>
+                        <div className="mt-4 space-y-4">
+                            <p className={paragraph}>{text.anthropicExamplesHint}</p>
+                            <CodeBlock title={text.anthropicSearchExample} code={anthropicSearchFields} {...copyProps} />
+                            <CodeBlock title={text.anthropicSchemaExample} code={anthropicSchemaFields} {...copyProps} />
+                        </div>
+                    </details>}
                 </section>
             ) : (
                 <section className={`${panel} space-y-4 scroll-mt-4`} aria-labelledby="guide-codex">

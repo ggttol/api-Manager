@@ -22,9 +22,11 @@ use std::{
 use super::{auth, parse_json, relay, store::Record, CodexError, CodexManager};
 use crate::proxy::server::AppState;
 
+mod search;
+
 const TOOL_PREFIX: &str = "toolu_codex_";
 const MAX_TOOLS: usize = 8192;
-const COMPATIBILITY: &str = "max_tokens=upstream-managed; thinking_budget=effort-hint; cache_control=automatic; reasoning=server-side; tool_state=volatile-24h";
+const COMPATIBILITY: &str = "max_tokens=upstream-managed; thinking_budget=effort-hint; cache_control=automatic; reasoning=server-side; tool_state=volatile-24h; web_search_max_uses=advisory; search_handles=gateway-opaque; source_quotes=unavailable";
 
 #[derive(Clone)]
 struct ToolPin {
@@ -35,12 +37,14 @@ struct ToolPin {
     output_index: u64,
     touched: Instant,
     bytes: usize,
+    search_bound: bool,
 }
 
 #[derive(Default)]
 pub(super) struct ToolCache {
     pins: HashMap<[u8; 32], ToolPin>,
     bytes: usize,
+    search: search::ReplayCache,
 }
 
 impl ToolCache {
@@ -48,13 +52,23 @@ impl ToolCache {
         self.pins
             .retain(|_, pin| pin.touched.elapsed() < relay::SESSION_TTL);
         self.bytes = self.pins.values().map(|pin| pin.bytes).sum();
+        self.search.prune();
     }
 
-    fn lookup(&mut self, scope: &[u8; 32], id: &str) -> Result<ToolPin, CodexError> {
+    fn lookup(
+        &mut self,
+        scope: &[u8; 32],
+        id: &str,
+        search_restored: bool,
+    ) -> Result<ToolPin, CodexError> {
         let key = relay::session_key(scope, "anthropic-tool", id);
         let pin = self.pins.get_mut(&key).filter(|pin| pin.touched.elapsed() < relay::SESSION_TTL)
             .ok_or_else(|| CodexError::new(StatusCode::CONFLICT,
                 "Unknown, expired, or differently scoped Codex tool ID; start a new conversation without old tool state"))?;
+        if pin.search_bound && !search_restored {
+            return Err(CodexError::new(StatusCode::CONFLICT,
+                "This client tool belongs to gateway search history; replay the complete original assistant turn"));
+        }
         pin.touched = Instant::now();
         Ok(pin.clone())
     }
@@ -88,8 +102,11 @@ impl ToolCache {
             })
             .ok_or_else(|| CodexError::unavailable("Codex tool state is too large"))?;
         // Conservatively charge shared reasoning once per handle, bounding memory even after partial expiry.
-        if self.pins.len() + tools.len() > MAX_TOOLS
-            || bytes > relay::MAX_COLLECTED.saturating_sub(self.bytes)
+        if self.pins.len() + self.search.len() + tools.len() > MAX_TOOLS
+            || bytes
+                > relay::MAX_COLLECTED
+                    .saturating_sub(self.bytes)
+                    .saturating_sub(self.search.retained_bytes())
         {
             return Err(CodexError::unavailable(
                 "Codex tool state cache is full; wait for inactive conversations to expire",
@@ -107,11 +124,62 @@ impl ToolCache {
                     output_index: tool.output_index,
                     touched: Instant::now(),
                     bytes: reasoning_bytes + tool.call_id.len() + tool.name.len() + account.len(),
+                    search_bound: false,
                 },
             );
         }
         self.bytes += bytes;
         Ok(())
+    }
+
+    fn commit_output(
+        &mut self,
+        scope: &[u8; 32],
+        account: &str,
+        tools: &[OutputTool],
+        reasoning: BTreeMap<u64, Value>,
+        wire: Vec<Value>,
+        native: Vec<Value>,
+    ) -> Result<(), CodexError> {
+        self.commit(scope, account, tools, reasoning)?;
+        self.prune();
+        let committed = self.search.commit(
+            scope,
+            account,
+            wire,
+            native,
+            relay::MAX_COLLECTED.saturating_sub(self.bytes),
+            MAX_TOOLS.saturating_sub(self.pins.len()),
+        );
+        match committed {
+            Ok(search_bound) => {
+                if search_bound {
+                    for tool in tools {
+                        if let Some(pin) = self.pins.get_mut(&relay::session_key(
+                            scope,
+                            "anthropic-tool",
+                            &tool.id,
+                        )) {
+                            pin.search_bound = true;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // These handles were freshly minted for this response. Admission
+                // is atomic under the session lock; failed output retains no pins.
+                for tool in tools {
+                    if let Some(pin) =
+                        self.pins
+                            .remove(&relay::session_key(scope, "anthropic-tool", &tool.id))
+                    {
+                        self.bytes -= pin.bytes;
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -400,7 +468,28 @@ fn map_request(
         });
     }
     if let Some(config) = request.get("output_config") {
-        fields(config, &["effort"], "output_config")?;
+        fields(config, &["effort", "format"], "output_config")?;
+        if let Some(format) = config.get("format") {
+            fields(format, &["type", "schema"], "output_config.format")?;
+            if string(format, "type")? != "json_schema" {
+                return Err(CodexError::bad_request(
+                    "Only json_schema output_config.format is supported",
+                ));
+            }
+            let schema = format
+                .get("schema")
+                .filter(|schema| schema.is_object())
+                .ok_or_else(|| {
+                    CodexError::bad_request(
+                        "output_config.format.schema must be a JSON Schema object",
+                    )
+                })?;
+            // The subscription Responses endpoint enforces the schema; do not replace it
+            // with a prompt hint or silently rewrite constraints for another dialect.
+            body["text"] = json!({"format":{
+                "type":"json_schema", "name":"anthropic_response", "strict":true, "schema":schema
+            }});
+        }
         if let Some(value) = config.get("effort") {
             if effort == Some("none") {
                 return Err(CodexError::bad_request(
@@ -421,11 +510,21 @@ fn map_request(
     }
     let mut names = HashSet::new();
     let mut tools = Vec::new();
+    let mut native_search = false;
     if let Some(values) = request.get("tools") {
         for tool in values
             .as_array()
             .ok_or_else(|| CodexError::bad_request("tools must be an array"))?
         {
+            let name = identifier(tool, "name")?;
+            if !names.insert(name.to_string()) {
+                return Err(CodexError::bad_request("Duplicate tool name"));
+            }
+            if tool.get("type").and_then(Value::as_str) == Some("web_search_20250305") {
+                tools.push(search::map_tool(tool, &mut body)?);
+                native_search = true;
+                continue;
+            }
             fields(
                 tool,
                 &[
@@ -444,12 +543,8 @@ fn map_request(
                 .is_some_and(|v| !matches!(v.as_str(), Some("custom")))
             {
                 return Err(CodexError::bad_request(
-                    "Only custom client tools are supported; no Anthropic server tools",
+                    "Only custom client tools and web_search_20250305 are supported",
                 ));
-            }
-            let name = identifier(tool, "name")?;
-            if !names.insert(name.to_string()) {
-                return Err(CodexError::bad_request("Duplicate tool name"));
             }
             let schema = tool
                 .get("input_schema")
@@ -485,7 +580,11 @@ fn map_request(
                         "tool_choice references an undefined tool",
                     ));
                 }
-                json!({"type":"function", "name":name})
+                if native_search && name == "web_search" {
+                    json!({"type":"web_search"})
+                } else {
+                    json!({"type":"function", "name":name})
+                }
             }
             _ => {
                 return Err(CodexError::bad_request(
@@ -545,6 +644,57 @@ fn map_request(
                 CodexError::bad_request("Message content must be text or an array")
             })?
         };
+        if let Some((account, native)) = cache.search.replay(scope, blocks)? {
+            if role != "assistant" {
+                return Err(CodexError::bad_request(
+                    "Gateway search history requires assistant role",
+                ));
+            }
+            if tool_account
+                .as_ref()
+                .is_some_and(|origin| origin != &account)
+            {
+                return Err(CodexError::new(
+                    StatusCode::CONFLICT,
+                    "Tool history belongs to different Codex accounts",
+                ));
+            }
+            tool_account = Some(account);
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("server_tool_use") {
+                    if !seen.insert(identifier(block, "id")?.to_string()) {
+                        return Err(CodexError::bad_request("Duplicate server_tool_use ID"));
+                    }
+                }
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let id = identifier(block, "id")?;
+                    if !seen.insert(id.to_string()) {
+                        return Err(CodexError::bad_request("Duplicate tool_use ID"));
+                    }
+                    let pin = cache.lookup(scope, id, true)?;
+                    if tool_account
+                        .as_ref()
+                        .is_some_and(|account| account != &pin.account)
+                    {
+                        return Err(CodexError::new(
+                            StatusCode::CONFLICT,
+                            "Client tool and search history belong to different Codex accounts",
+                        ));
+                    }
+                    pending.insert(id.to_string(), pin.call_id);
+                }
+            }
+            for item in &native {
+                if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                    reasoning_seen.insert(
+                        serde_json::to_string(item)
+                            .map_err(|_| CodexError::upstream("Invalid cached reasoning"))?,
+                    );
+                }
+            }
+            input.extend(native);
+            continue;
+        }
         let mut content = Vec::new();
         let mut tool_reasoning = Vec::new();
         for block in blocks {
@@ -560,7 +710,7 @@ fn map_request(
                     let args = block.get("input").filter(|v| v.is_object()).ok_or_else(|| CodexError::bad_request("tool_use.input must be an object"))?;
                     flush_message(&mut input, role, &mut content);
                     let call_id = if id.starts_with(TOOL_PREFIX) {
-                        let pin = cache.lookup(scope, id)?;
+                        let pin = cache.lookup(scope, id, false)?;
                         if pin.name != name { return Err(CodexError::bad_request("Tool name does not match its gateway-issued ID")); }
                         if tool_account.as_ref().is_some_and(|account| account != &pin.account) {
                             return Err(CodexError::new(StatusCode::CONFLICT, "Tool history belongs to different Codex accounts"));
@@ -770,9 +920,23 @@ fn usage(response: &Value, provisional: bool) -> Result<Value, CodexError> {
     }
     // Responses input_tokens INCLUDES cache reads; Anthropic input_tokens EXCLUDES them.
     // Output tokens already include reasoning; never add reasoning_tokens again.
-    Ok(
-        json!({"input_tokens":input-cached, "output_tokens":output, "cache_creation_input_tokens":0, "cache_read_input_tokens":cached}),
-    )
+    let mut mapped = json!({"input_tokens":input-cached, "output_tokens":output, "cache_creation_input_tokens":0, "cache_read_input_tokens":cached});
+    if let Some(count) = response.pointer("/tool_usage/web_search/num_requests") {
+        let count = count
+            .as_u64()
+            .ok_or_else(|| CodexError::upstream("Invalid native web search usage"))?;
+        mapped["server_tool_use"] = json!({"web_search_requests":count});
+    } else if response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item["type"] == "web_search_call"))
+        && !provisional
+    {
+        return Err(CodexError::upstream(
+            "Native web search response is missing actual search request usage",
+        ));
+    }
+    Ok(mapped)
 }
 fn stop_reason(response: &Value, tools: bool) -> Result<&'static str, CodexError> {
     match response.get("status").and_then(Value::as_str) {
@@ -842,15 +1006,6 @@ fn tool_input(arguments: &str) -> Result<Value, CodexError> {
     Ok(input)
 }
 fn output_text(part: &Value) -> Result<&str, CodexError> {
-    if part.get("annotations").is_some_and(|value| {
-        value
-            .as_array()
-            .is_none_or(|annotations| !annotations.is_empty())
-    }) {
-        return Err(CodexError::upstream(
-            "Codex annotated output cannot be represented as Anthropic citations",
-        ));
-    }
     match upstream_string(part, "type")? {
         "output_text" => upstream_string(part, "text"),
         "refusal" => upstream_string(part, "refusal"),
@@ -878,29 +1033,51 @@ async fn convert_response(
     let mut reasoning = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         match upstream_string(item, "type")? {
-            "reasoning" => { reasoning.insert(index as u64, item.clone()); }
+            "reasoning" => {
+                reasoning.insert(index as u64, item.clone());
+            }
             "message" => {
-                for part in item.get("content").and_then(Value::as_array).ok_or_else(|| CodexError::upstream("Codex message has no content array"))? {
-                    content.push(json!({"type":"text", "text":output_text(part)?}));
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| CodexError::upstream("Codex message has no content array"))?
+                {
+                    let mut block = json!({"type":"text", "text":output_text(part)?});
+                    let citations = search::annotations(part)?
+                        .iter()
+                        .map(search::citation)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !citations.is_empty() {
+                        block["citations"] = json!(citations);
+                    }
+                    content.push(block);
                 }
+            }
+            "web_search_call" => {
+                let id = search::server_id();
+                let (tool, result) = search::result(item, &id)?;
+                content.push(tool);
+                content.push(result);
             }
             "function_call" => {
                 let tool = output_tool(item, index as u64)?;
                 let input = tool_input(upstream_string(item, "arguments")?)?;
-                content.push(json!({"type":"tool_use", "id":tool.id, "name":tool.name, "input":input}));
+                content.push(
+                    json!({"type":"tool_use", "id":tool.id, "name":tool.name, "input":input}),
+                );
                 tools.push(tool);
             }
-            _ => return Err(CodexError::upstream("Unsupported Codex output item; only messages, custom tools and private reasoning are supported")),
+            _ => return Err(CodexError::upstream("Unsupported Codex output item")),
         }
     }
     let stop = stop_reason(&response, !tools.is_empty())?;
-    let message = message(&response, model, content, Some(stop), false)?;
+    let message = message(&response, model, content.clone(), Some(stop), false)?;
     manager
         .sessions
         .lock()
         .await
         .anthropic_tools
-        .commit(scope, account, &tools, reasoning)?;
+        .commit_output(scope, account, &tools, reasoning, content, items.clone())?;
     Ok(message)
 }
 
@@ -910,6 +1087,8 @@ struct Block {
     closed: bool,
     tool: Option<usize>,
     arguments: String,
+    complete: bool,
+    citations: BTreeMap<u64, (Value, Value, bool)>,
 }
 struct StreamMapper {
     model: String,
@@ -920,6 +1099,9 @@ struct StreamMapper {
     tools: Vec<OutputTool>,
     reasoning: BTreeMap<u64, Value>,
     retained_bytes: usize,
+    next_index: usize,
+    search: search::StreamState,
+    native: BTreeMap<u64, Value>,
 }
 impl StreamMapper {
     fn new(model: String) -> Self {
@@ -932,6 +1114,9 @@ impl StreamMapper {
             tools: Vec::new(),
             reasoning: BTreeMap::new(),
             retained_bytes: 0,
+            next_index: 0,
+            search: search::StreamState::default(),
+            native: BTreeMap::new(),
         }
     }
     fn start(&mut self, response: &Value, events: &mut Vec<Value>) -> Result<(), CodexError> {
@@ -958,15 +1143,8 @@ impl StreamMapper {
             }
             return Ok(());
         }
-        if self.active.is_some() {
-            return Err(CodexError::upstream(
-                "Codex interleaved unfinished content blocks",
-            ));
-        }
-        if self.blocks.len() >= MAX_TOOLS {
-            return Err(CodexError::upstream("Too many Codex content blocks"));
-        }
-        let index = self.blocks.len();
+        self.prepare_block(events)?;
+        let index = self.allocate_index()?;
         let tool = if let Some(item) = item {
             let tool = output_tool(item, key.0)?;
             let index = self.tools.len();
@@ -990,6 +1168,8 @@ impl StreamMapper {
                 closed: false,
                 tool,
                 arguments: String::new(),
+                complete: false,
+                citations: BTreeMap::new(),
             },
         );
         self.active = Some(key);
@@ -1014,15 +1194,13 @@ impl StreamMapper {
         if text.is_empty() {
             return Ok(());
         }
-        if tool {
-            if self.retained_bytes.saturating_add(text.len()) > relay::MAX_COLLECTED {
-                return Err(CodexError::upstream(
-                    "Codex tool state exceeds the gateway limit",
-                ));
-            }
-            self.retained_bytes += text.len();
-            block.arguments.push_str(text);
+        if self.retained_bytes.saturating_add(text.len()) > relay::MAX_COLLECTED {
+            return Err(CodexError::upstream(
+                "Codex replay state exceeds the gateway limit",
+            ));
         }
+        self.retained_bytes += text.len();
+        block.arguments.push_str(text);
         block.emitted = block.emitted.saturating_add(text.len());
         let delta = if tool {
             json!({"type":"input_json_delta", "partial_json":text})
@@ -1043,9 +1221,9 @@ impl StreamMapper {
             .blocks
             .get(&key)
             .ok_or_else(|| CodexError::upstream("Codex completion has no content block"))?;
-        if tool && !text.starts_with(&block.arguments) {
+        if !text.starts_with(&block.arguments) {
             return Err(CodexError::upstream(
-                "Codex final tool arguments conflict with streamed arguments",
+                "Codex final output conflicts with streamed content",
             ));
         }
         let suffix = text.get(block.emitted..).ok_or_else(|| {
@@ -1060,7 +1238,11 @@ impl StreamMapper {
             return Ok(());
         }
         self.delta(key, suffix, tool, events)?;
-        self.close(key, events)
+        self.blocks.get_mut(&key).unwrap().complete = true;
+        if tool {
+            self.close(key, events)?;
+        }
+        Ok(())
     }
     fn close(&mut self, key: (u64, u64), events: &mut Vec<Value>) -> Result<(), CodexError> {
         let block = self
@@ -1083,6 +1265,7 @@ impl StreamMapper {
         item: &Value,
         events: &mut Vec<Value>,
     ) -> Result<(), CodexError> {
+        self.remember_item(index, item)?;
         match upstream_string(item, "type")? {
             "reasoning" => {
                 if let Some(previous) = self.reasoning.get(&index) {
@@ -1115,8 +1298,10 @@ impl StreamMapper {
                     let key = (index, content_index as u64);
                     self.open(key, None, events)?;
                     self.complete(key, output_text(part)?, false, events)?;
+                    self.part_annotations(key, part, events)?;
                 }
             }
+            "web_search_call" => self.search_done(index, item, false, events)?,
             "function_call" => {
                 let key = (index, 0);
                 self.open(key, Some(item), events)?;
@@ -1162,6 +1347,7 @@ impl StreamMapper {
                 let item = &event["item"];
                 match upstream_string(item, "type")? {
                     "function_call" => self.open((output_index()?, 0), Some(item), &mut events)?,
+                    "web_search_call" => self.search_open(output_index()?, item, &mut events)?,
                     "message" | "reasoning" => {}
                     _ => {
                         return Err(CodexError::upstream(
@@ -1176,11 +1362,32 @@ impl StreamMapper {
                 let key = (output_index()?, content_index()?);
                 self.open(key, None, &mut events)?;
                 self.delta(key, output_text(part)?, false, &mut events)?;
+                self.part_annotations(key, part, &mut events)?;
             }
             "response.output_text.delta" | "response.refusal.delta" => {
                 let key = (output_index()?, content_index()?);
                 self.open(key, None, &mut events)?;
                 self.delta(key, upstream_string(event, "delta")?, false, &mut events)?;
+            }
+            "response.output_text.annotation.added" => {
+                let key = (output_index()?, content_index()?);
+                self.open(key, None, &mut events)?;
+                let annotation_index = event
+                    .get("annotation_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        CodexError::upstream("Native citation event has no annotation_index")
+                    })?;
+                self.annotation(key, annotation_index, &event["annotation"], &mut events)?;
+            }
+            "response.web_search_call.in_progress"
+            | "response.web_search_call.searching"
+            | "response.web_search_call.completed" => {
+                if !self.search.calls.contains_key(&output_index()?) {
+                    return Err(CodexError::upstream(
+                        "Native search progress has no search call",
+                    ));
+                }
             }
             "response.function_call_arguments.delta" => {
                 self.delta(
@@ -1204,6 +1411,7 @@ impl StreamMapper {
                 let key = (output_index()?, content_index()?);
                 self.open(key, None, &mut events)?;
                 self.complete(key, output_text(&event["part"])?, false, &mut events)?;
+                self.part_annotations(key, &event["part"], &mut events)?;
             }
             "response.function_call_arguments.done" => {
                 self.complete(
@@ -1225,9 +1433,23 @@ impl StreamMapper {
                         self.item_done(index as u64, item, &mut events)?;
                     }
                 }
-                if self.active.is_some() {
+                self.finish_search(&mut events)?;
+                if let Some(key) = self.active {
+                    if !self.blocks.get(&key).is_some_and(|block| block.complete) {
+                        return Err(CodexError::upstream(
+                            "Codex terminal response left unfinished content",
+                        ));
+                    }
+                    self.close(key, &mut events)?;
+                }
+                if !self.search.calls.is_empty()
+                    && response
+                        .pointer("/tool_usage/web_search/num_requests")
+                        .and_then(Value::as_u64)
+                        .is_none()
+                {
                     return Err(CodexError::upstream(
-                        "Codex terminal response left an unfinished content block",
+                        "Native web search response is missing actual search request usage",
                     ));
                 }
                 let stop = stop_reason(response, !self.tools.is_empty())?;
@@ -1311,12 +1533,20 @@ pub(super) async fn respond(
         // to simulate a stream: this fallback is only for an upstream JSON content type.
         let mut mapper = StreamMapper::new(options.model);
         let events = mapper.event(&json!({"type":"response.completed", "response":value}))?;
-        manager.sessions.lock().await.anthropic_tools.commit(
-            &scope,
-            &account,
-            &mapper.tools,
-            mapper.reasoning,
-        )?;
+        let wire = mapper.replay_wire()?;
+        manager
+            .sessions
+            .lock()
+            .await
+            .anthropic_tools
+            .commit_output(
+                &scope,
+                &account,
+                &mapper.tools,
+                mapper.reasoning,
+                wire,
+                mapper.native.into_values().collect(),
+            )?;
         headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
@@ -1360,7 +1590,9 @@ pub(super) async fn respond(
                     let events = mapper.event(&event)?;
                     if mapper.terminal {
                         let reasoning = std::mem::take(&mut mapper.reasoning);
-                        manager.sessions.lock().await.anthropic_tools.commit(&scope, &account, &mapper.tools, reasoning)?;
+                        let wire = mapper.replay_wire()?;
+                        let native = std::mem::take(&mut mapper.native).into_values().collect();
+                        manager.sessions.lock().await.anthropic_tools.commit_output(&scope, &account, &mapper.tools, reasoning, wire, native)?;
                     }
                     Ok::<_, CodexError>(events)
                 }.await;

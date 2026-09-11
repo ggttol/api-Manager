@@ -2,6 +2,14 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Codex Anthropic native search and structured output
+
+`web_search_20250305` now maps to upstream native `web_search`, including search-result blocks, URL citations, and incremental SSE. `output_config.format` forwards the original schema to native strict JSON Schema without a prompt-only fallback; `output_config.effort` can accompany search and format settings.
+
+Search `max_uses` preserves the requested number as instruction guidance only: the subscription backend rejects `max_tool_calls`, so there is no hard call or billing cap. The response header discloses `web_search_max_uses=advisory`. Opaque search/citation handles are gateway-scoped, not Anthropic encryption; unknown, expired, or foreign handles are rejected, and continuation requires the entire original assistant content unchanged. Missing source excerpts remain empty rather than fabricated quotations. Other unsupported server tools, search constraints, and strict-schema subset errors still fail explicitly. The bilingual guide adds collapsible request-field examples while retaining the `count_tokens: 501`, advisory output budget, native-model selection, complete-text quota failover, and private-state isolation guidance.
+
+Fixed mixed search/client-tool history bypassing whole-turn integrity and failed search-cache admission leaving orphaned tool state; both regressions failed before the fix and passed afterward. All 32 Codex and 5 middleware regressions passed. Production acceptance with official Anthropic SDK 0.125.0 covered unary/streamed search, URL citations, continuation from both response forms, tampering rejection, strict schema, and combined search/schema output. Claude Code 2.1.263 actually executed WebSearch and completed its reply; structured output also passed. Verified desktop/390px, dark/light, bilingual presentation and example copying without changing preferred or enabled accounts.
+
 ## Codex quota failover
 
 Responses and Anthropic Messages now share preferred-first Codex quota scheduling. Complete HTTP `429` errors cool the exhausted account and retry safely portable requests against other eligible accounts without cycling back or changing the user's preferred/enabled settings. Cooldowns persist, recover through fresh usage observations or expiry, and return `429` with the earliest `Retry-After` when the pool is cooling. The bilingual account pool and guide expose cooldown reasons, recovery times, and the retry boundaries.

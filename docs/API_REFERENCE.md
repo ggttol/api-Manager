@@ -72,7 +72,7 @@ requires_openai_auth = false
 | GET | `/codex/v1/models` | 将实际可用模型目录转换为 OpenAI 模型列表 |
 | POST | `/codex/v1/responses` | 原生 Responses；保留工具、推理与 SSE 事件；上游 `store=false` |
 | POST | `/codex/v1/responses/compact` | 通过当前官方 Responses `compaction_trigger` 协议生成加密压缩项，汇总为 JSON 返回 |
-| POST | `/codex/v1/messages` | Anthropic Messages 兼容；文本、图片、自定义工具往返、非流式及增量 SSE |
+| POST | `/codex/v1/messages` | Anthropic Messages 兼容；文本、图片、自定义工具往返、原生搜索与引文、严格 JSON Schema、非流式及增量 SSE |
 | POST | `/codex/v1/messages/count_tokens` | 返回 Anthropic 格式 `501`；没有可用的准确上游计数接口，不伪造计数 |
 
 ### Anthropic SDK / Claude Code
@@ -81,9 +81,50 @@ Base URL 使用 `http://127.0.0.1:8045/codex`（远程使用可信 HTTPS 或 SSH
 
 在 Web **接入指南 → Codex → Anthropic Messages** 加载并选择模型，可复制 cURL 或 Claude Code 配置。Claude Code 使用 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_MODEL`；指南同时设置三种默认模型别名及子代理模型，避免客户端自动请求 `claude-*`。
 
-协议差异：正整数 `max_tokens` 仅兼容接收，订阅上游不接受 `max_output_tokens`，不保证这个输出硬上限；thinking 预算映射为推理强度，cache_control 为自动缓存提示。响应 `x-codex-compatibility` 头说明这些差异。不会输出 Claude 签名思维块或推理摘要。采样参数、非空 stop_sequences、结构化 output_config.format、assistant 预填充、Claude 签名回放、文档/PDF、服务端工具与未支持的上下文编辑会明确报错，不静默丢弃。
+协议差异：正整数 `max_tokens` 仅兼容接收，订阅上游不接受 `max_output_tokens`，不保证这个输出硬上限；thinking 预算映射为推理强度，`output_config.effort` 的 `low / medium / high / max` 映射为 `low / medium / high / xhigh`，cache_control 为自动缓存提示。响应 `x-codex-compatibility` 头说明这些差异。不会输出 Claude 签名思维块或推理摘要。采样参数、非空 stop_sequences、assistant 预填充、Claude 签名回放、文档/PDF、其他不支持的服务端工具与上下文编辑会明确报错，不静默丢弃。`count_tokens` 仍返回 `501`。
 
 工具 ID 是网关生成的随机句柄，按调用密钥及原账号隔离，关联的 Codex 推理状态只留在服务器内存。必须原样回传 tool_use ID；未知、过期、跨密钥或混合账号的句柄返回 `409`，原账号失效返回 `503`、原账号冷却返回 `429`，均不跨账号重试。空闲 24 小时或服务重启后，旧网关工具历史不能续接。普通完整文字历史可以重新建立绑定；经适配器验证的完整外部工具历史不依赖网关句柄。
+
+#### 原生联网搜索与严格 JSON Schema
+
+- **搜索**：`tools: [{"type":"web_search_20250305","name":"web_search","max_uses":8}]` 映射为 Codex 原生 `web_search`；支持 `tool_choice: {"type":"auto"}`，由模型决定是否搜索，不是提示词模拟联网。其他搜索工具版本以及不能可靠映射的约束（包括 `allowed_domains` / `blocked_domains`）会明确拒绝，不静默忽略。
+- **次数仅建议**：正整数 `max_uses` 转为保留所填次数的指令建议。订阅后端拒绝 `max_tool_calls`，因此 `max_uses: 8` **不能保证最多 8 次调用，也不是计费硬上限**。响应 `x-codex-compatibility` 包含 `web_search_max_uses=advisory`。搜索实际执行情况以上游结果为准。
+- **结果与引文**：搜索映射为 `server_tool_use`、`web_search_tool_result` / `web_search_result`；文本 URL 引文映射为 `web_search_result_location`，SSE 使用 `citations_delta`。保留上游 URL 及可用标题；来源可能只有 URL，没有标题或摘录。缺失引用文字保持为空，不伪造来源原文或逐字引述。
+- **搜索续接**：`srvtoolu_codex_` 调用 ID 和 `gateway_search_` 搜索/引文句柄是绑定网关、访问密钥与来源账号的不透明标识。即使兼容字段名为 `encrypted_content` / `encrypted_index`，其值也**不是 Anthropic 加密文本**。后续请求必须原样回传整个原始 assistant 内容，包括搜索结果与引文；不可仅摘取或改写句柄。未知、过期或外来句柄明确拒绝；关联的原生搜索及隐藏推理状态仅在原账号续接，不随完整文字会话的额度切换迁移。重启或状态过期后，用完整文字重述任务，不携带旧搜索块或引文句柄。
+- **结构化输出**：`output_config.format: {"type":"json_schema","schema":{...}}` 映射为原生 `text.format: {"type":"json_schema","name":"anthropic_response","strict":true,"schema":{...}}`，原始 Schema 原样传递。这是真正的原生严格约束，不是提示词建议。Schema 必须满足上游严格模式支持的子集；不兼容的 Schema 保留明确错误，不采用提示词降级。
+
+下例将搜索和 JSON Schema 合并。先将 `CODEX_MODEL_ID` 设为 `/codex/v1/models` 实际返回的原生 ID，并在可信终端设置 `API_MANAGER_KEY`；不要使用管理员密码或订阅 Token。示例回环地址适用于同机访问或 SSH 隧道，远程请使用可信 HTTPS。`auto` 不保证发起搜索；`max_tokens` 与搜索次数均不是硬上限。
+
+```bash
+curl --fail-with-body --no-buffer 'http://127.0.0.1:8045/codex/v1/messages' \
+  -H "x-api-key: ${API_MANAGER_KEY:?Set API_MANAGER_KEY first}" \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  --data-raw "$(jq -n --arg model "${CODEX_MODEL_ID:?Select a native model from the catalog}" '{
+    model: $model,
+    max_tokens: 1024,
+    stream: true,
+    messages: [{role: "user", content: "Search for the latest Rust stable release. Return an answer and its official source URL."}],
+    tools: [{type: "web_search_20250305", name: "web_search", max_uses: 8}],
+    tool_choice: {type: "auto"},
+    output_config: {
+      effort: "high",
+      format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: {answer: {type: "string"}, source_url: {type: "string"}},
+          required: ["answer", "source_url"],
+          additionalProperties: false
+        }
+      }
+    }
+  }')"
+```
+
+命令需要 `jq` 安全编码模型 ID。可移除 `tools` / `tool_choice` 仅使用 Schema，或移除 `format` 仅使用搜索；`effort` 与 `format` 属于同一个 `output_config`。Schema 约束最终文本的 JSON 结构，不要求搜索结果块变成该 JSON，也不保证每个结构化答案都会附带原生引文。
+
+**English summary:** Use the gateway key and a native model returned by `/codex/v1/models`; the Anthropic client base URL ends in `/codex`, not `/codex/v1`. `web_search_20250305` uses native search with streamed result blocks and URL citations. `max_uses` is instruction guidance only, disclosed as `web_search_max_uses=advisory`; the subscription backend rejects `max_tool_calls`, so there is no hard call or billing cap. Unsupported tools and search constraints (including domain filters) fail explicitly. Search/citation handles are gateway-scoped, not Anthropic encryption; replay the entire original assistant content unchanged. Unknown, expired, or foreign handles are rejected, and unavailable source quotes stay empty. `output_config.format` forwards the original schema to native strict JSON Schema, with meaningful upstream subset errors and no prompt-only fallback. Exact token counting remains `501`, `max_tokens` remains advisory, complete-text quota failover remains available, and private state remains issuer-bound.
 
 ### 额度冷却与账号切换
 

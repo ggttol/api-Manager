@@ -4,6 +4,8 @@
 
 打开 Web 后台的 **Codex** 页面，可使用设备码授权或导入 Codex 的 `auth.json`，管理独立账号、刷新授权、查询真实用量和模型目录。客户端可使用 `/codex/v1/responses` 原生 Responses，或 `/codex/v1/messages` Anthropic Messages 兼容协议，均不经过 GPT → Gemini 模型映射。**接入指南 → Codex → Anthropic Messages → Claude Code** 提供可复制配置；Anthropic 客户端 Base URL 为 `/codex`，不是 `/codex/v1`。兼容协议使用 Codex 模型，不是 Claude 原生推理；输出预算等差异在指南中说明。请在终端设置自己的网关密钥，不要分发管理员密码或订阅 Token。
 
+Codex Anthropic 兼容入口支持将 `web_search_20250305` 映射为原生联网搜索，并以结果块及 URL 引文增量输出；`output_config.format: {type: "json_schema", schema: ...}` 使用原生严格 JSON Schema，不是提示词模拟约束，不兼容的 Schema 明确报错。**`max_uses` 仅为保留所填次数的指令建议，不保证调用次数或计费硬上限**：订阅后端拒绝 `max_tool_calls`，响应 `x-codex-compatibility` 头明示 `web_search_max_uses=advisory`。搜索与引文使用网关范围内的不透明句柄，并非 Anthropic 加密文本；续接需原样保留整个 assistant 内容，未知、过期或外来句柄拒绝。来源摘录可能缺失，空引用文字不代表逐字原文。其他不支持的服务端工具或搜索约束仍明确报错；`count_tokens` 仍为 `501`，`max_tokens` 仍不是硬上限。中英文接入指南及 [API Reference](docs/API_REFERENCE.md#原生联网搜索与严格-json-schema) 提供示例与边界。
+
 Codex 账号池默认开启额度切换：上游返回完整 HTTP `429` 错误后，暂时冷却原账号，为可安全迁移的请求尝试其他可用账号，不循环重试，也不改变首选或启停设置。完整文字会话可继续使用原 `session_id` / `prompt_cache_key`；响应 ID、加密上下文和工具句柄仍按来源账号隔离。页面显示“冷却中 · 暂时跳过”及预计恢复时间；到期重新获得候选资格，额度是否恢复仍以上游为准。全部账号冷却时返回 `429` 和 `Retry-After`。
 
 凭据导入和授权必须通过可信 HTTPS 或 SSH 隧道完成。Codex 凭据加密保存在数据目录的 `codex/` 子目录中，备份时必须同时保存 `key` 和 `accounts.enc.json`；密钥与密文同盘不能防御整机失陷。会话绑定保存在内存，重启后无法识别的续接会明确报错，需要开启新会话。此接入不提供 WebSocket，也不保证上游订阅接口的长期兼容性或第三方共享使用授权。
