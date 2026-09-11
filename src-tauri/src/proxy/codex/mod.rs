@@ -2,6 +2,7 @@
 //! OAuth and API contracts follow openai/codex rust-v0.154.0; no Google model mapping applies.
 mod anthropic;
 mod auth;
+mod images;
 mod relay;
 mod scheduler;
 mod store;
@@ -966,6 +967,7 @@ pub fn proxy_routes() -> Router<AppState> {
         .route("/models", get(relay::models))
         .route("/responses", post(relay::responses))
         .route("/responses/compact", post(relay::compact))
+        .route("/images/generations", post(images::generations))
         .route("/messages", post(anthropic::messages))
         .route("/messages/count_tokens", post(anthropic::count_tokens))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))

@@ -344,7 +344,7 @@ fn portable_input(headers: &HeaderMap, body: &Value) -> bool {
     }
 }
 
-async fn select_account(
+pub(super) async fn select_account(
     manager: &CodexManager,
     headers: &HeaderMap,
     body: &Value,

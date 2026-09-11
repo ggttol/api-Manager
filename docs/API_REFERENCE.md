@@ -72,8 +72,32 @@ requires_openai_auth = false
 | GET | `/codex/v1/models` | 将实际可用模型目录转换为 OpenAI 模型列表 |
 | POST | `/codex/v1/responses` | 原生 Responses；保留工具、推理与 SSE 事件；上游 `store=false` |
 | POST | `/codex/v1/responses/compact` | 通过当前官方 Responses `compaction_trigger` 协议生成加密压缩项，汇总为 JSON 返回 |
+| POST | `/codex/v1/images/generations` | Codex 官方客户端生图兼容；转换成订阅上游原生 Responses 生图，返回真实 `data[].b64_json` |
 | POST | `/codex/v1/messages` | Anthropic Messages 兼容；文本、图片、自定义工具往返、原生搜索与引文、严格 JSON Schema、非流式及增量 SSE |
 | POST | `/codex/v1/messages/count_tokens` | 返回 Anthropic 格式 `501`；没有可用的准确上游计数接口，不伪造计数 |
+
+### Codex 官方客户端生图
+
+客户端使用 `/codex/v1` Base URL。内置 `image_gen.imagegen` 会另外调用 `/images/generations`，由网关转换为 `gpt-5.6-luna` 的原生 Responses `image_generation` 工具调用；没有注入到普通聊天请求中，也不需要独立的官方付费 API Key。
+
+兼容请求标识为 `model: "gpt-image-2"`，仅支持一次生成一张 (`n: 1`) 和 Base64 返回；实际图片渲染器由订阅上游选择，不保证与公共 API 的同名模型版本相同。响应 `x-codex-image-compatibility` 明示 `renderer=upstream-default`。支持转交 `size`、`quality`、`background`、`output_format`、`output_compression`、`moderation`；具体组合仍受上游约束。不支持的参数、图片 URL 返回、多图请求及上游失败会明确报错；未实现图片编辑接口。
+
+**客户端前提**：Codex `0.153.4` 会隐藏本地登录套餐为 Free 的内置生图工具，即使服务器池里的账号是 Pro/Plus。需要在客户端登录有权限使用的 Plus/Pro 账号，并保留网关提供商的 `requires_openai_auth = true`、正确的网关鉴权及支持图片输入的模型。可显式启用 `[features] image_generation = true`。登录套餐来自客户端本地状态，服务器账号池不会改写它；不要修改 Token 中的套餐字段。现有服务不支持 WebSocket，保持 `supports_websockets = false`。
+
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "A cute kitten sitting on a blue cushion",
+  "n": 1,
+  "size": "auto",
+  "quality": "auto",
+  "output_format": "png"
+}
+```
+
+调用 `POST /codex/v1/images/generations`，沿用网关 Bearer Key。成功返回 `created` 与 `data[0].b64_json`；Codex 客户端负责解码、保存和展示。只验证图片生成，不承诺图片编辑或任意其他客户端功能。原生 `/codex/v1/responses` 生图入口保持不变。
+
+`usage` 仅在上游报告时保留原生 Responses 用量，供网关已有日志与令牌计量使用；不伪造图片 Token 数或图片价格，兼容头标注 `usage=responses`。
 
 ### Anthropic SDK / Claude Code
 

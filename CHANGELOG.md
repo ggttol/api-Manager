@@ -4,6 +4,8 @@
 
 ## API Manager 修改版（基于 v4.7.0）
 
+新增 Codex 官方客户端图片生成兼容入口 `/codex/v1/images/generations`，调用现有订阅账号池的原生 Responses 生图并返回真实 Base64 图片；不注入普通对话，不使用独立付费 API。`gpt-image-2` 为客户端兼容标识，实际渲染器由上游选择并通过兼容响应头披露；单图生成、上游参数约束、错误、请求额度调度与原生计量保留。官方 Codex 0.153.4 在隔离网关配置中实际调用图片接口、保存猫咪 PNG 并完成续聊。该版本本地 Free 登录会隐藏生图工具，服务器 Plus/Pro 账号不会改变客户端登录套餐；图片编辑不在本次范围内。
+
 Codex Anthropic 兼容新增原生联网搜索与严格结构化输出：`web_search_20250305` 映射至上游 `web_search`，转换搜索结果块、URL 引文及增量 SSE；`output_config.format` 将原始 Schema 传给原生严格 JSON Schema，不使用提示词降级。`output_config.effort` 可与搜索及格式配置共用。
 
 明确披露搜索 `max_uses` 仅为保留请求次数的指令建议：订阅后端拒绝 `max_tool_calls`，不保证调用次数或计费硬上限，响应头包含 `web_search_max_uses=advisory`。搜索与引文的网关不透明句柄不是 Anthropic 加密文本，未知、过期或外来句柄拒绝；续接须保留整个原始 assistant 内容，来源缺少摘录时不伪造引用文字。其他不支持的服务端工具、搜索约束及严格 Schema 子集错误仍明确返回。中英文接入指南增加可折叠字段示例，保留 `count_tokens: 501`、输出预算建议值、原生模型选择、完整文字额度切换及私有状态隔离说明。

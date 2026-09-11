@@ -2,6 +2,10 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Codex native client image generation
+
+Added `/codex/v1/images/generations`, backed by the existing subscription pool and native Responses image tool. Ordinary conversations are unchanged. The client-facing `gpt-image-2` identifier is a compatibility alias; the upstream chooses its renderer, disclosed in a compatibility header. Single-image requests preserve supported options, upstream errors, quota scheduling and reported Responses usage. Official Codex 0.153.4 invoked the real endpoint, saved a kitten PNG and completed its conversation under isolated gateway configuration. This client version hides the image tool for a locally cached Free login regardless of the gateway pool's paid accounts. Image editing is not included.
+
 ## Codex Anthropic native search and structured output
 
 `web_search_20250305` now maps to upstream native `web_search`, including search-result blocks, URL citations, and incremental SSE. `output_config.format` forwards the original schema to native strict JSON Schema without a prompt-only fallback; `output_config.effort` can accompany search and format settings.
