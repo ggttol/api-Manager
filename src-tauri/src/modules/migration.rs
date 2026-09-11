@@ -166,52 +166,46 @@ pub async fn import_from_v1() -> Result<Vec<Account>, String> {
                             "Importing account: {}",
                             email_placeholder
                         ));
-                        let (email, access_token, expires_in, oauth_client_key) =
-                            match oauth::refresh_access_token(&refresh_token, None).await {
-                                Ok(token_resp) => {
-                                    let oauth_client_key = token_resp.oauth_client_key.clone();
-                                    match oauth::get_user_info(&token_resp.access_token, None).await
-                                    {
-                                        Ok(user_info) => (
-                                            user_info.email,
-                                            token_resp.access_token,
-                                            token_resp.expires_in,
-                                            oauth_client_key,
-                                        ),
-                                        Err(_) => (
-                                            email_placeholder.clone(),
-                                            token_resp.access_token,
-                                            token_resp.expires_in,
-                                            oauth_client_key,
-                                        ),
-                                    }
-                                }
-                                Err(e) => {
-                                    crate::modules::logger::log_warn(&format!(
-                                        "Token refresh failed (likely expired): {}",
-                                        e
-                                    ));
-                                    (
-                                        email_placeholder.clone(),
-                                        "imported_access_token".to_string(),
-                                        0,
-                                        None,
-                                    )
-                                }
-                            };
+                        let Ok(token_resp) =
+                            oauth::refresh_access_token(&refresh_token, None).await
+                        else {
+                            crate::modules::logger::log_warn(
+                                "Skipping legacy credential because its refresh token is no longer valid",
+                            );
+                            continue;
+                        };
+                        let Ok(user_info) =
+                            oauth::get_user_info(&token_resp.access_token, None).await
+                        else {
+                            crate::modules::logger::log_warn(
+                                "Skipping legacy credential because its account identity could not be verified",
+                            );
+                            continue;
+                        };
+                        let email = user_info.email;
+                        // Import-all prioritizes live keychain/database state. A
+                        // legacy backup must never overwrite an existing identity.
+                        if account::find_account_id_by_email(&email).is_some() {
+                            crate::modules::logger::log_info(&format!(
+                                "Skipping legacy credential already supplied by a newer source: {email}"
+                            ));
+                            continue;
+                        }
                         let token_data = TokenData::new(
-                            access_token,
-                            refresh_token,
-                            expires_in,
+                            token_resp.access_token,
+                            token_resp
+                                .refresh_token
+                                .filter(|token| !token.trim().is_empty())
+                                .unwrap_or(refresh_token),
+                            token_resp.expires_in,
                             Some(email.clone()),
-                            None, // project_id will be fetched on demand
-                            None, // session_id
-                            true, // V1 tokens are Antigravity Google OAuth tokens
-                            None, // V1 doesn't have id_token saved
+                            None,
+                            None,
+                            true,
+                            token_resp.id_token,
                         )
-                        .with_oauth_client_key(oauth_client_key);
-                        // Name already fetched in get_user_info at line 153, but outside match scope, use None to be safe
-                        match account::upsert_account(email.clone(), None, token_data) {
+                        .with_oauth_client_key(token_resp.oauth_client_key);
+                        match account::upsert_account(email.clone(), user_info.name, token_data) {
                             Ok(acc) => {
                                 crate::modules::logger::log_info(&format!(
                                     "Import successful: {}",
@@ -242,40 +236,46 @@ pub async fn import_from_v1() -> Result<Vec<Account>, String> {
     Ok(imported_accounts)
 }
 
-/// Import account from custom database path
-pub async fn import_from_custom_db_path(path_str: String) -> Result<Account, String> {
+async fn import_oauth_state(oauth_state: ImportedOAuthState) -> Result<Account, String> {
     use crate::modules::oauth;
 
+    let refresh_token = oauth_state.refresh_token.clone();
+    if refresh_token.is_empty() {
+        return Err("Login state contains an empty refresh token".to_string());
+    }
+
+    crate::modules::logger::log_info("Getting user info using Refresh Token...");
+    let token_resp = oauth::refresh_access_token(&refresh_token, None).await?;
+    let user_info = oauth::get_user_info(&token_resp.access_token, None).await?;
+    let email = user_info.email;
+
+    crate::modules::logger::log_info(&format!("Successfully retrieved account info: {email}"));
+    let token_data = TokenData::new(
+        token_resp.access_token,
+        token_resp
+            .refresh_token
+            .filter(|token| !token.trim().is_empty())
+            .unwrap_or(refresh_token),
+        token_resp.expires_in,
+        Some(email.clone()),
+        oauth_state.project_id,
+        None,
+        oauth_state.is_gcp_tos,
+        token_resp.id_token,
+    )
+    .with_oauth_client_key(token_resp.oauth_client_key);
+
+    account::upsert_account(email, user_info.name, token_data)
+}
+
+/// Import account from custom database path
+pub async fn import_from_custom_db_path(path_str: String) -> Result<Account, String> {
     let path = PathBuf::from(path_str);
     if !path.exists() {
         return Err(format!("File does not exist: {:?}", path));
     }
 
-    let oauth_state = extract_oauth_state_from_file(&path)?;
-    let refresh_token = oauth_state.refresh_token.clone();
-
-    // 3. Use Refresh Token to get latest Access Token and user info
-    crate::modules::logger::log_info("Getting user info using Refresh Token...");
-    let token_resp = oauth::refresh_access_token(&refresh_token, None).await?;
-    let user_info = oauth::get_user_info(&token_resp.access_token, None).await?;
-
-    let email = user_info.email;
-
-    crate::modules::logger::log_info(&format!("Successfully retrieved account info: {}", email));
-
-    let token_data = TokenData::new(
-        token_resp.access_token,
-        refresh_token,
-        token_resp.expires_in,
-        Some(email.clone()),
-        oauth_state.project_id,
-        None, // session_id will be generated in token_manager
-        oauth_state.is_gcp_tos,
-        token_resp.id_token,
-    )
-    .with_oauth_client_key(token_resp.oauth_client_key);
-    // 4. Add or update account
-    account::upsert_account(email.clone(), user_info.name, token_data)
+    import_oauth_state(extract_oauth_state_from_file(&path)?).await
 }
 
 /// Scan all local sources (Keyring/Keychain, IDE Databases, V1/CLI Directories) and import all unique accounts
@@ -284,33 +284,47 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
 
     let mut imported_accounts = Vec::new();
     let mut seen_refresh_tokens = std::collections::HashSet::new();
+    let mut seen_emails = std::collections::HashSet::new();
 
-    // 1. Check System Keyring / Keychain
-    if let Ok(oauth_state) = integration::read_from_system_keyring() {
-        let refresh_token = oauth_state.refresh_token.clone();
-        if !refresh_token.is_empty() && seen_refresh_tokens.insert(refresh_token.clone()) {
-            crate::modules::logger::log_info(
-                "Discovered OAuth state in System Keyring/Keychain",
-            );
-            if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
-                let email = match oauth::get_user_info(&token_resp.access_token, None).await {
-                    Ok(info) => info.email,
-                    Err(_) => "Unknown".to_string(),
-                };
-                let token_data = TokenData::new(
-                    token_resp.access_token,
-                    refresh_token,
-                    token_resp.expires_in,
-                    Some(email.clone()),
-                    oauth_state.project_id,
-                    None,
-                    oauth_state.is_gcp_tos,
-                    token_resp.id_token,
-                )
-                .with_oauth_client_key(token_resp.oauth_client_key);
+    // The system keyring belongs to the native application. An explicitly
+    // selected IDE import must not mix in that unrelated credential source.
+    if target_ide.is_none() {
+        if let Ok(oauth_state) = integration::read_from_system_keyring() {
+            let refresh_token = oauth_state.refresh_token.clone();
+            if !refresh_token.is_empty() && seen_refresh_tokens.insert(refresh_token.clone()) {
+                crate::modules::logger::log_info(
+                    "Discovered OAuth state in System Keyring/Keychain",
+                );
+                if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
+                    if let Ok(user_info) =
+                        oauth::get_user_info(&token_resp.access_token, None).await
+                    {
+                        let email = user_info.email;
+                        seen_emails.insert(email.clone());
+                        let token_data = TokenData::new(
+                            token_resp.access_token,
+                            token_resp
+                                .refresh_token
+                                .filter(|token| !token.trim().is_empty())
+                                .unwrap_or(refresh_token),
+                            token_resp.expires_in,
+                            Some(email.clone()),
+                            oauth_state.project_id,
+                            None,
+                            oauth_state.is_gcp_tos,
+                            token_resp.id_token,
+                        )
+                        .with_oauth_client_key(token_resp.oauth_client_key);
 
-                if let Ok(acc) = account::upsert_account(email, None, token_data) {
-                    imported_accounts.push(acc);
+                        if let Ok(acc) = account::upsert_account(email, user_info.name, token_data)
+                        {
+                            imported_accounts.push(acc);
+                        }
+                    } else {
+                        crate::modules::logger::log_warn(
+                            "Skipping keyring credential because its account identity could not be verified",
+                        );
+                    }
                 }
             }
         }
@@ -327,14 +341,29 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
                         "Discovered OAuth state in DB path: {:?}",
                         db_path
                     ));
-                    if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await {
-                        let email = match oauth::get_user_info(&token_resp.access_token, None).await {
-                            Ok(info) => info.email,
-                            Err(_) => "Unknown".to_string(),
+                    if let Ok(token_resp) = oauth::refresh_access_token(&refresh_token, None).await
+                    {
+                        let Ok(user_info) =
+                            oauth::get_user_info(&token_resp.access_token, None).await
+                        else {
+                            crate::modules::logger::log_warn(
+                                "Skipping database credential because its account identity could not be verified",
+                            );
+                            continue;
                         };
+                        let email = user_info.email;
+                        if !seen_emails.insert(email.clone()) {
+                            crate::modules::logger::log_info(&format!(
+                                "Skipping database credential for {email}; a higher-priority source already supplied it"
+                            ));
+                            continue;
+                        }
                         let token_data = TokenData::new(
                             token_resp.access_token,
-                            refresh_token,
+                            token_resp
+                                .refresh_token
+                                .filter(|token| !token.trim().is_empty())
+                                .unwrap_or(refresh_token),
                             token_resp.expires_in,
                             Some(email.clone()),
                             oauth_state.project_id,
@@ -344,7 +373,8 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
                         )
                         .with_oauth_client_key(token_resp.oauth_client_key);
 
-                        if let Ok(acc) = account::upsert_account(email, None, token_data) {
+                        if let Ok(acc) = account::upsert_account(email, user_info.name, token_data)
+                        {
                             imported_accounts.push(acc);
                         }
                     }
@@ -356,26 +386,54 @@ pub async fn import_all_local_accounts(target_ide: Option<&str>) -> Result<Vec<A
     // 3. Scan V1 / CLI agent directory (~/.antigravity-agent)
     if let Ok(v1_accounts) = import_from_v1().await {
         for acc in v1_accounts {
-            if seen_refresh_tokens.insert(acc.token.refresh_token.clone()) {
+            if seen_refresh_tokens.insert(acc.token.refresh_token.clone())
+                && seen_emails.insert(acc.email.clone())
+            {
                 imported_accounts.push(acc);
             }
         }
     }
 
     if imported_accounts.is_empty() {
-        return Err("No login state data found across Keyring, IDE databases, or CLI directories".to_string());
+        return Err(
+            "No login state data found across Keyring, IDE databases, or CLI directories"
+                .to_string(),
+        );
     }
 
     Ok(imported_accounts)
 }
 
-/// Import current logged-in accounts from all local sources (Keyring, candidate DBs, V1 CLI)
+/// Resolve the one credential that represents the currently signed-in account.
+///
+/// Keychain state is authoritative for the native application. Otherwise this
+/// uses only the selected application's own database; broad candidate scanning
+/// is reserved for explicit import-all operations.
+fn current_oauth_state(target_ide: Option<&str>) -> Result<ImportedOAuthState, String> {
+    if target_ide.is_none() {
+        if let Ok(oauth_state) = crate::modules::integration::read_from_system_keyring() {
+            if oauth_state.refresh_token.is_empty() {
+                return Err(
+                    "System keyring login state contains an empty refresh token".to_string()
+                );
+            }
+            return Ok(oauth_state);
+        }
+    }
+
+    let db_path = db::get_current_application_db_path(target_ide)?;
+    let oauth_state = extract_oauth_state_from_file(&db_path)?;
+    if oauth_state.refresh_token.is_empty() {
+        return Err(
+            "Selected application's login state contains an empty refresh token".to_string(),
+        );
+    }
+    Ok(oauth_state)
+}
+
+/// Import the account currently signed into the selected application.
 pub async fn import_from_db(target_ide: Option<&str>) -> Result<Account, String> {
-    let accounts = import_all_local_accounts(target_ide).await?;
-    accounts
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No accounts found".to_string())
+    import_oauth_state(current_oauth_state(target_ide)?).await
 }
 
 /// Get current Refresh Token from database (common logic)
@@ -454,7 +512,7 @@ fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthState
 
         let refresh_token = String::from_utf8(refresh_bytes)
             .map_err(|_| "Refresh Token is not UTF-8 encoded".to_string())?;
-        let is_gcp_tos = protobuf::find_varint_field(&oauth_info_blob, 6)?.unwrap_or(1) != 0;
+        let is_gcp_tos = protobuf::find_varint_field(&oauth_info_blob, 6)?.unwrap_or(0) != 0;
         let project_id = extract_enterprise_project_id_from_conn(&conn)?;
 
         return Ok(ImportedOAuthState {
@@ -501,22 +559,6 @@ fn extract_oauth_state_from_file(db_path: &PathBuf) -> Result<ImportedOAuthState
     })
 }
 
-/// Get current Refresh Token from System Keyring or candidate databases
 pub fn get_refresh_token_from_db(target_ide: Option<&str>) -> Result<String, String> {
-    use crate::modules::integration;
-
-    if let Ok(oauth_state) = integration::read_from_system_keyring() {
-        return Ok(oauth_state.refresh_token);
-    }
-
-    let candidate_paths = db::get_all_candidate_db_paths(target_ide);
-    for db_path in candidate_paths {
-        if db_path.exists() {
-            if let Ok(token) = extract_refresh_token_from_file(&db_path) {
-                return Ok(token);
-            }
-        }
-    }
-
-    Err("Login state data not found in keyring or any database format".to_string())
+    Ok(current_oauth_state(target_ide)?.refresh_token)
 }

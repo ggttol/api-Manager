@@ -1,5 +1,5 @@
 import { createPortal } from 'react-dom';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Wand2, RotateCcw, FolderOpen, Trash2, X } from 'lucide-react';
 import { Account, DeviceProfile, DeviceProfileVersion } from '../../types/account';
 import * as accountService from '../../services/accountService';
@@ -19,30 +19,43 @@ export default function DeviceFingerprintDialog({ account, onClose }: DeviceFing
     const [actionMessage, setActionMessage] = useState<string | null>(null);
     const [confirmProfile, setConfirmProfile] = useState<DeviceProfile | null>(null);
     const [confirmType, setConfirmType] = useState<'generate' | 'restoreOriginal' | null>(null);
+    const accountIdRef = useRef<string | null>(account?.id ?? null);
+
 
     const fetchDevice = async (target?: Account | null) => {
-        if (!target) {
+        const targetId = target?.id;
+        if (!targetId) {
             setDeviceProfiles(null);
             return;
         }
         setLoadingDevice(true);
         try {
-            const res = await accountService.getDeviceProfiles(target.id);
-            setDeviceProfiles(res);
-        } catch (e: any) {
-            const errorMsg = typeof e === 'string' ? e : e.message || '';
-            const translated = errorMsg === 'storage_json_not_found'
-                ? t('accounts.device_fingerprint_dialog.storage_json_not_found')
-                : (typeof e === 'string' ? e : t('accounts.device_fingerprint_dialog.failed_to_load_device_info'));
-            setActionMessage(translated);
+            const res = await accountService.getDeviceProfiles(targetId);
+            if (accountIdRef.current === targetId) {
+                setDeviceProfiles(res);
+            }
+        } catch (e: unknown) {
+            if (accountIdRef.current === targetId) {
+                const errorMsg = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+                setActionMessage(errorMsg === 'storage_json_not_found'
+                    ? t('accounts.device_fingerprint_dialog.storage_json_not_found')
+                    : (typeof e === 'string' ? e : t('accounts.device_fingerprint_dialog.failed_to_load_device_info')));
+            }
         } finally {
-            setLoadingDevice(false);
+            if (accountIdRef.current === targetId) {
+                setLoadingDevice(false);
+            }
         }
     };
 
     useEffect(() => {
-        fetchDevice(account);
-    }, [account]);
+        accountIdRef.current = account?.id ?? null;
+        setDeviceProfiles(null);
+        setActionMessage(null);
+        setConfirmProfile(null);
+        setConfirmType(null);
+        void fetchDevice(account);
+    }, [account?.id]);
 
     const handleGeneratePreview = async () => {
         setActionLoading('preview');

@@ -181,9 +181,10 @@ fn compact_browser_snapshot(text: &str, max_chars: usize) -> Option<String> {
     let head_len = head_len.min(10_000).max(500);
     let tail_len = budget.saturating_sub(head_len).min(3_000);
 
-    let head = &text[..head_len.min(text.len())];
-    let tail = if tail_len > 0 && text.len() > head_len {
-        let start = text.len().saturating_sub(tail_len);
+    let head_end = floor_char_boundary(text, head_len.min(text.len()));
+    let head = &text[..head_end];
+    let tail = if tail_len > 0 && text.len() > head_end {
+        let start = ceil_char_boundary(text, text.len().saturating_sub(tail_len));
         &text[start..]
     } else {
         ""
@@ -213,10 +214,10 @@ fn truncate_text_safe(text: &str, max_chars: usize) -> String {
     }
 
     // 尝试寻找一个安全的截断点 (不在 < 和 > 之间)
-    let mut split_pos = max_chars;
+    let mut split_pos = floor_char_boundary(text, max_chars);
 
     // 向前查找是否有未闭合的标签开始符
-    let sub = &text[..max_chars];
+    let sub = &text[..split_pos];
     if let Some(last_open) = sub.rfind('<') {
         if let Some(last_close) = sub.rfind('>') {
             if last_open > last_close {
@@ -241,9 +242,25 @@ fn truncate_text_safe(text: &str, max_chars: usize) -> String {
         }
     }
 
-    let truncated = &text[..split_pos];
+    let truncated = &text[..floor_char_boundary(text, split_pos)];
     let omitted = text.len() - split_pos;
     format!("{}\n...[truncated {} chars]", truncated, omitted)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
 }
 
 /// 深度清理 HTML (移除 style, script, base64 等)
@@ -366,6 +383,19 @@ mod tests {
     }
 
     #[test]
+    fn test_multibyte_truncation_uses_character_boundaries() {
+        let text = "中".repeat(70_000);
+        let result = truncate_text_safe(&text, 200_000);
+        assert!(result.starts_with(&"中".repeat(66_666)));
+        assert!(result.contains("[truncated"));
+
+        let snapshot = format!("page snapshot: {}", "中 ref=abc ".repeat(5_000));
+        let compacted = compact_tool_result_text(&snapshot, 16_000);
+        assert!(compacted.contains("[HEAD]"));
+        assert!(compacted.contains("[TAIL]"));
+    }
+
+    #[test]
     fn test_compact_saved_output_notice() {
         let text = r#"result (150000 characters) exceeds maximum allowed tokens. Output has been saved to /tmp/output.txt
 Format: JSON array with schema
@@ -383,11 +413,11 @@ Please read the file locally."#;
         let mut blocks = vec![
             serde_json::json!({
                 "type": "text",
-                "text": "a".repeat(100_000)
+                "text": "a".repeat(100)
             }),
             serde_json::json!({
                 "type": "text",
-                "text": "b".repeat(150_000)
+                "text": "b".repeat(100)
             }),
             serde_json::json!({
                 "type": "image",
@@ -402,8 +432,8 @@ Please read the file locally."#;
             }),
         ];
 
-        // 确认工具结果不再剔除图片
         sanitize_tool_result_blocks(&mut blocks);
         assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[2]["source"]["data"], "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
     }
 }

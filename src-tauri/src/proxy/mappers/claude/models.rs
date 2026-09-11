@@ -26,9 +26,12 @@ pub struct ClaudeRequest {
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
-    /// Output configuration for effort level (Claude API v2.0.67+)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<OutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
     // [NEW] Image generation parameters (for Anthropic protocol compatibility)
     #[serde(default)]
     pub size: Option<String>,
@@ -144,11 +147,12 @@ pub enum ContentBlock {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageSource {
-    #[serde(rename = "type")]
-    pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+#[serde(tag = "type")]
+pub enum ImageSource {
+    #[serde(rename = "base64")]
+    Base64 { media_type: String, data: String },
+    #[serde(rename = "url")]
+    Url { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

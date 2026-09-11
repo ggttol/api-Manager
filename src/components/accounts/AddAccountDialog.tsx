@@ -36,111 +36,35 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const statusRef = useRef(status);
     const activeTabRef = useRef(activeTab);
     const isOpenRef = useRef(isOpen);
+    const mountedRef = useRef(true);
+    const oauthFlowOwnedRef = useRef(false);
+    const oauthCompletionRef = useRef<Promise<void> | null>(null);
+    const oauthPreparationRef = useRef<Promise<void> | null>(null);
+    const oauthSessionRef = useRef(0);
+    const oauthCloseTimerRef = useRef<number | null>(null);
+    const clearWebOAuthWorkRef = useRef<(() => void) | null>(null);
 
-    useEffect(() => {
-        oauthUrlRef.current = oauthUrl;
-        statusRef.current = status;
-        activeTabRef.current = activeTab;
-        isOpenRef.current = isOpen;
-    }, [oauthUrl, status, activeTab, isOpen]);
+    const isActiveOAuthSession = (session: number) =>
+        mountedRef.current && isOpenRef.current && oauthSessionRef.current === session;
 
-    // Reset state when dialog opens or tab changes
-    useEffect(() => {
-        if (isOpen) {
-            resetState();
+    const clearOAuthUiWork = () => {
+        clearWebOAuthWorkRef.current?.();
+        clearWebOAuthWorkRef.current = null;
+        if (oauthCloseTimerRef.current !== null) {
+            window.clearTimeout(oauthCloseTimerRef.current);
+            oauthCloseTimerRef.current = null;
         }
-    }, [isOpen, activeTab]);
+    };
 
-    // Listen for OAuth URL
-    useEffect(() => {
-        if (!isTauri()) return;
-        let unlisten: (() => void) | undefined;
-
-        const setupListener = async () => {
-            unlisten = await listen('oauth-url-generated', (event) => {
-                setOauthUrl(event.payload as string);
-                // 自动复制到剪贴板? 可选，这里只设置状态让用户手动复制
-            });
-        };
-
-        setupListener();
-
-        return () => {
-            if (unlisten) unlisten();
-        };
-    }, []);
-
-    // Listen for OAuth callback completion (user may open the URL manually without clicking Start)
-    useEffect(() => {
-        if (!isTauri()) return;
-        let unlisten: (() => void) | undefined;
-
-        const setupListener = async () => {
-            unlisten = await listen('oauth-callback-received', async () => {
-                if (!isOpenRef.current) return;
-                if (activeTabRef.current !== 'oauth') return;
-                if (statusRef.current === 'loading' || statusRef.current === 'success') return;
-                if (!oauthUrlRef.current) return;
-
-                // Auto-complete: exchange code and save account (no browser open)
-                setStatus('loading');
-                setMessage(`${t('accounts.add.tabs.oauth')}...`);
-
-                try {
-                    await completeOAuthLogin();
-                    setStatus('success');
-                    setMessage(`${t('accounts.add.tabs.oauth')} ${t('common.success')}!`);
-                    setTimeout(() => {
-                        setIsOpen(false);
-                        resetState();
-                    }, 1500);
-                } catch (error) {
-                    setStatus('error');
-                    let errorMsg = String(error);
-                    if (errorMsg.includes('Refresh Token') || errorMsg.includes('refresh_token')) {
-                        setMessage(errorMsg);
-                    } else if (errorMsg.includes('Tauri') || errorMsg.toLowerCase().includes('environment') || errorMsg.includes('环境')) {
-                        setMessage(t('common.environment_error', { error: errorMsg }));
-                    } else {
-                        setMessage(`${t('accounts.add.tabs.oauth')} ${t('common.error')}: ${errorMsg}`);
-                    }
-                }
-            });
-        };
-
-        setupListener();
-
-        return () => {
-            if (unlisten) unlisten();
-        };
-    }, [completeOAuthLogin, t]);
-
-    // Pre-generate OAuth URL when dialog opens on OAuth tab (so URL is shown BEFORE "Start OAuth")
-    useEffect(() => {
-        if (!isOpen) return;
-        if (activeTab !== 'oauth') return;
-        if (oauthUrl) return;
-
-        invoke<any>('prepare_oauth_url')
-            .then((res) => {
-                const url = typeof res === 'string' ? res : res?.url;
-                if (url && url.length > 0) setOauthUrl(url);
-            })
-            .catch((e) => {
-                console.error('Failed to prepare OAuth URL:', e);
-            });
-    }, [isOpen, activeTab, oauthUrl]);
-
-    // If user navigates away from OAuth tab, cancel prepared flow to release the port.
-    useEffect(() => {
-        if (!isOpen) return;
-        if (activeTab === 'oauth') return;
-        if (!oauthUrl) return;
-
-        cancelOAuthLogin().catch(() => { });
-        setOauthUrl('');
-        setOauthUrlCopied(false);
-    }, [isOpen, activeTab]);
+    const cancelOwnedOAuth = () => {
+        oauthSessionRef.current += 1;
+        clearOAuthUiWork();
+        oauthCompletionRef.current = null;
+        if (oauthFlowOwnedRef.current) {
+            oauthFlowOwnedRef.current = false;
+            void cancelOAuthLogin();
+        }
+    };
 
     const resetState = () => {
         setStatus('idle');
@@ -149,6 +73,144 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         setOauthUrl('');
         setOauthUrlCopied(false);
     };
+
+    const closeDialog = () => {
+        cancelOwnedOAuth();
+        setIsOpen(false);
+        resetState();
+    };
+
+    const scheduleOAuthClose = (session: number) => {
+        oauthCloseTimerRef.current = window.setTimeout(() => {
+            if (isActiveOAuthSession(session)) closeDialog();
+        }, 1500);
+    };
+
+    const waitForOAuthCompletion = (startInBrowser: boolean) => {
+        if (oauthCompletionRef.current) return oauthCompletionRef.current;
+
+        const completion = startInBrowser ? startOAuthLogin() : completeOAuthLogin();
+        oauthCompletionRef.current = completion;
+        void completion.then(
+            () => {
+                if (oauthCompletionRef.current === completion) oauthCompletionRef.current = null;
+            },
+            () => {
+                if (oauthCompletionRef.current === completion) oauthCompletionRef.current = null;
+            }
+        );
+        return completion;
+    };
+
+    const completeOwnedOAuth = async (startInBrowser: boolean) => {
+        const session = oauthSessionRef.current;
+        setStatus('loading');
+        setMessage(`${t('accounts.add.tabs.oauth')}...`);
+        try {
+            await waitForOAuthCompletion(startInBrowser);
+            if (!isActiveOAuthSession(session)) return;
+            setStatus('success');
+            setMessage(`${t('accounts.add.tabs.oauth')} ${t('common.success')}!`);
+            scheduleOAuthClose(session);
+        } catch (error) {
+            if (!isActiveOAuthSession(session)) return;
+            const errorMsg = String(error);
+            setStatus('error');
+            if (errorMsg.includes('Refresh Token') || errorMsg.includes('refresh_token')) {
+                setMessage(errorMsg);
+            } else if (errorMsg.includes('Tauri') || errorMsg.toLowerCase().includes('environment') || errorMsg.includes('环境')) {
+                setMessage(t('common.environment_error', { error: errorMsg }));
+            } else {
+                setMessage(`${t('accounts.add.tabs.oauth')} ${t('common.error')}: ${errorMsg}`);
+            }
+        }
+    };
+
+    useEffect(() => {
+        oauthUrlRef.current = oauthUrl;
+        statusRef.current = status;
+        activeTabRef.current = activeTab;
+        isOpenRef.current = isOpen;
+    }, [oauthUrl, status, activeTab, isOpen]);
+
+    useEffect(() => () => {
+        mountedRef.current = false;
+        cancelOwnedOAuth();
+    }, []);
+
+    // Listen for OAuth URL
+    useEffect(() => {
+        if (!isTauri()) return;
+        let unlisten: (() => void) | undefined;
+
+        void listen('oauth-url-generated', (event) => {
+            if (isOpenRef.current && activeTabRef.current === 'oauth') {
+                setOauthUrl(event.payload as string);
+            }
+        }).then(listener => {
+            unlisten = listener;
+        });
+
+        return () => {
+            unlisten?.();
+        };
+    }, []);
+
+    // Listen for OAuth callback completion (user may open the URL manually without clicking Start)
+    useEffect(() => {
+        if (!isTauri()) return;
+        let unlisten: (() => void) | undefined;
+
+        void listen('oauth-callback-received', () => {
+            if (!isOpenRef.current || activeTabRef.current !== 'oauth' || !oauthUrlRef.current) return;
+            void completeOwnedOAuth(false);
+        }).then(listener => {
+            unlisten = listener;
+        });
+
+        return () => {
+            unlisten?.();
+        };
+    }, []);
+
+    // Pre-generate OAuth URL when dialog opens on OAuth tab (so URL is shown BEFORE "Start OAuth").
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'oauth' || oauthUrl) return;
+        const session = oauthSessionRef.current;
+        const previousPreparation = oauthPreparationRef.current;
+        const preparation = (async () => {
+            await previousPreparation?.catch(() => undefined);
+            if (!isActiveOAuthSession(session)) return;
+
+            oauthFlowOwnedRef.current = true;
+            const res = await invoke<unknown>('prepare_oauth_url');
+            const url = typeof res === 'string'
+                ? res
+                : res && typeof res === 'object' && 'url' in res && typeof res.url === 'string'
+                    ? res.url
+                    : '';
+            if (!isActiveOAuthSession(session)) {
+                void cancelOAuthLogin();
+                return;
+            }
+            if (url) setOauthUrl(url);
+        })();
+        oauthPreparationRef.current = preparation;
+        void preparation.catch((error) => {
+            if (isActiveOAuthSession(session)) console.error('Failed to prepare OAuth URL:', error);
+        });
+
+    }, [isOpen, activeTab, oauthUrl]);
+
+    // If user navigates away from OAuth tab, cancel the dialog-owned prepared flow.
+    useEffect(() => {
+        if (isOpen && activeTab !== 'oauth') {
+            cancelOwnedOAuth();
+            setOauthUrl('');
+            setOauthUrlCopied(false);
+
+        }
+    }, [isOpen, activeTab]);
 
     const handleAction = async (
         actionName: string,
@@ -274,65 +336,54 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         }
     };
 
+
     const handleOAuthWeb = async () => {
+        const session = oauthSessionRef.current;
         try {
             setStatus('loading');
             setMessage(t('accounts.add.oauth.btn_start') + '...');
-
-            // 1. 获取 URL (指向 /auth/callback)
-            const res = await invoke<any>('prepare_oauth_url');
-            const url = typeof res === 'string' ? res : res.url;
-
-            if (!url) {
-                throw new Error(t('accounts.add.oauth.error_no_url', 'OAuth URLを取得できませんでした'));
+            oauthFlowOwnedRef.current = true;
+            const res = await invoke<unknown>('prepare_oauth_url');
+            const url = typeof res === 'string' ? res : res && typeof res === 'object' && 'url' in res && typeof res.url === 'string' ? res.url : '';
+            if (!url) throw new Error(t('accounts.add.oauth.error_no_url', 'OAuth URLを取得できませんでした'));
+            if (!isActiveOAuthSession(session)) {
+                void cancelOAuthLogin();
+                return;
             }
+            setOauthUrl(url);
 
-            setOauthUrl(url); // 确保链接在 UI 中可见，方便用户手动复制
-
-            // 2. 打开新标签页 (响应用户反馈：Web 端直接使用新标签体验更好)
             const popup = window.open(url, '_blank');
-
             if (!popup) {
                 setStatus('error');
                 setMessage(t('accounts.add.oauth.popup_blocked', 'ポップアップがブロックされました'));
                 return;
             }
 
-            // 3. 监听消息
             const handleMessage = async (event: MessageEvent) => {
-                // 安全检查: 如果定义了 ORIGIN 校验更好，这里暂时检查 data type
-                if (event.data?.type === 'oauth-success') {
-                    popup.close();
-                    window.removeEventListener('message', handleMessage);
-
-                    // 4. 成功后刷新列表
-                    await fetchAccounts();
-
-                    setStatus('success');
-                    setMessage(t('accounts.add.oauth_success') || t('common.success'));
-
-                    setTimeout(() => {
-                        setIsOpen(false);
-                        resetState();
-                    }, 1500);
-                }
+                if (event.data?.type !== 'oauth-success' || !isActiveOAuthSession(session)) return;
+                clearWebOAuthWorkRef.current?.();
+                await fetchAccounts();
+                if (!isActiveOAuthSession(session)) return;
+                setStatus('success');
+                setMessage(t('accounts.add.oauth_success') || t('common.success'));
+                scheduleOAuthClose(session);
             };
-
-            window.addEventListener('message', handleMessage);
-
-            // 5. 检测窗口关闭 (用户手动关闭)
-            const timer = setInterval(() => {
-                if (popup.closed) {
-                    clearInterval(timer);
-                    window.removeEventListener('message', handleMessage);
-                    if (statusRef.current === 'loading') { // 如果还在 loading 状态就关闭了，说明取消了
-                        setStatus('idle');
-                        setMessage('');
-                    }
+            const timer = window.setInterval(() => {
+                if (!popup.closed) return;
+                clearWebOAuthWorkRef.current?.();
+                if (isActiveOAuthSession(session) && statusRef.current === 'loading') {
+                    setStatus('idle');
+                    setMessage('');
                 }
             }, 1000);
-
+            clearWebOAuthWorkRef.current = () => {
+                window.clearInterval(timer);
+                window.removeEventListener('message', handleMessage);
+                if (!popup.closed) popup.close();
+            };
+            window.addEventListener('message', handleMessage);
         } catch (error) {
+            if (!isActiveOAuthSession(session)) return;
             console.error('OAuth Web Error:', error);
             setStatus('error');
             setMessage(`${t('common.error')}: ${error}`);
@@ -341,17 +392,16 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
 
     const handleOAuth = () => {
         if (!isTauri()) {
-            handleOAuthWeb();
+            void handleOAuthWeb();
             return;
         }
-        // Default flow: opens the default browser and completes automatically.
-        // (If user opened the URL manually, completion is also triggered by oauth-callback-received.)
-        handleAction(t('accounts.add.tabs.oauth'), startOAuthLogin, { clearOauthUrl: false });
+        oauthFlowOwnedRef.current = true;
+        void completeOwnedOAuth(true);
     };
 
     const handleCompleteOAuth = () => {
-        // Manual flow: user already authorized in their preferred browser, just finish the flow.
-        handleAction(t('accounts.add.tabs.oauth'), completeOAuthLogin, { clearOauthUrl: false });
+        oauthFlowOwnedRef.current = true;
+        void completeOwnedOAuth(false);
     };
 
     const handleCopyUrl = async () => {
@@ -366,36 +416,26 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
 
     const handleManualSubmit = async () => {
         if (!manualCode.trim()) return;
-
+        const session = oauthSessionRef.current;
         setStatus('loading');
         setMessage(t('accounts.add.oauth.manual_submitting', '認可コードを送信中...'));
 
         try {
+            oauthFlowOwnedRef.current = true;
             await invoke('submit_oauth_code', { code: manualCode.trim(), state: null });
-
-            // 提交成功反馈
+            await waitForOAuthCompletion(false);
+            if (!isActiveOAuthSession(session)) return;
             setStatus('success');
-            setMessage(t('accounts.add.oauth.manual_submitted', '認可コードを送信しました。バックエンドで処理中です...'));
-
+            setMessage(`${t('accounts.add.tabs.oauth')} ${t('common.success')}!`);
             setManualCode('');
-
-            // 对齐 Web 模式下的刷新逻辑
-            if (!isTauri()) {
-                setTimeout(async () => {
-                    await fetchAccounts();
-                    setIsOpen(false);
-                    resetState();
-                }, 2000);
-            }
+            scheduleOAuthClose(session);
         } catch (error) {
-            let errStr = String(error);
-            if (errStr.includes("No active OAuth flow")) {
-                setMessage(t('accounts.add.oauth.error_no_flow'));
-                setStatus('error');
-            } else {
-                setMessage(`${t('common.error')}: ${errStr}`);
-                setStatus('error');
-            }
+            if (!isActiveOAuthSession(session)) return;
+            const errStr = String(error);
+            setStatus('error');
+            setMessage(errStr.includes('No active OAuth flow')
+                ? t('accounts.add.oauth.error_no_flow')
+                : `${t('common.error')}: ${errStr}`);
         }
     };
 
@@ -468,6 +508,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                 className="console-button console-button-primary"
                 onClick={() => {
                     console.log('AddAccountDialog button clicked');
+                    oauthSessionRef.current += 1;
                     setIsOpen(true);
                 }}
                 title={!showText ? t('accounts.add_account') : undefined}
@@ -485,13 +526,12 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                     <div data-tauri-drag-region className="fixed top-0 left-0 right-0 h-8 z-[1]" />
 
                     {/* Click outside to close */}
-                    <div className="absolute inset-0 z-[0]" onClick={() => setIsOpen(false)} />
+                    <div className="absolute inset-0 z-[0]" onClick={closeDialog} />
 
                     <div className="bg-white dark:bg-base-100 text-gray-900 dark:text-base-content rounded-2xl shadow-2xl w-full max-w-lg p-6 relative z-[10] m-4 max-h-[90vh] overflow-y-auto">
                         <h3 className="font-bold text-lg mb-4">{t('accounts.add.title')}</h3>
 
                         {/* Tab 导航 - 胶囊风格 */}
-
                         <div className="bg-gray-100 dark:bg-base-200 p-1 rounded-xl mb-6 grid grid-cols-3 gap-1">
                             <button
                                 className={`py-2 px-3 rounded-lg text-sm font-medium transition-all duration-200 ${activeTab === 'oauth'
@@ -698,13 +738,8 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                         <div className="flex gap-3 w-full mt-6">
                             <button
                                 className="flex-1 px-4 py-2.5 bg-gray-100 dark:bg-base-200 text-gray-700 dark:text-gray-300 font-medium rounded-xl hover:bg-gray-200 dark:hover:bg-base-300 transition-colors focus:outline-none focus:ring-2 focus:ring-200 dark:focus:ring-base-300"
-                                onClick={async () => {
-                                    if (status === 'loading' && activeTab === 'oauth') {
-                                        await cancelOAuthLogin();
-                                    }
-                                    setIsOpen(false);
-                                }}
-                                disabled={status === 'success'} // Only disable on success, allow cancel on loading
+                                onClick={closeDialog}
+                                disabled={status === 'success'}
                             >
                                 {t('accounts.add.btn_cancel')}
                             </button>

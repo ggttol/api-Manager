@@ -96,14 +96,13 @@ impl CavemanCleaner {
             })
             .to_string();
 
-        // 4. Restore preserved blocks
+        // 4. Restore protected blocks last so cleanup never changes their contents.
         for (idx, block) in preserved_blocks.iter().enumerate() {
             let placeholder = format!("__PRESERVED_BLOCK_{}__", idx);
             compressed_text = compressed_text.replace(&placeholder, block);
         }
 
-        // 5. Final spacing cleanup after block restoration
-        Self::cleanup_artifacts(&compressed_text)
+        compressed_text
     }
 
     /// Helper to cleanup whitespace, excess newlines, and trailing spaces
@@ -143,5 +142,15 @@ mod tests {
         // Assert critical code and structure are preserved exactly
         assert!(cleaned.contains("fn main() {"));
         assert!(cleaned.contains("println!(\"Hello World\");"));
+    }
+
+    #[test]
+    fn test_caveman_clean_preserves_protected_whitespace() {
+        let code = "```python\nif ready:\n    if nested:\n        print(\"two  spaces\")\n```";
+        let input = format!("Please keep this exact code:\n{}\nThank you.", code);
+
+        let cleaned = CavemanCleaner::clean(&input);
+
+        assert!(cleaned.contains(code));
     }
 }

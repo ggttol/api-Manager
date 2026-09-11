@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
 import { Save, AlertTriangle, Shield, ShieldCheck } from 'lucide-react';
 import { showToast } from '../common/ToastContainer';
+import { useConfigStore } from '../../stores/useConfigStore';
 
 interface IpBlacklistConfig {
     enabled: boolean;
@@ -21,6 +22,7 @@ interface SecurityMonitorConfig {
 
 export const SecurityConfig: React.FC = () => {
     const { t } = useTranslation();
+    const { updateConfig } = useConfigStore();
     const [config, setConfig] = useState<SecurityMonitorConfig | null>(null);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -46,7 +48,12 @@ export const SecurityConfig: React.FC = () => {
         if (!config) return;
         setSaving(true);
         try {
-            await invoke('update_security_config', { config });
+            // The shared writer persists and applies the complete proxy config in
+            // order with every other preference mutation.
+            await updateConfig(current => ({
+                ...current,
+                proxy: { ...current.proxy, security_monitor: config },
+            }), true);
             showToast(t('security.config.save_success'), 'success');
         } catch (e) {
             console.error('Failed to save security config', e);

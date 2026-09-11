@@ -5,6 +5,7 @@ import { showToast } from '../components/common/ToastContainer';
 import { copyToClipboard } from '../utils/clipboard';
 import { request } from '../utils/request';
 import { PageHeader } from '../components/common/ConsolePage';
+import { getProxyBaseUrl, isTauri } from '../utils/env';
 
 const content = {
     zh: {
@@ -171,8 +172,15 @@ function CodeBlock({ title, code, copyLabel, copiedLabel, disabled = false, onCo
 
 export default function ApiGuide() {
     const { t, i18n } = useTranslation();
+    const [proxyPort, setProxyPort] = useState(8045);
+    useEffect(() => {
+        if (!isTauri()) return;
+        void request<{ port: number }>('get_proxy_status').then(status => {
+            if (status.port > 0) setProxyPort(status.port);
+        }).catch(() => {});
+    }, []);
     const text = content[(i18n.resolvedLanguage || i18n.language).toLowerCase().startsWith('zh') ? 'zh' : 'en'];
-    const origin = window.location.origin;
+    const origin = getProxyBaseUrl(proxyPort);
     const insecure = window.location.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname) && !/^127\.\d+\.\d+\.\d+$/.test(window.location.hostname);
     const [example, setExample] = useState<Example>('codex');
     const [client, setClient] = useState<Client>('curl');

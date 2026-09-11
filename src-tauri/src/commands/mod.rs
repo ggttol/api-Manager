@@ -245,9 +245,6 @@ pub async fn fetch_account_quota(
     // 5. 同步到运行中的反代服务（如果已启动）
     let instance_lock = proxy_state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
-        if quota.models.iter().any(|model| model.percentage > 0) {
-            instance.token_manager.clear_rate_limit_memory(&account_id);
-        }
         let _ = instance.token_manager.reload_account(&account_id).await;
 
         // Blend TokenManager lockout state only for models that are still 0%
@@ -398,68 +395,12 @@ pub async fn save_config(
 ) -> Result<(), String> {
     modules::save_app_config(&config)?;
 
+    // Apply the persisted configuration to the retained server even when
+    // forwarding is logically stopped.
+    crate::commands::proxy::apply_saved_proxy_config(proxy_state.inner(), &config.proxy).await?;
+
     // 通知托盘配置已更新
     let _ = app.emit("config://updated", ());
-
-    // 热更新正在运行的服务
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        // 更新模型映射
-        instance.axum_server.update_mapping(&config.proxy).await;
-        // 更新仅暴露真实配额模型开关
-        instance
-            .axum_server
-            .update_only_raw_quota_models(config.proxy.only_raw_quota_models)
-            .await;
-        // 更新上游代理
-        instance
-            .axum_server
-            .update_proxy(config.proxy.upstream_proxy.clone())
-            .await;
-        // 更新安全策略 (auth)
-        instance.axum_server.update_security(&config.proxy).await;
-        // 更新 z.ai 配置
-        instance.axum_server.update_zai(&config.proxy).await;
-        // 更新实验性配置
-        instance
-            .axum_server
-            .update_experimental(&config.proxy)
-            .await;
-        // 更新调试日志配置
-        instance
-            .axum_server
-            .update_debug_logging(&config.proxy)
-            .await;
-        // [NEW] 更新 User-Agent 配置
-        instance.axum_server.update_user_agent(&config.proxy).await;
-        // 更新 Thinking Budget 配置
-        crate::proxy::update_thinking_budget_config(config.proxy.thinking_budget.clone());
-        // [NEW] 更新全局系统提示词配置
-        crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
-        // [NEW] 更新全局图像思维模式配置
-        crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
-        // [NEW] 更新全局压缩等级配置
-        crate::proxy::config::update_global_compression_level(
-            config.proxy.experimental.compression_level.clone(),
-            config.proxy.experimental.enable_usage_scaling,
-        );
-        crate::proxy::config::update_global_thresholds(
-            config.proxy.experimental.context_compression_threshold_l1,
-            config.proxy.experimental.context_compression_threshold_l2,
-            config.proxy.experimental.context_compression_threshold_l3,
-        );
-        // 更新代理池配置
-        instance
-            .axum_server
-            .update_proxy_pool(config.proxy.proxy_pool.clone())
-            .await;
-        // 更新熔断配置
-        instance
-            .token_manager
-            .update_circuit_breaker_config(config.circuit_breaker.clone())
-            .await;
-        tracing::debug!("已同步热更新反代服务配置");
-    }
 
     Ok(())
 }
@@ -922,41 +863,7 @@ pub async fn toggle_proxy_status(
         if enable { "启用" } else { "禁用" }
     ));
 
-    // 1. 读取账号文件
-    let data_dir = modules::account::get_data_dir()?;
-    let account_path = data_dir
-        .join("accounts")
-        .join(format!("{}.json", account_id));
-
-    if !account_path.exists() {
-        return Err(format!("账号文件不存在: {}", account_id));
-    }
-
-    let content =
-        std::fs::read_to_string(&account_path).map_err(|e| format!("读取账号文件失败: {}", e))?;
-
-    let mut account_json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析账号文件失败: {}", e))?;
-
-    // 2. 更新 proxy_disabled 字段
-    if enable {
-        // 启用反代
-        account_json["proxy_disabled"] = serde_json::Value::Bool(false);
-        account_json["proxy_disabled_reason"] = serde_json::Value::Null;
-        account_json["proxy_disabled_at"] = serde_json::Value::Null;
-    } else {
-        // 禁用反代
-        let now = chrono::Utc::now().timestamp();
-        account_json["proxy_disabled"] = serde_json::Value::Bool(true);
-        account_json["proxy_disabled_at"] = serde_json::Value::Number(now.into());
-        account_json["proxy_disabled_reason"] =
-            serde_json::Value::String(reason.unwrap_or_else(|| "用户手动禁用".to_string()));
-    }
-
-    // 3. 保存到磁盘
-    let json_str = serde_json::to_string_pretty(&account_json)
-        .map_err(|e| format!("序列化账号数据失败: {}", e))?;
-    std::fs::write(&account_path, json_str).map_err(|e| format!("写入账号文件失败: {}", e))?;
+    modules::toggle_proxy_status(&account_id, enable, reason.as_deref())?;
 
     modules::logger::log_info(&format!(
         "账号反代状态已更新: {} ({})",
@@ -973,13 +880,12 @@ pub async fn toggle_proxy_status(
                 let pref_id = instance.token_manager.get_preferred_account().await;
                 if pref_id.as_deref() == Some(&account_id) {
                     instance.token_manager.set_preferred_account(None).await;
-
-                    if let Ok(mut cfg) = crate::modules::config::load_app_config() {
-                        if cfg.proxy.preferred_account_id.as_deref() == Some(&account_id) {
-                            cfg.proxy.preferred_account_id = None;
-                            let _ = crate::modules::config::save_app_config(&cfg);
+                    let _ = crate::modules::config::update_app_config(|config| {
+                        if config.proxy.preferred_account_id.as_deref() == Some(&account_id) {
+                            config.proxy.preferred_account_id = None;
                         }
-                    }
+                        Ok(())
+                    });
                 }
             }
 
@@ -1023,33 +929,10 @@ pub async fn update_account_label(account_id: String, label: String) -> Result<(
         if label.is_empty() { "无" } else { &label }
     ));
 
-    // 1. 读取账号文件
-    let data_dir = modules::account::get_data_dir()?;
-    let account_path = data_dir
-        .join("accounts")
-        .join(format!("{}.json", account_id));
-
-    if !account_path.exists() {
-        return Err(format!("账号文件不存在: {}", account_id));
-    }
-
-    let content =
-        std::fs::read_to_string(&account_path).map_err(|e| format!("读取账号文件失败: {}", e))?;
-
-    let mut account_json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析账号文件失败: {}", e))?;
-
-    // 2. 更新 custom_label 字段
-    if label.is_empty() {
-        account_json["custom_label"] = serde_json::Value::Null;
-    } else {
-        account_json["custom_label"] = serde_json::Value::String(label.clone());
-    }
-
-    // 3. 保存到磁盘
-    let json_str = serde_json::to_string_pretty(&account_json)
-        .map_err(|e| format!("序列化账号数据失败: {}", e))?;
-    std::fs::write(&account_path, json_str).map_err(|e| format!("写入账号文件失败: {}", e))?;
+    modules::account::update_account_label(
+        &account_id,
+        (!label.is_empty()).then_some(label.clone()),
+    )?;
 
     modules::logger::log_info(&format!(
         "账号标签已更新: {} ({})",

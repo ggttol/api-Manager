@@ -490,11 +490,6 @@ pub async fn handle_messages(
         .await;
     }
 
-    // [Issue #703 Fix] 智能兜底判断:需要归一化模型名用于配额保护检查
-    let normalized_model =
-        crate::proxy::common::model_mapping::normalize_to_standard_id(&request.model)
-            .unwrap_or_else(|| request.model.clone());
-
     let use_zai = if !zai_enabled {
         false
     } else {
@@ -513,7 +508,7 @@ pub async fn handle_messages(
                     // [Issue #703 Fix] 智能判断:检查是否有可用的 Google 账号
                     let has_available = state
                         .token_manager
-                        .has_available_account("claude", &normalized_model)
+                        .has_available_account("claude", &request.model)
                         .await;
                     if !has_available {
                         tracing::info!(
@@ -560,12 +555,13 @@ pub async fn handle_messages(
     filter_invalid_thinking_blocks_with_family(&mut request.messages, target_family);
 
     // [New] Recover from broken tool loops (where signatures were stripped)
-    // This prevents "Assistant message must start with thinking" errors by closing the loop with synthetic messages
     if state.experimental.read().await.enable_tool_loop_recovery {
         close_tool_loop_for_thinking(&mut request.messages);
     }
 
-    let experimental_cfg = state.experimental.read().await;
+    // Snapshot configuration once. Holding a read guard across request processing can
+    // deadlock a queued writer when this handler later attempts another read.
+    let experimental_cfg = state.experimental.read().await.clone();
     let compression_level = if experimental_cfg.compression_level == "disabled" {
         if experimental_cfg.enable_usage_scaling {
             "high".to_string()
@@ -656,12 +652,11 @@ pub async fn handle_messages(
     // Google Flow 继续使用 request 对象
     // (后续代码不需要再次 filter_invalid_thinking_blocks)
 
-    // [NEW] 获取上下文控制配置
-    let experimental = state.experimental.read().await;
-    let scaling_enabled = experimental.enable_usage_scaling;
-    let threshold_l1 = experimental.context_compression_threshold_l1;
-    let threshold_l2 = experimental.context_compression_threshold_l2;
-    let threshold_l3 = experimental.context_compression_threshold_l3;
+    // The short snapshot above keeps configuration reads out of the request lifetime.
+    let scaling_enabled = experimental_cfg.enable_usage_scaling;
+    let threshold_l1 = experimental_cfg.context_compression_threshold_l1;
+    let threshold_l2 = experimental_cfg.context_compression_threshold_l2;
+    let threshold_l3 = experimental_cfg.context_compression_threshold_l3;
 
     // 获取最新一条“有意义”的消息内容（用于日志记录和后台任务检测）
     // 策略：反向遍历，首先筛选出所有角色为 "user" 的消息，然后从中找到第一条非 "Warmup" 且非空的文本消息
@@ -996,7 +991,6 @@ pub async fn handle_messages(
                     4, // Protect last 4 messages (~2 turns)
                 ) {
                     is_purified = true; // Still breaks cache, but preserves signatures
-                    compression_applied = true;
 
                     let new_raw = ContextManager::estimate_token_usage(&request_with_mapped);
                     let new_usage = calibrator.calibrate(new_raw);
@@ -1017,19 +1011,22 @@ pub async fn handle_messages(
             // ===== Layer 3: Fork Conversation + XML Summary (L3 threshold) =====
             // Ultimate optimization: Generate structured summary and start fresh conversation
             // Advantage: Completely cache-friendly (append-only), extreme compression ratio
-            if usage_ratio > threshold_l3 && !compression_applied {
+            if usage_ratio > threshold_l3 {
                 info!(
                     "[{}] [Layer-3] Context pressure ({:.1}%) exceeded threshold ({:.1}%), attempting Fork+Summary",
                     trace_id, usage_ratio * 100.0, threshold_l3 * 100.0
                 );
 
-                // Clone token_manager Arc to avoid borrow issues
+                // Clone dependencies needed by the summary request.
                 let token_manager_clone = token_manager.clone();
+                let custom_mapping = state.custom_mapping.read().await.clone();
 
                 match try_compress_with_summary(
                     &request_with_mapped,
                     &trace_id,
                     &token_manager_clone,
+                    &upstream,
+                    &custom_mapping,
                 )
                 .await
                 {
@@ -1262,9 +1259,6 @@ pub async fn handle_messages(
 
         // 成功
         if status.is_success() {
-            // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
-
             // Determine context limit based on model
             let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(
                 &request_with_mapped.model,
@@ -1409,6 +1403,30 @@ pub async fn handle_messages(
                                         break;
                                     }
                                 }
+                            }
+                        };
+                        // Feedback is only cleared when the client has consumed a
+                        // complete, error-free Claude stream. Headers and a partial
+                        // body are not evidence of a successful request.
+                        let success_token_manager = token_manager.clone();
+                        let success_account_id = account_id.clone();
+                        let combined_stream = async_stream::stream! {
+                            let mut stream = Box::pin(combined_stream);
+                            let mut saw_message_stop = false;
+                            let mut saw_error = false;
+                            while let Some(item) = stream.next().await {
+                                if let Ok(bytes) = &item {
+                                    let event = String::from_utf8_lossy(bytes);
+                                    saw_message_stop |= event.contains("event: message_stop\n");
+                                    saw_error |= event.contains("event: error\n")
+                                        || event.contains("data: {\"error\":");
+                                } else {
+                                    saw_error = true;
+                                }
+                                yield item;
+                            }
+                            if saw_message_stop && !saw_error {
+                                success_token_manager.mark_account_success(&success_account_id);
                             }
                         };
 
@@ -1640,7 +1658,10 @@ pub async fn handle_messages(
             if status_code == 429 || status_code == 529 {
                 if let Some(sid) = session_id {
                     token_manager.clear_session_binding(sid);
-                    debug!("[{}] Unbound session {} from account {} due to status {}", trace_id, sid, email, status_code);
+                    debug!(
+                        "[{}] Unbound session {} from account {} due to status {}",
+                        trace_id, sid, email, status_code
+                    );
                 }
             }
         }
@@ -1651,17 +1672,10 @@ pub async fn handle_messages(
         let lower_err = error_text.to_lowercase();
         if status_code == 400
             && !retried_without_thinking
-            && (lower_err.contains("invalid thought signature")
-                || lower_err.contains("invalid `signature`")
-                || lower_err.contains("invalid signature")
-                || lower_err.contains("thought_signature")
-                || lower_err.contains("thoughtsignature")
-                || lower_err.contains("thinking.signature: field required")
-                || lower_err.contains("thinking.thinking: field required")
-                || lower_err.contains("thinking.signature")
-                || lower_err.contains("thinking.thinking")
-                || lower_err.contains("corrupted thought signature")
-                || lower_err.contains("failed to deserialise")
+            && (crate::proxy::handlers::common::is_invalid_signature_error(
+                status_code,
+                &error_text,
+            ) || lower_err.contains("failed to deserialise")
                 || lower_err.contains("thinking block")
                 || lower_err.contains("found `text`")
                 || lower_err.contains("found 'text'")
@@ -1895,7 +1909,8 @@ pub async fn handle_messages(
             last_status
         };
 
-        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
+        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error)
+        {
             if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
                 headers.insert(axum::http::header::RETRY_AFTER, val);
             }
@@ -1917,7 +1932,8 @@ pub async fn handle_messages(
                 headers.insert("X-Mapped-Model", v);
             }
         }
-        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
+        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error)
+        {
             if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
                 headers.insert(axum::http::header::RETRY_AFTER, val);
             }
@@ -2340,17 +2356,24 @@ async fn call_gemini_sync(
     model: &str,
     request: &ClaudeRequest,
     token_manager: &Arc<crate::proxy::TokenManager>,
+    upstream: &crate::proxy::upstream::client::UpstreamClient,
+    custom_mapping: &std::collections::HashMap<String, String>,
     trace_id: &str,
 ) -> Result<String, String> {
-    // Get token and transform request
+    // Resolve virtual background names through the same routing table and send the
+    // v1internal envelope through the account-routed shared upstream client.
+    let resolved_model =
+        crate::proxy::common::model_mapping::resolve_model_route(model, custom_mapping);
     let (access_token, project_id, _, account_id, _wait_ms) = token_manager
-        .get_token("gemini", false, None, model)
+        .get_token("gemini", false, None, &resolved_model)
         .await
         .map_err(|e| format!("Failed to get account: {}", e))?;
 
+    let mut summary_request = request.clone();
+    summary_request.model = resolved_model.clone();
     let token_obj = token_manager.get_token_by_id(&account_id);
     let gemini_body = crate::proxy::mappers::claude::transform_claude_request_in(
-        request,
+        &summary_request,
         &project_id,
         false,
         Some(account_id.as_str()),
@@ -2359,22 +2382,21 @@ async fn call_gemini_sync(
     )
     .map_err(|e| format!("Failed to transform request: {}", e))?;
 
-    // Call Gemini API
-    let upstream_url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-        model
+    debug!(
+        "[{}] Calling routed Gemini model {} for summary",
+        trace_id, resolved_model
     );
-
-    debug!("[{}] Calling Gemini API: {}", trace_id, model);
-
-    let response = reqwest::Client::new()
-        .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&gemini_body)
-        .send()
+    let response = upstream
+        .call_v1_internal(
+            "generateContent",
+            &access_token,
+            gemini_body,
+            None,
+            Some(account_id.as_str()),
+        )
         .await
-        .map_err(|e| format!("API call failed: {}", e))?;
+        .map_err(|e| format!("API call failed: {}", e))?
+        .response;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -2388,8 +2410,8 @@ async fn call_gemini_sync(
         .json()
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
+    let gemini_response = crate::proxy::mappers::gemini::unwrap_response(&gemini_response);
 
-    // Extract text from response
     gemini_response
         .get("candidates")
         .and_then(|c| c.get(0))
@@ -2398,7 +2420,7 @@ async fn call_gemini_sync(
         .and_then(|p| p.get(0))
         .and_then(|p| p.get("text"))
         .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
+        .map(str::to_owned)
         .ok_or_else(|| "Failed to extract text from response".to_string())
 }
 
@@ -2420,6 +2442,8 @@ async fn try_compress_with_summary(
     original_request: &ClaudeRequest,
     trace_id: &str,
     token_manager: &Arc<crate::proxy::TokenManager>,
+    upstream: &crate::proxy::upstream::client::UpstreamClient,
+    custom_mapping: &std::collections::HashMap<String, String>,
 ) -> Result<ClaudeRequest, String> {
     info!(
         "[{}] [Layer-3] Starting context compression with XML summary",
@@ -2465,6 +2489,8 @@ async fn try_compress_with_summary(
         temperature: Some(0.3),
         tools: None,
         thinking: None,
+        tool_choice: None,
+        stop_sequences: None,
         metadata: None,
         top_p: None,
         top_k: None,
@@ -2483,6 +2509,8 @@ async fn try_compress_with_summary(
         INTERNAL_BACKGROUND_TASK,
         &summary_request,
         token_manager,
+        upstream,
+        custom_mapping,
         trace_id,
     )
     .await?;
@@ -2547,6 +2575,8 @@ async fn try_compress_with_summary(
         top_p: original_request.top_p,
         top_k: original_request.top_k,
         output_config: original_request.output_config.clone(),
+        tool_choice: original_request.tool_choice.clone(),
+        stop_sequences: original_request.stop_sequences.clone(),
         size: original_request.size.clone(),
         quality: original_request.quality.clone(),
     })

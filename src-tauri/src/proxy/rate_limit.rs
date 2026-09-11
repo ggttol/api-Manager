@@ -107,33 +107,29 @@ impl RateLimitTracker {
     /// 支持检查账号级和模型级锁
     pub fn get_remaining_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
         let now = SystemTime::now();
+        let mut longest = Duration::ZERO;
 
-        // 1. 检查全局账号锁
-        if let Some(info) = self.limits.get(account_id) {
-            if info.reset_time > now {
-                return info
-                    .reset_time
-                    .duration_since(now)
-                    .unwrap_or(Duration::from_secs(0))
-                    .as_secs();
-            }
-        }
-
-        // 2. 如果指定了模型，检查模型级锁
-        if let Some(m) = model {
-            let key = self.get_limit_key(account_id, Some(m));
+        let mut consider = |key: String| {
             if let Some(info) = self.limits.get(&key) {
-                if info.reset_time > now {
-                    return info
-                        .reset_time
-                        .duration_since(now)
-                        .unwrap_or(Duration::from_secs(0))
-                        .as_secs();
+                if let Ok(remaining) = info.reset_time.duration_since(now) {
+                    longest = longest.max(remaining);
                 }
             }
+        };
+
+        consider(account_id.to_string());
+        if let Some(model) = model {
+            consider(self.get_limit_key(account_id, Some(model)));
         }
 
-        0
+        // A positive sub-second lock must remain unavailable until its deadline.
+        if longest.is_zero() {
+            0
+        } else {
+            longest
+                .as_secs()
+                .saturating_add(u64::from(longest.subsec_nanos() > 0))
+        }
     }
 
     /// 标记账号请求成功，重置连续失败计数
@@ -499,7 +495,12 @@ impl RateLimitTracker {
         };
 
         let mut retry_sec = retry_sec;
-        let max_allowed_lockout = backoff_steps.iter().copied().max().unwrap_or(MAX_LOCKOUT_SECONDS).max(MAX_LOCKOUT_SECONDS);
+        let max_allowed_lockout = backoff_steps
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(MAX_LOCKOUT_SECONDS)
+            .max(MAX_LOCKOUT_SECONDS);
         if retry_sec > max_allowed_lockout && !preserve_long_image_quota {
             tracing::info!(
                 "Capping retry lockout time for {} from {}s to {}s (max backoff limit)",
@@ -1057,13 +1058,58 @@ mod tests {
         let target_time = SystemTime::now() + Duration::from_secs(5 * 3600); // 5 hours
 
         // Capped: should be capped to 300s
-        tracker.set_lockout_until_with_cap("acc_cap", target_time, RateLimitReason::QuotaExhausted, None, true);
+        tracker.set_lockout_until_with_cap(
+            "acc_cap",
+            target_time,
+            RateLimitReason::QuotaExhausted,
+            None,
+            true,
+        );
         let wait_capped = tracker.get_remaining_wait("acc_cap", None);
         assert!(wait_capped <= 300 && wait_capped >= 290);
 
         // Uncapped (Zero Quota): should retain full 5 hours duration
-        tracker.set_lockout_until_with_cap("acc_uncap", target_time, RateLimitReason::QuotaExhausted, None, false);
+        tracker.set_lockout_until_with_cap(
+            "acc_uncap",
+            target_time,
+            RateLimitReason::QuotaExhausted,
+            None,
+            false,
+        );
         let wait_uncapped = tracker.get_remaining_wait("acc_uncap", None);
         assert!(wait_uncapped > 300 && wait_uncapped <= 5 * 3600);
+    }
+    #[test]
+    fn task_remaining_wait_uses_longest_lock_and_rounds_up() {
+        let tracker = RateLimitTracker::new();
+        let now = SystemTime::now();
+        tracker.set_lockout_until_with_cap(
+            "acc",
+            now + Duration::from_millis(500),
+            RateLimitReason::RateLimitExceeded,
+            None,
+            false,
+        );
+        tracker.set_lockout_until_with_cap(
+            "acc",
+            now + Duration::from_secs(3600),
+            RateLimitReason::QuotaExhausted,
+            Some("image".to_string()),
+            false,
+        );
+
+        assert!(tracker.is_rate_limited("acc", Some("image")));
+        assert!(tracker.get_remaining_wait("acc", Some("image")) >= 3599);
+
+        let short_only = RateLimitTracker::new();
+        short_only.set_lockout_until_with_cap(
+            "short",
+            now + Duration::from_millis(500),
+            RateLimitReason::RateLimitExceeded,
+            None,
+            false,
+        );
+        assert_eq!(short_only.get_remaining_wait("short", None), 1);
+        assert!(short_only.is_rate_limited("short", None));
     }
 }

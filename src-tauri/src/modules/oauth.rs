@@ -730,10 +730,15 @@ pub async fn ensure_fresh_token(
     let oauth_client_key =
         normalize_refreshed_oauth_client_key(current_token, response.oauth_client_key.clone());
 
-    // Construct new TokenData
+    // Keep a rotated refresh token when supplied; Google commonly omits this
+    // field for non-rotating refreshes.
+    let refresh_token = response
+        .refresh_token
+        .filter(|token| !token.trim().is_empty())
+        .unwrap_or_else(|| current_token.refresh_token.clone());
     Ok(crate::models::TokenData::new(
         response.access_token,
-        current_token.refresh_token.clone(), // refresh_token may not be returned on refresh
+        refresh_token,
         response.expires_in,
         current_token.email.clone(),
         current_token.project_id.clone(), // Keep original project_id

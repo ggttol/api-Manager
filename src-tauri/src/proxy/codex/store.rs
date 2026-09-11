@@ -41,6 +41,9 @@ pub(super) struct Record {
     // In-flight observation CAS only; no request survives a manager restart.
     #[serde(skip)]
     pub quota_version: u64,
+    // Explicit enable/disable changes must win over asynchronous verification.
+    #[serde(default)]
+    pub policy_version: u64,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -95,6 +98,20 @@ fn private_read(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    // POSIX requires syncing the containing directory for rename/link durability. Windows does
+    // not support FlushFileBuffers for directories; the replacement file itself is synced first.
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 impl Vault {
     pub fn open(data_dir: PathBuf) -> Result<(Self, Accounts), String> {
         let dir = data_dir.join("codex");
@@ -141,8 +158,7 @@ impl Vault {
                 let _ = fs::remove_file(&temporary);
                 match result {
                     Ok(()) => {
-                        File::open(&dir)
-                            .and_then(|file| file.sync_all())
+                        sync_directory(&dir)
                             .map_err(|_| "Cannot sync Codex credential directory")?;
                         key.to_vec()
                     }
@@ -216,7 +232,7 @@ impl Vault {
             file.write_all(&bytes)?;
             file.sync_all()?;
             fs::rename(&temporary, self.dir.join("accounts.enc.json"))?;
-            File::open(&self.dir)?.sync_all()?;
+            sync_directory(&self.dir)?;
             Ok(())
         })();
         if result.is_err() {
@@ -253,6 +269,7 @@ mod tests {
             },
             tokens,
             verified: true,
+            policy_version: 0,
             quota_version: 0,
         };
         let dto = serde_json::to_string(&record.account).unwrap();
@@ -263,8 +280,13 @@ mod tests {
         let file = temp.path().join("codex/accounts.enc.json");
         let ciphertext = fs::read_to_string(&file).unwrap();
         assert!(!ciphertext.contains("secret-"));
-        let (_, restored) = Vault::open(temp.path().to_path_buf()).unwrap();
+        let (reopened, mut restored) = Vault::open(temp.path().to_path_buf()).unwrap();
         assert_eq!(restored.accounts[0].tokens.refresh_token, "secret-refresh");
+        restored.accounts[0].account.label = "Updated account".into();
+        reopened.save(&restored).unwrap();
+        let (_, restored_again) = Vault::open(temp.path().to_path_buf()).unwrap();
+        assert_eq!(restored_again.accounts[0].account.label, "Updated account");
+        let ciphertext = fs::read_to_string(&file).unwrap();
         let mut envelope: Envelope = serde_json::from_str(&ciphertext).unwrap();
         let mut bytes = STANDARD.decode(&envelope.ciphertext).unwrap();
         bytes[0] ^= 1;

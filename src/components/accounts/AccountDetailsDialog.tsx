@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { X, Clock, AlertCircle, Bot } from 'lucide-react';
 import { createPortal } from 'react-dom';
 import { Account } from '../../types/account';
@@ -14,6 +14,10 @@ interface AccountDetailsDialogProps {
 export default function AccountDetailsDialog({ account, onClose }: AccountDetailsDialogProps) {
     const { t } = useTranslation();
     const [activeTab, setActiveTab] = useState<'basic' | 'detailed'>('basic');
+    useEffect(() => {
+        setActiveTab('basic');
+    }, [account?.id]);
+
     if (!account) return null;
 
     return createPortal(
@@ -102,7 +106,7 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                         )}
                     </div>
 
-                    {activeTab === 'basic' && (
+                    {(activeTab === 'basic' || !account.quota?.quota_groups?.length) && (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             {(() => {
                                 const uniqueLabels = new Set<string>();

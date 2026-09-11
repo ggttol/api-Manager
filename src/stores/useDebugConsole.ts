@@ -82,7 +82,7 @@ export const useDebugConsole = create<DebugConsoleState>((set, get) => ({
     startPolling: () => {
         if (get().pollInterval) return;
         const interval = window.setInterval(async () => {
-            if (get().isEnabled && get().isOpen) {
+            if (get().isEnabled) {
                 await get().loadLogs();
             }
         }, 2000);

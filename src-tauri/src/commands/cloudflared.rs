@@ -27,6 +27,15 @@ impl CloudflaredState {
     }
 }
 
+/// Stops a managed tunnel during application shutdown without initializing one.
+pub async fn stop_cloudflared_for_shutdown(state: &CloudflaredState) -> Result<(), String> {
+    let lock = state.manager.read().await;
+    if let Some(manager) = lock.as_ref() {
+        manager.stop().await?;
+    }
+    Ok(())
+}
+
 /// 检查cloudflared是否已安装
 #[tauri::command]
 pub async fn cloudflared_check(

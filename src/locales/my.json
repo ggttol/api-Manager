@@ -1006,8 +1006,8 @@
     "placeholder": "Masukkan kata laluan pengurusan atau Kunci API",
     "btn_login": "Sahkan dan Masuk",
     "note": "Nota: Jika kata laluan pengurusan berasingan ditetapkan, sila masukkan; jika tidak, masukkan API_KEY.",
-    "lookup_hint": "Jika terlupa, jalankan docker logs antigravity-manager untuk mencari Current API Key atau Web UI Password",
-    "config_hint": "Atau jalankan grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json untuk melihat."
+    "lookup_hint": "Jika terlupa, semak WEB_PASSWORD atau API_KEY (termasuk varian ABV_) dalam tetapan penggunaan anda. Log permulaan tidak memaparkan kelayakan akses.",
+    "config_hint": "Jika tiada pemboleh ubah persekitaran yang mengatasi tetapan, semak proxy.admin_password atau proxy.api_key dalam gui_config.json di direktori data. Jangan kongsi fail ini."
   },
   "token_stats": {
     "title": "Statistik Penggunaan Token",

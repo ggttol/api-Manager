@@ -6,24 +6,9 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::modules::security_db::{
-        self, add_to_blacklist, add_to_whitelist, get_blacklist, get_whitelist, init_db,
-        remove_from_blacklist, remove_from_whitelist,
+        self, add_to_blacklist, add_to_whitelist, get_blacklist, init_db, test_db_guard,
     };
     use std::time::Duration;
-
-    /// 辅助函数：清理测试环境
-    fn cleanup_test_data() {
-        if let Ok(entries) = get_blacklist() {
-            for entry in entries {
-                let _ = remove_from_blacklist(&entry.id);
-            }
-        }
-        if let Ok(entries) = get_whitelist() {
-            for entry in entries {
-                let _ = remove_from_whitelist(&entry.id);
-            }
-        }
-    }
 
     // ============================================================================
     // 集成测试场景 1：黑名单阻止请求
@@ -37,8 +22,7 @@ mod integration_tests {
     /// 3. 响应体包含封禁原因
     #[test]
     fn test_scenario_blacklist_blocks_request() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 添加测试 IP 到黑名单
         let entry = add_to_blacklist(
@@ -58,8 +42,6 @@ mod integration_tests {
         // 这里验证数据层正确性
         let is_blocked = security_db::is_ip_in_blacklist("192.168.100.100").unwrap();
         assert!(is_blocked, "IP should be blocked");
-
-        cleanup_test_data();
     }
 
     // ============================================================================
@@ -74,8 +56,7 @@ mod integration_tests {
     /// 3. 请求应该被允许（白名单优先）
     #[test]
     fn test_scenario_whitelist_priority() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 添加 IP 到黑名单
         let _ = add_to_blacklist(
@@ -95,8 +76,6 @@ mod integration_tests {
         // 在实际中间件中，whitelist_priority=true 时，会先检查白名单
         // 如果在白名单中，则跳过黑名单检查
         // 这里只验证数据正确性，中间件逻辑由 ip_filter.rs 保证
-
-        cleanup_test_data();
     }
 
     // ============================================================================
@@ -111,8 +90,7 @@ mod integration_tests {
     /// 3. 请求应该被允许
     #[test]
     fn test_scenario_temporary_ban_expiration() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 获取当前时间戳
         let now = std::time::SystemTime::now()
@@ -122,17 +100,15 @@ mod integration_tests {
 
         // 添加已过期的临时封禁
         let _ = add_to_blacklist(
-            "expired.ban.test",
+            "198.51.100.40",
             Some("Temporary ban - should be expired"),
             Some(now - 60), // 1分钟前过期
             "test",
         );
 
         // 查询时应该触发过期清理
-        let is_blocked = security_db::is_ip_in_blacklist("expired.ban.test").unwrap();
+        let is_blocked = security_db::is_ip_in_blacklist("198.51.100.40").unwrap();
         assert!(!is_blocked, "Expired ban should not block");
-
-        cleanup_test_data();
     }
 
     // ============================================================================
@@ -147,8 +123,7 @@ mod integration_tests {
     /// 3. 192.168.2.x 的请求正常通过
     #[test]
     fn test_scenario_cidr_subnet_blocking() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 封禁整个子网
         let _ = add_to_blacklist(
@@ -171,8 +146,6 @@ mod integration_tests {
             let is_blocked = security_db::is_ip_in_blacklist(&ip).unwrap();
             assert!(!is_blocked, "IP {} should NOT be blocked", ip);
         }
-
-        cleanup_test_data();
     }
 
     // ============================================================================
@@ -189,8 +162,7 @@ mod integration_tests {
     ///    - 剩余封禁时间（如果是临时）
     #[test]
     fn test_scenario_ban_message_details() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -199,14 +171,14 @@ mod integration_tests {
 
         // 添加临时封禁（2小时后过期）
         let _ = add_to_blacklist(
-            "temp.ban.message",
+            "198.51.100.41",
             Some("Rate limit exceeded"),
             Some(now + 7200), // 2小时后
             "rate_limiter",
         );
 
         // 获取封禁详情
-        let entry = security_db::get_blacklist_entry_for_ip("temp.ban.message")
+        let entry = security_db::get_blacklist_entry_for_ip("198.51.100.41")
             .unwrap()
             .unwrap();
 
@@ -218,8 +190,6 @@ mod integration_tests {
             remaining > 0 && remaining <= 7200,
             "Should have ~2h remaining"
         );
-
-        cleanup_test_data();
     }
 
     // ============================================================================
@@ -234,13 +204,12 @@ mod integration_tests {
     /// 3. 访问日志记录：IP、时间、状态(403)、封禁原因
     #[test]
     fn test_scenario_blocked_request_logging() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 模拟保存被阻止的访问日志
         let log = security_db::IpAccessLog {
             id: uuid::Uuid::new_v4().to_string(),
-            client_ip: "blocked.request.test".to_string(),
+            client_ip: "198.51.100.42".to_string(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -261,7 +230,7 @@ mod integration_tests {
 
         // 验证日志可以检索
         let logs = security_db::get_ip_access_logs(10, 0, None, true).unwrap();
-        let found = logs.iter().any(|l| l.client_ip == "blocked.request.test");
+        let found = logs.iter().any(|l| l.client_ip == "198.51.100.42");
         assert!(found, "Blocked request should be logged");
 
         let _ = security_db::clear_ip_access_logs();
@@ -278,12 +247,11 @@ mod integration_tests {
     /// 2. 与没有安全检查的基线相比，延迟增加 < 10ms
     #[test]
     fn test_scenario_performance_impact() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 添加一些黑名单条目
         for i in 0..50 {
-            let _ = add_to_blacklist(&format!("perf.test.{}", i), None, None, "test");
+            let _ = add_to_blacklist(&format!("198.18.10.{}", i + 1), None, None, "test");
         }
 
         // 添加一些 CIDR 规则
@@ -311,8 +279,6 @@ mod integration_tests {
             avg_per_check < Duration::from_millis(5),
             "Security check should be fast"
         );
-
-        cleanup_test_data();
     }
 
     // ============================================================================
@@ -326,21 +292,22 @@ mod integration_tests {
     /// 2. 数据仍然存在
     #[test]
     fn test_scenario_data_persistence() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         // 添加数据
-        let _ = add_to_blacklist("persist.test.ip", Some("Persistence test"), None, "test");
-        let _ = add_to_whitelist("persist.white.ip", Some("Persistence test"));
+        let _ = add_to_blacklist("198.51.100.43", Some("Persistence test"), None, "test");
+        let _ = add_to_whitelist("198.51.100.44", Some("Persistence test"));
 
         // 重新初始化（实际上只是验证数据仍然可读）
-        let _ = init_db();
+        let result = init_db();
+        assert!(
+            result.is_ok(),
+            "Reinitializing the test database should succeed"
+        );
 
         // 验证数据仍然存在
-        assert!(security_db::is_ip_in_blacklist("persist.test.ip").unwrap());
-        assert!(security_db::is_ip_in_whitelist("persist.white.ip").unwrap());
-
-        cleanup_test_data();
+        assert!(security_db::is_ip_in_blacklist("198.51.100.43").unwrap());
+        assert!(security_db::is_ip_in_whitelist("198.51.100.44").unwrap());
     }
 }
 
@@ -351,39 +318,29 @@ mod integration_tests {
 #[cfg(test)]
 mod stress_tests {
     use crate::modules::security_db::{
-        add_to_blacklist, clear_ip_access_logs, get_blacklist, init_db, is_ip_in_blacklist,
-        remove_from_blacklist, save_ip_access_log, IpAccessLog,
+        add_to_blacklist, get_blacklist, is_ip_in_blacklist, remove_from_blacklist,
+        save_ip_access_log, test_db_guard, IpAccessLog,
     };
     use std::thread;
     use std::time::{Duration, Instant};
 
-    /// 辅助函数：清理测试环境
-    fn cleanup_test_data() {
-        if let Ok(entries) = get_blacklist() {
-            for entry in entries {
-                let _ = remove_from_blacklist(&entry.id);
-            }
-        }
-        let _ = clear_ip_access_logs();
-    }
-
     /// 压力测试：大量黑名单条目
     #[test]
     fn stress_test_large_blacklist() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         let count = 500;
 
         // 批量添加
         let start = Instant::now();
         for i in 0..count {
-            let _ = add_to_blacklist(
-                &format!("stress.{}.{}.{}.{}", i / 256, (i / 16) % 16, i % 16, i),
+            add_to_blacklist(
+                &format!("198.18.{}.{}", (i / 256) % 256, i % 256),
                 None,
                 None,
                 "stress",
-            );
+            )
+            .expect("add stress blacklist entry");
         }
         let add_duration = start.elapsed();
         println!("Added {} entries in {:?}", count, add_duration);
@@ -391,13 +348,7 @@ mod stress_tests {
         // 随机查找测试
         let start = Instant::now();
         for i in 0..100 {
-            let _ = is_ip_in_blacklist(&format!(
-                "stress.{}.{}.{}.{}",
-                i / 256,
-                (i / 16) % 16,
-                i % 16,
-                i
-            ));
+            let _ = is_ip_in_blacklist(&format!("198.18.{}.{}", (i / 256) % 256, i % 256));
         }
         let lookup_duration = start.elapsed();
         println!("100 lookups in large blacklist took {:?}", lookup_duration);
@@ -407,15 +358,12 @@ mod stress_tests {
             lookup_duration < Duration::from_secs(1),
             "Lookups should be reasonably fast even with large blacklist"
         );
-
-        cleanup_test_data();
     }
 
     /// 压力测试：大量访问日志
     #[test]
     fn stress_test_access_logging() {
-        let _ = init_db();
-        let _ = clear_ip_access_logs();
+        let _db = test_db_guard().expect("isolated security database");
 
         let count = 1000;
         let now = std::time::SystemTime::now()
@@ -428,7 +376,7 @@ mod stress_tests {
         for i in 0..count {
             let log = IpAccessLog {
                 id: uuid::Uuid::new_v4().to_string(),
-                client_ip: format!("log.stress.{}", i % 100),
+                client_ip: format!("198.51.100.{}", (i % 100) + 100),
                 timestamp: now,
                 method: Some("POST".to_string()),
                 path: Some("/v1/messages".to_string()),
@@ -440,7 +388,7 @@ mod stress_tests {
                 block_reason: None,
                 username: None,
             };
-            let _ = save_ip_access_log(&log);
+            save_ip_access_log(&log).expect("save stress access log");
         }
         let write_duration = start.elapsed();
         println!("Wrote {} access logs in {:?}", count, write_duration);
@@ -450,51 +398,38 @@ mod stress_tests {
             write_duration < Duration::from_secs(10),
             "Access log writing should be reasonably fast"
         );
-
-        let _ = clear_ip_access_logs();
     }
 
     /// 压力测试：并发操作
     #[test]
     fn stress_test_concurrent_operations() {
-        let _ = init_db();
-        cleanup_test_data();
+        let _db = test_db_guard().expect("isolated security database");
 
         let thread_count = 5;
         let ops_per_thread = 20;
 
         let handles: Vec<_> = (0..thread_count)
             .map(|t| {
-                thread::spawn(move || {
+                thread::spawn(move || -> Result<(), String> {
                     for i in 0..ops_per_thread {
-                        // 每个线程添加-查询-删除
-                        let ip = format!("concurrent.{}.{}", t, i);
-                        if let Ok(entry) = add_to_blacklist(&ip, None, None, "concurrent") {
-                            let _ = is_ip_in_blacklist(&ip);
-                            let _ = remove_from_blacklist(&entry.id);
-                        }
+                        let ip = format!("198.18.{}.{}", t, i + 1);
+                        let entry = add_to_blacklist(&ip, None, None, "concurrent")?;
+                        assert!(is_ip_in_blacklist(&ip)?);
+                        remove_from_blacklist(&entry.id)?;
                     }
+                    Ok(())
                 })
             })
             .collect();
 
         // 等待所有线程完成
         for handle in handles {
-            handle.join().expect("Thread should not panic");
+            handle
+                .join()
+                .expect("Thread should not panic")
+                .expect("concurrent security operation should succeed");
         }
 
-        // 验证没有遗留数据
-        let remaining = get_blacklist().unwrap();
-        let concurrent_remaining: Vec<_> = remaining
-            .iter()
-            .filter(|e| e.ip_pattern.starts_with("concurrent."))
-            .collect();
-
-        assert!(
-            concurrent_remaining.is_empty(),
-            "All concurrent test data should be cleaned up"
-        );
-
-        cleanup_test_data();
+        assert!(get_blacklist().expect("read blacklist").is_empty());
     }
 }

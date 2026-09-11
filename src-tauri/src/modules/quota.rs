@@ -333,16 +333,18 @@ pub async fn fetch_quota_with_cache(
                                 "Quota API {} returned {}, falling back to next endpoint",
                                 ep_url, status
                             ));
-                            last_error =
-                                Some(AppError::Unknown(format!("HTTP {} - {}", status, text)));
+                            last_error = Some(AppError::Network(
+                                format!("HTTP {} - {}", status, text),
+                                Some(status.as_u16()),
+                            ));
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             break; // Break the inner retry loop, continue to next endpoint
                         }
 
-                        return Err(AppError::Unknown(format!(
-                            "API Error: {} - {}",
-                            status, text
-                        )));
+                        return Err(AppError::Network(
+                            format!("API Error: {} - {}", status, text),
+                            Some(status.as_u16()),
+                        ));
                     }
 
                     if ep_idx > 0 {
@@ -553,38 +555,36 @@ pub async fn fetch_all_quotas(
 pub async fn get_valid_token_for_warmup(
     account: &crate::models::account::Account,
 ) -> Result<(String, String), String> {
-    let mut account = account.clone();
+    let account_snapshot = account.clone();
 
-    // Check and auto-refresh token
-    let new_token =
-        crate::modules::oauth::ensure_fresh_token(&account.token, Some(&account.id)).await?;
+    // Check and auto-refresh token without holding the account-file lock.
+    let new_token = crate::modules::oauth::ensure_fresh_token(
+        &account_snapshot.token,
+        Some(&account_snapshot.id),
+    )
+    .await?;
 
-    // If token changed (meant refreshed), save it
-    if new_token.access_token != account.token.access_token {
-        account.token = new_token;
-        if let Err(e) = crate::modules::account::save_account(&account) {
-            crate::modules::logger::log_warn(&format!(
-                "[Warmup] Failed to save refreshed token: {}",
-                e
-            ));
-        } else {
-            crate::modules::logger::log_info(&format!(
-                "[Warmup] Successfully refreshed and saved new token for {}",
-                account.email
-            ));
-        }
+    let access_token = new_token.access_token.clone();
+    if new_token.access_token != account_snapshot.token.access_token {
+        // Merge only the refreshed token into the latest persisted account. A
+        // deleted account stays deleted rather than being recreated from the
+        // stale warmup snapshot.
+        crate::modules::account::update_existing_account(&account_snapshot.id, |latest| {
+            latest.token = new_token;
+        })
+        .map_err(|error| format!("[Warmup] Failed to save refreshed token: {}", error))?;
     }
 
     // Fetch project_id
     let (project_id, _) = fetch_project_id(
-        &account.token.access_token,
-        &account.email,
-        Some(&account.id),
+        &access_token,
+        &account_snapshot.email,
+        Some(&account_snapshot.id),
     )
     .await;
     let final_pid = project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
 
-    Ok((account.token.access_token, final_pid))
+    Ok((access_token, final_pid))
 }
 
 /// Send warmup request via proxy internal API
@@ -596,10 +596,10 @@ pub async fn warmup_model_directly(
     percentage: i32,
     _account_id: Option<&str>,
 ) -> bool {
-    // Get currently configured proxy port
-    let port = config::load_app_config()
-        .map(|c| c.proxy.port)
-        .unwrap_or(8045);
+    let proxy_config = config::load_app_config()
+        .map(|config| config.proxy)
+        .unwrap_or_default();
+    let port = proxy_config.port;
 
     let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
     let body = json!({
@@ -616,12 +616,13 @@ pub async fn warmup_model_directly(
         .no_proxy()
         .build()
         .unwrap_or_else(|_| rquest::Client::new());
-    let resp = client
+    let mut request = client
         .post(&warmup_url)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await;
+        .header("Content-Type", "application/json");
+    if !proxy_config.api_key.is_empty() {
+        request = request.bearer_auth(&proxy_config.api_key);
+    }
+    let resp = request.json(&body).send().await;
 
     match resp {
         Ok(response) => {

@@ -1,3 +1,4 @@
+use crate::utils::atomic_file::{lock_client_config, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -211,11 +212,16 @@ impl CliApp {
                 },
             ],
             CliApp::Codex => {
-                let codex_dir = if home.join(".chatgpt").exists() || !home.join(".codex").exists() {
-                    home.join(".chatgpt")
-                } else {
-                    home.join(".codex")
-                };
+                let codex_dir = std::env::var_os("CODEX_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        let modern = home.join(".codex");
+                        if modern.exists() || !home.join(".chatgpt").exists() {
+                            modern
+                        } else {
+                            home.join(".chatgpt")
+                        }
+                    });
                 vec![
                     CliConfigFile {
                         name: "auth.json".to_string(),
@@ -226,7 +232,7 @@ impl CliApp {
                         path: codex_dir.join("config.toml"),
                     },
                 ]
-            },
+            }
             CliApp::Gemini => vec![
                 CliConfigFile {
                     name: ".env".to_string(),
@@ -501,15 +507,97 @@ pub fn get_sync_status(app: &CliApp, proxy_url: &str) -> (bool, bool, Option<Str
 
     (all_synced, has_backup, current_base_url)
 }
+fn backup_path(file: &CliConfigFile) -> PathBuf {
+    file.path
+        .with_file_name(format!("{}.antigravity.bak", file.name))
+}
+
+fn created_marker_path(file: &CliConfigFile) -> PathBuf {
+    file.path
+        .with_file_name(format!("{}.antigravity-manager.created", file.name))
+}
+
+fn validate_existing_config(app: &CliApp, file: &CliConfigFile) -> Result<(), String> {
+    if !file.path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&file.path)
+        .map_err(|error| format!("无法读取 {}: {error}", file.name))?;
+    if matches!(app, CliApp::Gemini) && file.name == ".env" {
+        return Ok(());
+    }
+    if matches!(app, CliApp::Codex) && file.name == "config.toml" {
+        let document = content
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| format!("{} 不是有效 TOML: {error}", file.name))?;
+        for (parent, child) in [("model_providers", Some("custom")), ("features", None)] {
+            let Some(item) = document.get(parent) else {
+                continue;
+            };
+            let table = item.as_table().ok_or_else(|| {
+                format!(
+                    "{file_name} 的 {parent} 必须是 TOML 表",
+                    file_name = file.name
+                )
+            })?;
+            if let Some(child) = child {
+                if let Some(item) = table.get(child) {
+                    item.as_table().ok_or_else(|| {
+                        format!(
+                            "{file_name} 的 {parent}.{child} 必须是 TOML 表",
+                            file_name = file.name
+                        )
+                    })?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let json: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("{} 不是有效 JSON: {error}", file.name))?;
+    let root = json
+        .as_object()
+        .ok_or_else(|| format!("{} 的根节点必须是 JSON 对象", file.name))?;
+    let require_object =
+        |parent: &serde_json::Map<String, Value>, key: &str| -> Result<(), String> {
+            if let Some(value) = parent.get(key) {
+                value
+                    .as_object()
+                    .ok_or_else(|| format!("{} 的 {key} 必须是 JSON 对象", file.name))?;
+            }
+            Ok(())
+        };
+    match app {
+        CliApp::Claude if file.name == "settings.json" => require_object(root, "env")?,
+        CliApp::Gemini if file.name == "settings.json" || file.name == "config.json" => {
+            require_object(root, "security")?;
+            if let Some(security) = root.get("security").and_then(Value::as_object) {
+                require_object(security, "auth")?;
+            }
+        }
+        CliApp::OpenCode if file.name == "config.json" => {
+            require_object(root, "providers")?;
+            if let Some(providers) = root.get("providers").and_then(Value::as_object) {
+                require_object(providers, "openai")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// 执行同步逻辑
-pub fn sync_config(
+fn sync_config_locked(
     app: &CliApp,
     proxy_url: &str,
     api_key: &str,
     model: Option<&str>,
 ) -> Result<(), String> {
     let files = app.config_files();
+    for file in &files {
+        validate_existing_config(app, file)?;
+    }
 
     for file in &files {
         // Gemini 兼容性逻辑：优先使用 settings.json
@@ -520,27 +608,30 @@ pub fn sync_config(
             }
         }
 
+        let existed_before_sync = file.path.exists();
         if let Some(parent) = file.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {}", e))?;
         }
 
-        // [New Feature] 自动备份：如果文件存在且没有备份，创建 .antigravity.bak 备份
-        // 这样可以保留用户最初的配置，后续多次同步不会覆盖这个备份
-        if file.path.exists() {
-            let backup_path = file
-                .path
-                .with_file_name(format!("{}.antigravity.bak", file.name));
-            if !backup_path.exists() {
-                if let Err(e) = fs::copy(&file.path, &backup_path) {
-                    tracing::warn!("Failed to create backup for {}: {}", file.name, e);
-                } else {
-                    tracing::info!("Created backup for {}: {:?}", file.name, backup_path);
-                }
+        // A creation marker means this file has no user-owned original state, even
+        // after a later sync has made the file exist.
+        let manager_created = created_marker_path(file).exists();
+        if existed_before_sync && !manager_created {
+            let backup = backup_path(file);
+            if !backup.exists() {
+                let bytes = fs::read(&file.path)
+                    .map_err(|error| format!("无法读取 {}: {error}", file.name))?;
+                write_atomic(&backup, &bytes)
+                    .map_err(|error| format!("无法备份 {}: {error}", file.name))?;
             }
+        } else if !existed_before_sync {
+            write_atomic(&created_marker_path(file), b"created by api-manager\n")
+                .map_err(|error| format!("无法记录 {} 的创建所有权: {error}", file.name))?;
         }
 
-        let mut content = if file.path.exists() {
-            fs::read_to_string(&file.path).unwrap_or_default()
+        let mut content = if existed_before_sync {
+            fs::read_to_string(&file.path)
+                .map_err(|error| format!("无法读取 {}: {error}", file.name))?
         } else {
             String::new()
         };
@@ -790,13 +881,65 @@ pub fn sync_config(
             }
         }
 
-        // 使用临时文件原子写入
-        let tmp_path = file.path.with_extension("tmp");
-        fs::write(&tmp_path, &content).map_err(|e| format!("写入临时文件失败: {}", e))?;
-        fs::rename(&tmp_path, &file.path).map_err(|e| format!("重命名配置文件失败: {}", e))?;
+        write_atomic(&file.path, content.as_bytes())
+            .map_err(|error| format!("写入配置文件失败: {error}"))?;
     }
 
     Ok(())
+}
+
+pub fn sync_config(
+    app: &CliApp,
+    proxy_url: &str,
+    api_key: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let _transaction = lock_client_config();
+    sync_config_locked(app, proxy_url, api_key, model)
+}
+
+fn restore_files_locked(files: &[CliConfigFile]) -> Result<bool, String> {
+    let mut restored_any = false;
+
+    for file in files {
+        let backup = backup_path(file);
+        let marker = created_marker_path(file);
+        // Marker ownership wins over a stale backup produced by older repeated
+        // syncs: the managed file did not exist before the first sync.
+        if marker.exists() {
+            if file.path.exists() {
+                fs::remove_file(&file.path)
+                    .map_err(|error| format!("删除由集成创建的 {} 失败: {error}", file.name))?;
+            }
+            fs::remove_file(&marker)
+                .map_err(|error| format!("删除 {} 的所有权记录失败: {error}", file.name))?;
+            if backup.exists() {
+                fs::remove_file(&backup)
+                    .map_err(|error| format!("删除过期备份失败 {}: {error}", file.name))?;
+            }
+            restored_any = true;
+        } else if backup.exists() {
+            let bytes = fs::read(&backup)
+                .map_err(|error| format!("恢复备份失败 {}: {error}", file.name))?;
+            write_atomic(&file.path, &bytes)
+                .map_err(|error| format!("恢复备份失败 {}: {error}", file.name))?;
+            fs::remove_file(&backup)
+                .map_err(|error| format!("删除已恢复备份失败 {}: {error}", file.name))?;
+            restored_any = true;
+        }
+    }
+
+    Ok(restored_any)
+}
+
+pub fn restore_config(app: &CliApp) -> Result<(), String> {
+    let _transaction = lock_client_config();
+    let files = app.config_files();
+    if restore_files_locked(&files)? {
+        Ok(())
+    } else {
+        sync_config_locked(app, app.default_url(), "", None)
+    }
 }
 
 // Tauri Commands
@@ -844,36 +987,9 @@ pub async fn execute_cli_sync(
 
 #[tauri::command]
 pub async fn execute_cli_restore(app_type: CliApp) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        let files = app_type.config_files();
-        let mut restored_count = 0;
-
-        // 尝试从备份恢复
-        for file in &files {
-            let backup_path = file
-                .path
-                .with_file_name(format!("{}.antigravity.bak", file.name));
-            if backup_path.exists() {
-                // 还原：覆盖原文件
-                if let Err(e) = fs::rename(&backup_path, &file.path) {
-                    return Err(format!("恢复备份失败 {}: {}", file.name, e));
-                }
-                restored_count += 1;
-            }
-        }
-
-        if restored_count > 0 {
-            // 如果成功恢复了至少一个备份，就认为是恢复成功
-            return Ok(());
-        }
-
-        // 如果没有备份，则执行原来的逻辑：恢复为默认配置
-        let default_url = app_type.default_url();
-        // 恢复默认时清空 API Key，让用户重新授权或使用官方 Key
-        sync_config(&app_type, default_url, "", None)
-    })
-    .await
-    .unwrap_or_else(|_| Err("Task panicked".to_string()))
+    tokio::task::spawn_blocking(move || restore_config(&app_type))
+        .await
+        .unwrap_or_else(|_| Err("Task panicked".to_string()))
 }
 
 #[tauri::command]
@@ -902,4 +1018,67 @@ pub async fn get_cli_config_content(
     })
     .await
     .unwrap_or_else(|_| Err("Task panicked".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        backup_path, created_marker_path, restore_files_locked, validate_existing_config, CliApp,
+        CliConfigFile,
+    };
+    use std::fs;
+
+    #[test]
+    fn malformed_existing_config_is_rejected_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = CliConfigFile {
+            name: "settings.json".to_string(),
+            path: directory.path().join("settings.json"),
+        };
+        fs::write(&file.path, b"{ malformed").unwrap();
+
+        assert!(validate_existing_config(&CliApp::Claude, &file).is_err());
+        assert_eq!(fs::read(&file.path).unwrap(), b"{ malformed");
+        assert!(!backup_path(&file).exists());
+    }
+
+    #[test]
+    fn invalid_nested_configuration_is_rejected_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = CliConfigFile {
+            name: "settings.json".to_string(),
+            path: directory.path().join("settings.json"),
+        };
+        fs::write(&file.path, br#"{"security":null}"#).unwrap();
+
+        assert!(validate_existing_config(&CliApp::Gemini, &file).is_err());
+        assert_eq!(fs::read(&file.path).unwrap(), br#"{"security":null}"#);
+        assert!(!backup_path(&file).exists());
+    }
+
+    #[test]
+    fn restore_removes_only_explicitly_owned_companion_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = CliConfigFile {
+            name: ".claude.json".to_string(),
+            path: directory.path().join(".claude.json"),
+        };
+        let companion = CliConfigFile {
+            name: "settings.json".to_string(),
+            path: directory.path().join(".claude").join("settings.json"),
+        };
+        fs::create_dir_all(companion.path.parent().unwrap()).unwrap();
+        fs::write(&primary.path, b"managed").unwrap();
+        fs::write(backup_path(&primary), b"original").unwrap();
+        fs::write(&companion.path, b"managed-companion").unwrap();
+        // Simulates the stale backup created by older repeated-sync releases.
+        fs::write(backup_path(&companion), b"managed-companion").unwrap();
+        fs::write(created_marker_path(&companion), b"created by api-manager\n").unwrap();
+
+        assert!(restore_files_locked(&[primary.clone(), companion.clone()]).unwrap());
+        assert_eq!(fs::read(primary.path).unwrap(), b"original");
+        assert!(!companion.path.exists());
+        assert!(!created_marker_path(&companion).exists());
+        assert!(!backup_path(&companion).exists());
+    }
 }

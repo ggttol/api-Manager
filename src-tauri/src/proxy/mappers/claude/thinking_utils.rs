@@ -172,6 +172,21 @@ pub fn get_signature_family(signature: &str) -> Option<String> {
     SignatureCache::global().get_signature_family(signature)
 }
 
+fn normalized_signature_family(model: &str) -> String {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("gemini") {
+        "gemini".to_string()
+    } else if model.starts_with("claude") {
+        "claude".to_string()
+    } else {
+        model
+            .split(['-', '_', '/'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
 /// [CRITICAL] Sanitize thinking blocks and check cross-model compatibility
 pub fn filter_invalid_thinking_blocks_with_family(
     messages: &mut [Message],
@@ -198,10 +213,14 @@ pub fn filter_invalid_thinking_blocks_with_family(
                         }
                     };
 
-                    // 2. Family compatibility check (Prevents SONNET-Thinking sig being sent to OPUS-Thinking)
+                    // The cache records concrete upstream model versions while handlers
+                    // supply a protocol family (for example, `gemini`). Compare their
+                    // canonical families, retaining the detailed cache value elsewhere.
                     if let Some(target) = target_family {
                         if let Some(origin_family) = get_signature_family(sig) {
-                            if origin_family != target {
+                            if normalized_signature_family(&origin_family)
+                                != normalized_signature_family(target)
+                            {
                                 warn!("[Thinking-Sanitizer] Dropping signature from family '{}' for target '{}'", origin_family, target);
                                 stripped_count += 1;
                                 return false;
@@ -240,5 +259,54 @@ pub fn filter_invalid_thinking_blocks_with_family(
             "[Thinking-Sanitizer] Stripped {} invalid or incompatible thinking blocks",
             stripped_count
         );
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_signature_from_concrete_google_family_for_generic_target() {
+        let signature = "a".repeat(MIN_SIGNATURE_LENGTH);
+        SignatureCache::global()
+            .cache_thinking_family(signature.clone(), "gemini-3.7-flash-high".to_string());
+        let mut messages = vec![Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Array(vec![ContentBlock::Thinking {
+                thinking: "reasoning".to_string(),
+                signature: Some(signature),
+                cache_control: None,
+            }]),
+        }];
+
+        filter_invalid_thinking_blocks_with_family(&mut messages, Some("gemini"));
+
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Array(blocks) if matches!(blocks.as_slice(), [ContentBlock::Thinking { .. }])
+        ));
+    }
+
+    #[test]
+    fn rejects_signature_from_another_provider_family() {
+        let signature = "b".repeat(MIN_SIGNATURE_LENGTH);
+        SignatureCache::global()
+            .cache_thinking_family(signature.clone(), "claude-3-7-sonnet".to_string());
+        let mut messages = vec![Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Array(vec![ContentBlock::Thinking {
+                thinking: "reasoning".to_string(),
+                signature: Some(signature),
+                cache_control: None,
+            }]),
+        }];
+
+        filter_invalid_thinking_blocks_with_family(&mut messages, Some("gemini"));
+
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Array(blocks)
+                if matches!(blocks.as_slice(), [ContentBlock::Text { text }] if text == ".")
+        ));
     }
 }

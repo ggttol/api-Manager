@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request } from '../../utils/request';
 import { showToast } from '../common/ToastContainer';
@@ -12,10 +12,11 @@ import { useAccountStore } from '../../stores/useAccountStore';
 
 interface ProxyPoolSettingsProps {
     config: ProxyPoolConfig;
-    onChange: (config: ProxyPoolConfig, silent?: boolean) => void;
+    onChange: (config: ProxyPoolConfig, silent?: boolean) => Promise<void>;
+    onBindingsChange: (bindings: Record<string, string>) => Promise<void>;
 }
 
-export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSettingsProps) {
+export default function ProxyPoolSettings({ config, onChange, onBindingsChange }: ProxyPoolSettingsProps) {
     const { t } = useTranslation();
     const { accounts, fetchAccounts } = useAccountStore();
     const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -24,18 +25,22 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
     const [isTesting, setIsTesting] = useState(false);
     const [accountBindings, setAccountBindings] = useState<Record<string, string>>({});
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-
-    // Fetch bindings and accounts on mount
+    const bindingGeneration = useRef(0);
+    const wasBindingManagerOpen = useRef(false);
+    // Fetch bindings and accounts on mount. Binding reads are discarded once a
+    // manager session begins, so a delayed response cannot overwrite its edits.
     useEffect(() => {
         fetchBindings();
         fetchAccounts();
     }, []);
 
-    // Refresh bindings when manager closes
+    // Refresh only after a manager session closes; the initial closed render is
+    // covered by the mount effect above.
     useEffect(() => {
-        if (!isBindingManagerOpen) {
+        if (wasBindingManagerOpen.current && !isBindingManagerOpen) {
             fetchBindings();
         }
+        wasBindingManagerOpen.current = isBindingManagerOpen;
     }, [isBindingManagerOpen]);
 
     // [FIX] Polling for proxy pool status
@@ -78,9 +83,12 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
     }, [config.enabled, config.proxies]); // Depend on config.enabled and config.proxies to re-evaluate polling
 
     const fetchBindings = async () => {
+        const generation = bindingGeneration.current;
         try {
             const bindings = await request<Record<string, string>>('get_all_account_bindings');
-            if (bindings) setAccountBindings(bindings);
+            if (!bindings || generation !== bindingGeneration.current) return;
+            setAccountBindings(bindings);
+            await onBindingsChange(bindings);
         } catch (e) {
             console.error('Fetch bindings failed:', e);
         }
@@ -108,13 +116,8 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
 
     const handleBatchImport = async (newProxies: ProxyEntry[]) => {
         const updatedProxies = [...safeConfig.proxies, ...newProxies];
-        await onChange({
-            ...safeConfig,
-            proxies: updatedProxies
-        });
-
-        // Auto-trigger test after import is fully committed
-        handleTestAll();
+        await onChange({ ...safeConfig, proxies: updatedProxies });
+        await handleTestAll();
     };
 
     const handleBatchDelete = () => {
@@ -280,8 +283,10 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
                                     <RefreshCw size={14} />
                                 </button>
                                 <button
-                                    onClick={() => setIsBindingManagerOpen(true)}
-                                    className="p-2 text-gray-400 hover:text-indigo-500 hover:bg-white dark:hover:bg-gray-800 rounded-lg transition-all active:scale-90"
+                                    onClick={() => {
+                                        bindingGeneration.current += 1;
+                                        setIsBindingManagerOpen(true);
+                                    }}
                                     title={t('settings.proxy_pool.binding_manager', 'Manage Bindings')}
                                 >
                                     <Link2 size={14} />
@@ -351,7 +356,10 @@ export default function ProxyPoolSettings({ config, onChange }: ProxyPoolSetting
             {isBindingManagerOpen && (
                 <ProxyBindingManager
                     isOpen={isBindingManagerOpen}
-                    onClose={() => setIsBindingManagerOpen(false)}
+                    onClose={() => {
+                        bindingGeneration.current += 1;
+                        setIsBindingManagerOpen(false);
+                    }}
                     proxies={safeConfig.proxies}
                 />
             )}

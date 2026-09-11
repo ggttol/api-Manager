@@ -580,7 +580,10 @@ pub(super) fn json_response(status: StatusCode, headers: HeaderMap, value: Value
 
 pub(super) async fn models(State(state): State<AppState>) -> Result<Json<Value>, CodexError> {
     let id = state.codex.preferred_account().await?;
-    let catalog = state.codex.authorized_get(&id, auth::MODELS_URL).await?;
+    let catalog = state
+        .codex
+        .authorized_get(&id, auth::MODELS_URL, true)
+        .await?;
     let models = catalog
         .get("models")
         .and_then(Value::as_array)
@@ -864,6 +867,7 @@ async fn forward_inner(
                 .map_err(|_| CodexError::upstream("Codex returned an invalid JSON response"))?;
         record.tokens.redact(&mut value);
         remember_response(&manager, &scope, &id, &value).await?;
+        observe_terminal_event(&manager, &id, &value).await?;
         if compact {
             value["object"] = json!("response.compaction");
         }
@@ -882,10 +886,14 @@ async fn forward_inner(
     let stream = async_stream::try_stream! {
         let mut source = upstream.bytes_stream();
         let mut parser = SseParser::default();
+        let mut terminal = false;
         while let Some(chunk) = tokio::time::timeout(STREAM_IDLE, source.next()).await
             .map_err(|_| std::io::Error::other("Codex upstream stream timed out"))? {
             let chunk = chunk.map_err(|_| std::io::Error::other("Codex upstream stream interrupted"))?;
             for event in parser.push(&chunk).map_err(|error| std::io::Error::other(error.message))? {
+                observe_terminal_event(&stream_manager, &id, &event)
+                    .await
+                    .map_err(|error| std::io::Error::other(error.message))?;
                 if let Some(response) = event.get("response") {
                     remember_response(&stream_manager, &scope, &id, response).await.map_err(|error| std::io::Error::other(error.message))?;
                 }
@@ -893,9 +901,15 @@ async fn forward_inner(
                     remember_item(&mut *stream_manager.sessions.lock().await, &scope, &id, item)
                         .map_err(|error| std::io::Error::other(error.message))?;
                 }
+                terminal |= matches!(event.get("type").and_then(Value::as_str), Some("response.completed" | "response.incomplete" | "response.failed" | "error"));
             }
             // Pull-based Body polling provides backpressure. Dropping the body cancels the upstream read.
             yield chunk;
+        }
+        if !terminal {
+            Err(std::io::Error::other(
+                "Codex upstream stream ended without a terminal response",
+            ))?;
         }
     };
     let mut response = Response::new(Body::from_stream(
@@ -1065,6 +1079,30 @@ pub(super) fn is_sse_response(response: &reqwest::Response) -> bool {
         })
 }
 
+pub(super) async fn observe_terminal_event(
+    manager: &CodexManager,
+    account_id: &str,
+    event: &Value,
+) -> Result<(), CodexError> {
+    let error = match event.get("type").and_then(Value::as_str) {
+        Some("response.failed" | "response.incomplete") => event
+            .get("response")
+            .and_then(|response| response.get("error")),
+        Some("error") => event.get("error").or(Some(event)),
+        _ if event.get("status").and_then(Value::as_str) == Some("failed") => event.get("error"),
+        _ => None,
+    };
+    if let Some(error) = error.filter(|error| scheduler::is_cooldown_error(error, now())) {
+        manager
+            .note_cooldown(
+                account_id,
+                &scheduler::from_429(&HeaderMap::new(), error, now()),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn collect_response(
     upstream: reqwest::Response,
     manager: &CodexManager,
@@ -1097,6 +1135,7 @@ pub(super) async fn collect_response(
             if let Some(response) = event.get("response") {
                 remember_response(manager, scope, account_id, response).await?;
             }
+            observe_terminal_event(manager, account_id, &event).await?;
             if let Some(item) = event.get("item") {
                 remember_item(&mut *manager.sessions.lock().await, scope, account_id, item)?;
             }
@@ -1161,6 +1200,14 @@ pub(super) mod tests {
             }
         }
 
+        pub(in crate::proxy::codex) fn json(value: Value) -> Self {
+            Self {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: value.to_string(),
+            }
+        }
+
         pub(in crate::proxy::codex) fn ok(id: &str) -> Self {
             Self {
                 status: StatusCode::OK,
@@ -1171,7 +1218,7 @@ pub(super) mod tests {
             }
         }
 
-        fn sse(wire: &str) -> Self {
+        pub(in crate::proxy::codex) fn sse(wire: &str) -> Self {
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,
@@ -1667,6 +1714,10 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(bytes.as_ref(), wire.as_bytes());
         assert_eq!(streamed.calls.lock().await.len(), 1);
+        assert_eq!(
+            streamed.manager.preferred_account().await.unwrap(),
+            streamed.second
+        );
 
         let interrupted = Fixture::new(vec![Reply::sse(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"unfinished\"}\n\n",
@@ -1675,12 +1726,14 @@ pub(super) mod tests {
         let response = interrupted
             .responses(
                 HeaderMap::new(),
-                json!({"model":"native","input":"hello"}),
+                json!({"model":"native","input":"hello","stream":true}),
                 false,
             )
             .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(interrupted.calls.lock().await.len(), 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(axum::body::to_bytes(response.into_body(), MAX_COLLECTED)
+            .await
+            .is_err());
 
         let disconnected = Fixture::new(Vec::new()).await;
         disconnected.server.abort();

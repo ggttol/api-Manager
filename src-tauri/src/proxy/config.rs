@@ -26,8 +26,81 @@ pub fn normalize_proxy_url(url: &str) -> String {
 // ============================================================================
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
 
+/// Scoped configuration overrides for tests running on independent threads.
+///
+/// Production configuration remains process-global so runtime hot updates apply
+/// to every request. Tests that need a non-default policy use this guard rather
+/// than mutating that shared configuration and racing unrelated mapper tests.
+#[cfg(test)]
+thread_local! {
+    static TEST_THINKING_BUDGET_CONFIG: std::cell::RefCell<Option<ThinkingBudgetConfig>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_IMAGE_THINKING_MODE: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_COMPRESSION_LEVEL: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub struct TestConfigOverride<T: 'static> {
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<T>>>,
+    previous: Option<T>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl<T: 'static> Drop for TestConfigOverride<T> {
+    fn drop(&mut self) {
+        self.slot.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn override_test_config<T: 'static>(
+    slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<T>>>,
+    value: T,
+) -> TestConfigOverride<T> {
+    let previous = slot.with(|slot| slot.replace(Some(value)));
+    TestConfigOverride {
+        slot,
+        previous,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+/// Temporarily override the thinking-budget policy for the current test thread.
+#[cfg(test)]
+pub fn override_thinking_budget_config_for_test(
+    config: ThinkingBudgetConfig,
+) -> TestConfigOverride<ThinkingBudgetConfig> {
+    override_test_config(&TEST_THINKING_BUDGET_CONFIG, config)
+}
+
+#[cfg(test)]
+pub fn override_image_thinking_mode_for_test(
+    mode: &'static str,
+) -> TestConfigOverride<&'static str> {
+    override_test_config(&TEST_IMAGE_THINKING_MODE, mode)
+}
+
+#[cfg(test)]
+pub fn override_compression_level_for_test(
+    level: &'static str,
+) -> TestConfigOverride<&'static str> {
+    override_test_config(&TEST_COMPRESSION_LEVEL, level)
+}
+
 /// 获取当前 Thinking Budget 配置
 pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
+    #[cfg(test)]
+    if let Some(config) =
+        TEST_THINKING_BUDGET_CONFIG.with(|override_config| override_config.borrow().clone())
+    {
+        return config;
+    }
+
     GLOBAL_THINKING_BUDGET_CONFIG
         .get()
         .and_then(|lock| lock.read().ok())
@@ -100,6 +173,10 @@ pub fn update_global_system_prompt_config(config: GlobalSystemPromptConfig) {
 static GLOBAL_IMAGE_THINKING_MODE: OnceLock<RwLock<String>> = OnceLock::new();
 
 pub fn get_image_thinking_mode() -> String {
+    #[cfg(test)]
+    if let Some(mode) = TEST_IMAGE_THINKING_MODE.with(|mode| *mode.borrow()) {
+        return mode.to_string();
+    }
     GLOBAL_IMAGE_THINKING_MODE
         .get()
         .and_then(|lock| lock.read().ok())
@@ -155,6 +232,10 @@ pub fn get_global_threshold_l3() -> f32 {
 }
 
 pub fn get_global_compression_level() -> String {
+    #[cfg(test)]
+    if let Some(level) = TEST_COMPRESSION_LEVEL.with(|level| *level.borrow()) {
+        return level.to_string();
+    }
     let level = GLOBAL_COMPRESSION_LEVEL
         .get()
         .and_then(|lock| lock.read().ok())
@@ -610,6 +691,9 @@ pub struct ProxyConfig {
 
     /// Web UI 管理后台密码 (可选，如未设置则使用 api_key)
     pub admin_password: Option<String>,
+    /// Transport peers allowed to supply forwarded client-IP headers.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 
     /// 是否自动启动
     pub auto_start: bool,
@@ -711,6 +795,7 @@ impl Default for ProxyConfig {
             port: 8045,
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
             admin_password: None,
+            trusted_proxies: Vec::new(),
             auto_start: false,
             custom_mapping: std::collections::HashMap::new(),
             request_timeout: default_request_timeout(),
@@ -876,5 +961,9 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+    #[test]
+    fn proxy_config_defaults_to_no_trusted_proxies() {
+        assert!(ProxyConfig::default().trusted_proxies.is_empty());
     }
 }

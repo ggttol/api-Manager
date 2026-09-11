@@ -66,7 +66,8 @@ impl BoundedStreamCapture {
 fn build_filename(prefix: &str, trace_id: Option<&str>) -> String {
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f");
     let tid = trace_id.unwrap_or("unknown");
-    format!("{}_{}_{}.json", ts, tid, prefix)
+    let unique = uuid::Uuid::new_v4().simple();
+    format!("{}_{}_{}_{}.json", ts, tid, prefix, unique)
 }
 
 fn resolve_output_dir(cfg: &DebugLoggingConfig) -> Option<PathBuf> {
@@ -327,6 +328,41 @@ mod tests {
             payload["raw_stream"].as_str().unwrap().len()
                 <= DEBUG_STREAM_HEAD_BYTES + DEBUG_STREAM_TAIL_BYTES + 64
         );
+        tokio::fs::remove_dir_all(output_dir)
+            .await
+            .expect("remove test debug dir");
+    }
+
+    #[tokio::test]
+    async fn debug_payloads_with_shared_trace_and_prefix_do_not_overwrite_each_other() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "antigravity-debug-collision-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cfg = DebugLoggingConfig {
+            enabled: true,
+            output_dir: Some(output_dir.to_string_lossy().into_owned()),
+        };
+        let first_payload = serde_json::json!({"id": 1});
+        let second_payload = serde_json::json!({"id": 2});
+
+        tokio::join!(
+            write_debug_payload(&cfg, Some("shared-trace"), "request", &first_payload),
+            write_debug_payload(&cfg, Some("shared-trace"), "request", &second_payload)
+        );
+
+        let mut entries = tokio::fs::read_dir(&output_dir)
+            .await
+            .expect("debug log dir");
+        let mut payload_ids = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("read debug entry") {
+            let payload: Value =
+                serde_json::from_slice(&tokio::fs::read(entry.path()).await.expect("read payload"))
+                    .expect("debug json");
+            payload_ids.push(payload["id"].as_i64().expect("payload id"));
+        }
+        payload_ids.sort_unstable();
+        assert_eq!(payload_ids, vec![1, 2]);
         tokio::fs::remove_dir_all(output_dir)
             .await
             .expect("remove test debug dir");

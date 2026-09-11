@@ -122,15 +122,16 @@ where
     let client_tool_names = client_tool_names.unwrap_or(empty_set);
 
     let stream = async_stream::stream! {
-        let mut emitted_tool_calls = std::collections::HashSet::new();
+        let mut emitted_tool_calls: std::collections::HashMap<u32, std::collections::HashSet<String>> = std::collections::HashMap::new();
+        let mut tool_call_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut seen_candidates = std::collections::HashSet::new();
+        let mut terminal_candidates = std::collections::HashSet::new();
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
-        let mut tool_call_index = 0;
-
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'stream: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
                     match item {
@@ -146,16 +147,30 @@ where
                                         if json_part == "[DONE]" { continue; }
                                         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                             let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                            if let Some(error) = actual_data.get("error").filter(|error| !error.is_null()) {
+                                                let error_chunk = json!({
+                                                    "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts, "model": &model, "choices": [],
+                                                    "error": error
+                                                });
+                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
+                                                error_occurred = true;
+                                                break 'stream;
+                                            }
                                             if let Some(u) = actual_data.get("usageMetadata") {
                                                 final_usage = extract_usage_metadata(u);
                                             }
-
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
                                                 // [DEBUG] 打印原始 candidate 以排查空回复问题
                                                 if candidates.len() > 0 {
                                                      tracing::debug!("[Stream-Debug] Raw Candidate: {:?}", candidates[0]);
                                                 }
-                                                for (idx, candidate) in candidates.iter().enumerate() {
+                                                for (position, candidate) in candidates.iter().enumerate() {
+                                                    let candidate_index = candidate
+                                                        .get("index")
+                                                        .and_then(Value::as_u64)
+                                                        .map(|index| index as u32)
+                                                        .unwrap_or(position as u32);
+                                                    seen_candidates.insert(candidate_index);
                                                     let parts = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array());
                                                     let mut content_out = String::new();
                                                     let mut thought_out = String::new();
@@ -183,46 +198,34 @@ where
                                                             }
                                                             if let Some(func_call) = part.get("functionCall") {
                                                                 let call_key = serde_json::to_string(func_call).unwrap_or_default();
-                                                                if !emitted_tool_calls.contains(&call_key) {
-                                                                    emitted_tool_calls.insert(call_key);
+                                                                let candidate_calls = emitted_tool_calls.entry(candidate_index).or_default();
+                                                                if candidate_calls.insert(call_key) {
                                                                     let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                                                    let mut args = func_call.get("args").unwrap_or(&json!({})).clone();
+                                                                    let args = func_call.get("args").unwrap_or(&json!({})).clone();
 
-                                                                    // [FIX #1575] 标准化 shell 工具参数名称
-                                                                    // Gemini 可能使用 cmd/code/script 等替代参数名，统一为 command
-                                                                    if name == "shell" || name == "bash" || name == "local_shell" {
-                                                                        if let Some(obj) = args.as_object_mut() {
-                                                                            if !obj.contains_key("command") {
-                                                                                for alt_key in &["cmd", "code", "script", "shell_command"] {
-                                                                                    if let Some(val) = obj.remove(*alt_key) {
-                                                                                        obj.insert("command".to_string(), val);
-                                                                                        debug!("[OpenAI-Stream] Normalized shell arg '{}' -> 'command'", alt_key);
-                                                                                        break;
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
 
                                                                     let final_name = super::response::resolve_shell_tool_name(name, &client_tool_names);
 
-                                                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                                                    use std::hash::{Hash, Hasher};
-                                                                    serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
-                                                                    let call_id = format!("call_{:x}", hasher.finish());
+                                                                    let call_id = func_call
+                                                                        .get("id")
+                                                                        .and_then(Value::as_str)
+                                                                        .filter(|id| !id.is_empty())
+                                                                        .map(str::to_owned)
+                                                                        .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
 
                                                                     let args_str = serde_json::to_string(&args).unwrap_or_default();
+                                                                    let tool_call_index = tool_call_indices.entry(candidate_index).or_insert(0);
                                                                     let tool_call_chunk = json!({
                                                                         "id": &stream_id,
                                                                         "object": "chat.completion.chunk",
                                                                         "created": created_ts,
                                                                         "model": &model,
                                                                         "choices": [{
-                                                                            "index": idx as u32,
+                                                                            "index": candidate_index,
                                                                             "delta": {
                                                                                 "role": "assistant",
                                                                                 "tool_calls": [{
-                                                                                    "index": tool_call_index,
+                                                                                    "index": *tool_call_index,
                                                                                     "id": call_id,
                                                                                     "type": "function",
                                                                                     "function": { "name": final_name, "arguments": args_str }
@@ -232,7 +235,7 @@ where
                                                                         }]
                                                                     });
 
-                                                                    tool_call_index += 1;
+                                                                    *tool_call_index += 1;
                                                                     let sse_out = format!("data: {}\n\n", serde_json::to_string(&tool_call_chunk).unwrap_or_default());
                                                                     yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                                 }
@@ -274,13 +277,16 @@ where
                                                         _ => f,
                                                     });
 
-                                                    // [FIX #1575] 如果发射了工具调用，强制设置为 tool_calls
-                                                    // 解决 Gemini 返回 STOP 但有工具调用时，OpenAI 客户端认为对话已结束的问题
-                                                    let finish_reason = if !emitted_tool_calls.is_empty() && gemini_finish_reason.is_some() {
-                                                        Some("tool_calls")
-                                                    } else {
-                                                        gemini_finish_reason
+                                                    let has_candidate_tool_calls = emitted_tool_calls
+                                                        .get(&candidate_index)
+                                                        .is_some_and(|calls| !calls.is_empty());
+                                                    let finish_reason = match gemini_finish_reason {
+                                                        Some("stop") if has_candidate_tool_calls => Some("tool_calls"),
+                                                        other => other,
                                                     };
+                                                    if finish_reason.is_some() {
+                                                        terminal_candidates.insert(candidate_index);
+                                                    }
 
                                                     if !thought_out.is_empty() {
                                                         let reasoning_chunk = json!({
@@ -289,7 +295,7 @@ where
                                                             "created": created_ts,
                                                             "model": &model,
                                                             "choices": [{
-                                                                "index": idx as u32,
+                                                                "index": candidate_index,
                                                                 "delta": { "role": "assistant", "content": serde_json::Value::Null, "reasoning_content": thought_out },
                                                                 "finish_reason": serde_json::Value::Null
                                                             }]
@@ -299,23 +305,17 @@ where
                                                     }
 
                                                     if !content_out.is_empty() || finish_reason.is_some() {
-                                                        let mut openai_chunk = json!({
+                                                        let openai_chunk = json!({
                                                             "id": &stream_id,
                                                             "object": "chat.completion.chunk",
                                                             "created": created_ts,
                                                             "model": &model,
                                                             "choices": [{
-                                                                "index": idx as u32,
+                                                                "index": candidate_index,
                                                                 "delta": { "content": content_out },
                                                                 "finish_reason": finish_reason
                                                             }]
                                                         });
-                                                        if finish_reason.is_some() {
-                                                            if let Some(ref usage) = final_usage {
-                                                                openai_chunk["usage"] = serde_json::to_value(usage).unwrap();
-                                                            }
-                                                        }
-                                                        if finish_reason.is_some() { final_usage = None; }
                                                         let sse_out = format!("data: {}\n\n", serde_json::to_string(&openai_chunk).unwrap_or_default());
                                                         yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                     }
@@ -365,6 +365,19 @@ where
         }
 
         if !error_occurred {
+            if !seen_candidates.is_empty() && seen_candidates != terminal_candidates {
+                let error_chunk = json!({
+                    "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts, "model": &model, "choices": [],
+                    "error": { "type": "server_error", "message": "Upstream stream ended before every candidate finished", "code": "incomplete_stream" }
+                });
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
+            } else if let Some(usage) = final_usage {
+                let usage_chunk = json!({
+                    "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts,
+                    "model": &model, "choices": [], "usage": usage
+                });
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default())));
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -396,10 +409,12 @@ where
     let stream = async_stream::stream! {
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
+        let mut seen_candidates = std::collections::HashSet::new();
+        let mut terminal_candidates = std::collections::HashSet::new();
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'stream: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
                     match item {
@@ -414,38 +429,60 @@ where
                                         let json_part = line.trim_start_matches("data: ").trim();
                                         if json_part == "[DONE]" { continue; }
                                         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                                            let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                            let actual_data = if let Some(inner) = json.get_mut("response").map(|value| value.take()) {
+                                                inner
+                                            } else {
+                                                json
+                                            };
+                                            if let Some(error) = actual_data.get("error").filter(|error| !error.is_null()) {
+                                                let error_chunk = json!({
+                                                    "id": &stream_id, "object": "text_completion", "created": created_ts, "model": &model, "choices": [],
+                                                    "error": error
+                                                });
+                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
+                                                error_occurred = true;
+                                                break 'stream;
+                                            }
                                             if let Some(u) = actual_data.get("usageMetadata") { final_usage = extract_usage_metadata(u); }
-
-                                            let mut content_out = String::new();
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
-                                                if let Some(candidate) = candidates.get(0) {
+                                                let mut choices = Vec::with_capacity(candidates.len());
+                                                for (position, candidate) in candidates.iter().enumerate() {
+                                                    let index = candidate.get("index").and_then(Value::as_u64)
+                                                        .map(|value| value as u32).unwrap_or(position as u32);
+                                                    seen_candidates.insert(index);
+                                                    let mut content_out = String::new();
                                                     if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                         for part in parts {
-                                                            let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                                let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
-                                                                content_out.push_str(&clean_text);
+                                                            let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                                                            if !is_thought {
+                                                                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                                                    content_out.push_str(&text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", ""));
+                                                                }
                                                             }
-                                                            if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
+                                                            if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(Value::as_str) {
                                                                 store_thought_signature(sig, &session_id, message_count);
                                                             }
                                                         }
                                                     }
+                                                    let finish_reason = candidate.get("finishReason").and_then(Value::as_str).map(|reason| match reason {
+                                                        "STOP" => "stop", "MAX_TOKENS" => "length", "SAFETY" | "RECITATION" => "content_filter", other => other,
+                                                    });
+                                                    if finish_reason.is_some() {
+                                                        terminal_candidates.insert(index);
+                                                    }
+                                                    choices.push(json!({ "text": content_out, "index": index, "logprobs": null, "finish_reason": finish_reason }));
                                                 }
+                                                let mut legacy_chunk = json!({
+                                                    "id": &stream_id, "object": "text_completion", "created": created_ts, "model": &model,
+                                                    "choices": choices
+                                                });
+                                                if terminal_candidates == seen_candidates {
+                                                    if let Some(ref usage) = final_usage {
+                                                        legacy_chunk["usage"] = serde_json::to_value(usage).unwrap();
+                                                    }
+                                                }
+                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&legacy_chunk).unwrap_or_default())));
                                             }
-
-                                            let finish_reason = actual_data.get("candidates").and_then(|c| c.as_array()).and_then(|c| c.get(0)).and_then(|c| c.get("finishReason")).and_then(|f| f.as_str()).map(|f| match f {
-                                                "STOP" => "stop", "MAX_TOKENS" => "length", "SAFETY" => "content_filter", _ => f,
-                                            });
-
-                                            let mut legacy_chunk = json!({
-                                                "id": &stream_id, "object": "text_completion", "created": created_ts, "model": &model,
-                                                "choices": [{ "text": content_out, "index": 0, "logprobs": null, "finish_reason": finish_reason }]
-                                            });
-                                            if let Some(ref usage) = final_usage { legacy_chunk["usage"] = serde_json::to_value(usage).unwrap(); }
-                                            if finish_reason.is_some() { final_usage = None; }
-                                            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&legacy_chunk).unwrap_or_default())));
                                         }
                                     }
                                 }
@@ -471,6 +508,13 @@ where
             }
         }
         if !error_occurred {
+            if !seen_candidates.is_empty() && seen_candidates != terminal_candidates {
+                let error_chunk = json!({
+                    "id": &stream_id, "object": "text_completion", "created": created_ts, "model": &model, "choices": [],
+                    "error": { "type": "server_error", "message": "Upstream stream ended before every candidate finished", "code": "incomplete_stream" }
+                });
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -557,6 +601,7 @@ pub fn create_codex_sse_stream<S, E>(
         tokio::sync::oneshot::Sender<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>,
     >,
     cache_tool_calls: bool,
+    custom_tool_names: Option<std::collections::HashSet<String>>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -572,18 +617,10 @@ where
     let mut completion_tx = completion_tx;
     let stream = async_stream::stream! {
         let mut sequence_number: u64 = 0;
-
-        // Native Responses lifecycle: created must be followed by in_progress.
         let lifecycle_response = json!({
-            "id": &response_id,
-            "object": "response",
-            "created_at": created_at,
-            "status": "in_progress",
-            "model": &model,
-            "output": [],
-            "error": null,
-            "incomplete_details": null,
-            "usage": null
+            "id": &response_id, "object": "response", "created_at": created_at,
+            "status": "in_progress", "model": &model, "output": [], "error": null,
+            "incomplete_details": null, "usage": null
         });
         let created_ev = json!({ "type": "response.created", "response": lifecycle_response.clone() });
         let created_ev = inject_seq(created_ev, &mut sequence_number);
@@ -597,10 +634,12 @@ where
         let mut reasoning_item_seq: u32 = 0;
         let mut active_reasoning_item_id = String::new();
 
+        let custom_tool_names = custom_tool_names.unwrap_or_default();
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
         let mut accumulated_thinking = String::new();
         let mut has_seen_tool_calls = false;
+        let mut has_actionable_output = false;
         let mut final_finish_reason: Option<String> = None;
 
         let mut final_outputs_map: std::collections::BTreeMap<u32, serde_json::Value> = std::collections::BTreeMap::new();
@@ -611,7 +650,7 @@ where
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'stream: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
                     match item {
@@ -624,9 +663,25 @@ where
                                     if line.is_empty() || !line.starts_with("data: ") { continue; }
                                     let json_part = line.trim_start_matches("data: ").trim();
                                     if json_part == "[DONE]" { continue; }
-
                                     if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                        if let Some(error) = actual_data.get("error").filter(|error| !error.is_null()) {
+                                            let failed = inject_seq(json!({
+                                                "type": "response.failed",
+                                                "response": {
+                                                    "id": &response_id,
+                                                    "object": "response",
+                                                    "status": "failed",
+                                                    "model": &model,
+                                                    "output": [],
+                                                    "error": error,
+                                                    "incomplete_details": null,
+                                                    "usage": null
+                                                }
+                                            }), &mut sequence_number);
+                                            yield Ok::<Bytes, String>(codex_sse_frame(&failed));
+                                            return;
+                                        }
 
                                         if let Some(u) = actual_data.get("usageMetadata") {
                                             final_usage = extract_usage_metadata(u);
@@ -768,6 +823,34 @@ where
                                                                 }
                                                             }
                                                         }
+                                                        if let Some(image) = part.get("inlineData") {
+                                                            let mime_type = image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png");
+                                                            let data = image.get("data").and_then(Value::as_str).unwrap_or("");
+                                                            if mime_type.starts_with("image/") && !data.is_empty() {
+                                                                let image_output_index = next_output_index;
+                                                                next_output_index += 1;
+                                                                let image_item = json!({
+                                                                    "id": format!("img_{}", Uuid::new_v4()),
+                                                                    "type": "image_generation_call",
+                                                                    "status": "completed",
+                                                                    "result": data
+                                                                });
+                                                                let added = inject_seq(json!({
+                                                                    "type": "response.output_item.added",
+                                                                    "output_index": image_output_index,
+                                                                    "item": image_item
+                                                                }), &mut sequence_number);
+                                                                yield Ok::<Bytes, String>(codex_sse_frame(&added));
+                                                                let done = inject_seq(json!({
+                                                                    "type": "response.output_item.done",
+                                                                    "output_index": image_output_index,
+                                                                    "item": image_item
+                                                                }), &mut sequence_number);
+                                                                yield Ok::<Bytes, String>(codex_sse_frame(&done));
+                                                                final_outputs_map.insert(image_output_index, image_item);
+                                                                has_actionable_output = true;
+                                                            }
+                                                        }
                                                         if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                             store_thought_signature(sig, &session_id, message_count);
                                                         }
@@ -779,29 +862,14 @@ where
                                                                 let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                                 let mut args = func_call.get("args").unwrap_or(&json!({})).clone();
 
-                                                                if name == "shell" || name == "bash" || name == "local_shell" {
-                                                                    if let Some(obj) = args.as_object_mut() {
-                                                                        if !obj.contains_key("command") {
-                                                                            for alt_key in &["cmd", "code", "script", "shell_command"] {
-                                                                                if let Some(val) = obj.remove(*alt_key) {
-                                                                                    obj.insert("command".to_string(), val);
-                                                                                    break;
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
 
                                                                 let args_str = serde_json::to_string(&args).unwrap_or_default();
 
-                                                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                                                use std::hash::{Hash, Hasher};
-                                                                call_key.hash(&mut hasher);
-                                                                let call_id = format!("call_{:x}", hasher.finish());
+                                                                let call_id = format!("call_{}", Uuid::new_v4());
 
                                                                 let (actual_name, namespace) = split_namespace_tool_name(name);
                                                                 let tool_item_id = format!("item-{}", &Uuid::new_v4().to_string()[..16]);
-                                                                let is_custom_tool = actual_name == "apply_patch" || actual_name == "apply_patch_v2" || actual_name == "shell";
+                                                                let is_custom_tool = custom_tool_names.contains(&actual_name);
 
                                                                 let mut final_args_str = args_str.clone();
                                                                 let mut apply_patch_repairs_value: Option<Value> = None;
@@ -1131,11 +1199,12 @@ where
 
         let final_outputs: Vec<serde_json::Value> = final_outputs_map.into_values().collect();
 
-        let missing_actionable_output = !message_item_emitted && !has_seen_tool_calls;
+        let missing_actionable_output = !has_actionable_output && !message_item_emitted && !has_seen_tool_calls;
         let terminal_status = if missing_actionable_output {
             "incomplete"
         } else {
             match final_finish_reason.as_deref() {
+                Some("STOP") => "completed",
                 Some("MAX_TOKENS")
                 | Some("SAFETY")
                 | Some("RECITATION")
@@ -1145,7 +1214,7 @@ where
                 | Some("IMAGE_SAFETY")
                 | Some("IMAGE_PROHIBITED_CONTENT")
                 | None => "incomplete",
-                _ => "completed",
+                Some(_) => "failed",
             }
         };
         let terminal_type = format!("response.{terminal_status}");
@@ -1169,6 +1238,11 @@ where
             json!({
                 "code": "empty_response",
                 "message": "Gemini stream ended without a final assistant message or tool call."
+            })
+        } else if terminal_status == "failed" {
+            json!({
+                "code": "upstream_abnormal_finish",
+                "message": format!("Gemini stream ended with abnormal finish reason: {}", final_finish_reason.as_deref().unwrap_or("unknown"))
             })
         } else if final_finish_reason.is_none() {
             json!({
@@ -1261,6 +1335,7 @@ mod tests {
             "resp-test-codex-session".to_string(),
             None,
             cache_tool_calls,
+            None,
         );
 
         let mut raw = String::new();
@@ -1339,6 +1414,7 @@ mod tests {
             response_id.clone(),
             Some(completion_tx),
             true,
+            None,
         );
 
         let mut raw = String::new();
@@ -1588,6 +1664,7 @@ mod tests {
     async fn test_codex_empty_stop_is_incomplete_instead_of_blank_final_answer() {
         let (_, events) = collect_codex_stream(vec![json!({
             "candidates": [{
+
                 "finishReason": "STOP",
                 "content": {"parts": [{"text": ""}]}
             }]
@@ -1601,6 +1678,25 @@ mod tests {
         assert_eq!(terminal["type"], "response.incomplete");
         assert_eq!(terminal["response"]["status"], "incomplete");
         assert_eq!(terminal["response"]["error"]["code"], "empty_response");
+    }
+
+    #[tokio::test]
+    async fn codex_image_only_stop_is_completed_and_actionable() {
+        let (_, events) = collect_codex_stream(vec![json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{
+                    "inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}
+                }]}
+            }]
+        })])
+        .await;
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal["type"], "response.completed");
+        assert_eq!(
+            terminal["response"]["output"][0]["type"],
+            "image_generation_call"
+        );
     }
 
     #[tokio::test]
@@ -1657,39 +1753,35 @@ mod tests {
             }
         }
 
-        let mut found_usage = false;
-        let mut found_finish = false;
+        let mut finish_index = None;
+        let mut usage_index = None;
 
-        for (i, chunk_str) in chunks.iter().enumerate() {
+        for (index, chunk_str) in chunks.iter().enumerate() {
             let json_str = chunk_str.trim_start_matches("data: ").trim();
             let json: Value = serde_json::from_str(json_str).unwrap();
 
-            if i < chunks.len() - 1 {
-                assert!(
-                    json.get("usage").is_none(),
-                    "Usage should not be in intermediate chunks. Found in chunk {}",
-                    i
-                );
-            } else {
-                if let Some(usage) = json.get("usage") {
-                    found_usage = true;
-                    assert_eq!(usage["prompt_tokens"], 5);
-                    assert_eq!(usage["completion_tokens"], 2);
-                    assert_eq!(usage["total_tokens"], 7);
-                }
-                if let Some(choices) = json.get("choices") {
-                    if let Some(choice) = choices.get(0) {
-                        if let Some(finish_reason) = choice.get("finish_reason") {
-                            if finish_reason.as_str() == Some("stop") {
-                                found_finish = true;
-                            }
-                        }
-                    }
-                }
+            if json.get("usage").is_some() {
+                assert_eq!(json["choices"], json!([]));
+                assert_eq!(json["usage"]["prompt_tokens"], 5);
+                assert_eq!(json["usage"]["completion_tokens"], 2);
+                assert_eq!(json["usage"]["total_tokens"], 7);
+                usage_index = Some(index);
+            }
+
+            if json["choices"].as_array().is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|choice| choice["finish_reason"] == "stop")
+            }) {
+                assert!(json.get("usage").is_none());
+                finish_index = Some(index);
             }
         }
-        assert!(found_usage, "Usage should be found in the last chunk");
-        assert!(found_finish, "Finish reason should be strictly 'stop'");
+
+        let finish_index = finish_index.expect("stream must emit a terminal choice");
+        let usage_index = usage_index.expect("stream must emit usage");
+        assert!(finish_index < usage_index);
+        assert_eq!(usage_index, chunks.len() - 1);
     }
 
     #[tokio::test]

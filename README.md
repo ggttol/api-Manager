@@ -235,6 +235,8 @@ docker run -d --name antigravity-manager \
 > - **第一优先级 (环境变量)**: `ABV_WEB_PASSWORD` 或 `WEB_PASSWORD`。只要设置了环境变量，系统将始终使用它。
 > - **第二优先级 (配置文件)**: `gui_config.json` 中的 `admin_password` 字段。UI 的“保存”操作会更新此值。
 > - **保底回退 (向后兼容)**: 若上述均未设置，则回退使用 `API_KEY` 作为登录密码。
+>
+> 启动日志不会输出明文密钥或密码。遗忘凭据时，请检查部署环境变量，或数据目录内 `gui_config.json` 的 `proxy.admin_password` / `proxy.api_key`；请勿公开该文件。
 
 # 方式 2: 使用 Docker Compose
 # 1. 进入项目的 docker 目录

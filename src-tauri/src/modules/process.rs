@@ -824,15 +824,17 @@ pub fn start_antigravity(target_ide: Option<&str>) -> Result<(), String> {
                     let mut cmd = Command::new("open");
                     cmd.arg("-a").arg(&path_str);
 
-                    // Add startup arguments
                     if let Some(ref args) = args {
-                        for arg in args {
-                            cmd.arg(arg);
-                        }
+                        cmd.arg("--args");
+                        cmd.args(args);
                     }
 
-                    cmd.spawn()
+                    let status = cmd
+                        .status()
                         .map_err(|e| format!("Startup failed (open): {}", e))?;
+                    if !status.success() {
+                        return Err(format!("Startup failed (open exited with {})", status));
+                    }
                 } else {
                     let mut cmd = Command::new(&path_str);
 
@@ -892,11 +894,9 @@ pub fn start_antigravity(target_ide: Option<&str>) -> Result<(), String> {
         };
         cmd.args(["-a", app_name]);
 
-        // Add startup arguments
         if let Some(ref args) = args {
-            for arg in args {
-                cmd.arg(arg);
-            }
+            cmd.arg("--args");
+            cmd.args(args);
         }
 
         let output = cmd
@@ -978,11 +978,12 @@ fn get_process_info(target_ide: Option<&str>) -> (Option<std::path::PathBuf>, Op
                 .to_lowercase();
 
             // Extract actual arguments from command line (skipping exe path)
+            // Keep original argument values for callers (notably filesystem paths), and
+            // normalize only the copy used for process classification.
             let args = args
-                .map(|arg| arg.to_string_lossy().to_lowercase())
+                .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<String>>();
-
-            let args_str = args.join(" ");
+            let args_str = args.join(" ").to_lowercase();
 
             // Common helper process exclusion logic
             let is_helper = args_str.contains("--type=")
@@ -1059,58 +1060,33 @@ pub fn get_args_from_running_process(target_ide: Option<&str>) -> Option<Vec<Str
     args
 }
 
-/// Get --user-data-dir argument value (if exists)
+/// Get --user-data-dir argument value (if exists).
 pub fn get_user_data_dir_from_process(target_ide: Option<&str>) -> Option<std::path::PathBuf> {
-    // Prefer getting startup arguments from config
-    if let Ok(config) = crate::modules::config::load_app_config() {
-        if let Some(args) = config.antigravity_args {
-            // Check arguments in config
-            for i in 0..args.len() {
-                if args[i] == "--user-data-dir" && i + 1 < args.len() {
-                    // Next argument is the path
-                    let path = std::path::PathBuf::from(&args[i + 1]);
-                    if path.exists() {
-                        return Some(path);
-                    }
-                } else if args[i].starts_with("--user-data-dir=") {
-                    // Argument and value in same string, e.g. --user-data-dir=/path/to/data
-                    let parts: Vec<&str> = args[i].splitn(2, '=').collect();
-                    if parts.len() == 2 {
-                        let path_str = parts[1];
-                        let path = std::path::PathBuf::from(path_str);
-                        if path.exists() {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // If not in config, get arguments from running process
-    if let Some(args) = get_args_from_running_process(target_ide) {
-        for i in 0..args.len() {
-            if args[i] == "--user-data-dir" && i + 1 < args.len() {
-                // Next argument is the path
-                let path = std::path::PathBuf::from(&args[i + 1]);
-                if path.exists() {
+    // antigravity_args configures the native client launch. It must not be
+    // treated as Antigravity IDE state merely because the IDE is selected.
+    if target_ide != Some("ide") {
+        if let Ok(config) = crate::modules::config::load_app_config() {
+            if let Some(args) = config.antigravity_args {
+                if let Some(path) = user_data_dir_from_args(&args) {
                     return Some(path);
                 }
-            } else if args[i].starts_with("--user-data-dir=") {
-                // Argument and value in same string, e.g. --user-data-dir=/path/to/data
-                let parts: Vec<&str> = args[i].splitn(2, '=').collect();
-                if parts.len() == 2 {
-                    let path_str = parts[1];
-                    let path = std::path::PathBuf::from(path_str);
-                    if path.exists() {
-                        return Some(path);
-                    }
-                }
             }
         }
     }
 
-    None
+    get_args_from_running_process(target_ide).and_then(|args| user_data_dir_from_args(&args))
+}
+
+fn user_data_dir_from_args(args: &[String]) -> Option<std::path::PathBuf> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        let value = if arg == "--user-data-dir" {
+            args.get(index + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix("--user-data-dir=")
+        }?;
+        let path = std::path::PathBuf::from(value);
+        path.exists().then_some(path)
+    })
 }
 
 /// Get Antigravity executable path (cross-platform)
@@ -1294,4 +1270,19 @@ pub fn get_antigravity_cli_executable_path() -> Option<std::path::PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_data_dir_from_args;
+    use tempfile::tempdir;
+
+    #[test]
+    fn user_data_dir_arguments_preserve_path_case() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path().join("WorkProfile");
+        std::fs::create_dir(&profile).unwrap();
+        let args = vec![format!("--user-data-dir={}", profile.display())];
+        assert_eq!(user_data_dir_from_args(&args), Some(profile));
+    }
 }

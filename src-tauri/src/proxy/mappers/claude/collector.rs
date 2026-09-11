@@ -89,7 +89,7 @@ where
     let mut current_signature: Option<String> = None;
     let mut current_tool_use: Option<Value> = None;
     let mut current_tool_input = String::new();
-
+    let mut saw_message_stop = false;
     for event in events {
         match event.event_type.as_str() {
             "message_start" => {
@@ -111,100 +111,88 @@ where
 
             "content_block_start" => {
                 if let Some(content_block) = event.data.get("content_block") {
-                    if let Some(block_type) = content_block.get("type").and_then(|v| v.as_str()) {
-                        match block_type {
-                            "text" => current_text.clear(),
-                            "thinking" => {
-                                current_thinking.clear();
-                                // Extract signature from content_block
-                                current_signature = content_block
-                                    .get("signature")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-                            }
-                            "tool_use" => {
-                                current_tool_use = Some(content_block.clone());
-                                current_tool_input.clear();
-                            }
-                            _ => {}
+                    match content_block.get("type").and_then(|value| value.as_str()) {
+                        Some("text") => current_text.clear(),
+                        Some("thinking") => {
+                            current_thinking.clear();
+                            current_signature = content_block
+                                .get("signature")
+                                .and_then(|value| value.as_str())
+                                .map(ToString::to_string);
                         }
+                        Some("tool_use") => {
+                            current_tool_use = Some(content_block.clone());
+                            current_tool_input.clear();
+                        }
+                        _ => {}
                     }
                 }
             }
-
             "content_block_delta" => {
                 if let Some(delta) = event.data.get("delta") {
-                    if let Some(delta_type) = delta.get("type").and_then(|v| v.as_str()) {
-                        match delta_type {
-                            "text_delta" => {
-                                if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                    current_text.push_str(text);
-                                }
+                    match delta.get("type").and_then(|value| value.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.get("text").and_then(|value| value.as_str()) {
+                                current_text.push_str(text);
                             }
-                            "thinking_delta" => {
-                                if let Some(thinking) =
-                                    delta.get("thinking").and_then(|v| v.as_str())
-                                {
-                                    current_thinking.push_str(thinking);
-                                }
-                                // In case signature comes in delta (less likely but possible update)
-                                if let Some(sig) = delta.get("signature").and_then(|v| v.as_str()) {
-                                    current_signature = Some(sig.to_string());
-                                }
-                            }
-                            "input_json_delta" => {
-                                if let Some(partial_json) =
-                                    delta.get("partial_json").and_then(|v| v.as_str())
-                                {
-                                    current_tool_input.push_str(partial_json);
-                                }
-                            }
-                            _ => {}
                         }
+                        Some("thinking_delta") => {
+                            if let Some(thinking) =
+                                delta.get("thinking").and_then(|value| value.as_str())
+                            {
+                                current_thinking.push_str(thinking);
+                            }
+                        }
+                        Some("signature_delta") => {
+                            current_signature = delta
+                                .get("signature")
+                                .and_then(|value| value.as_str())
+                                .map(ToString::to_string);
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(input) =
+                                delta.get("partial_json").and_then(|value| value.as_str())
+                            {
+                                current_tool_input.push_str(input);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-
             "content_block_stop" => {
-                // 完成当前块
-                if !current_text.is_empty() {
-                    response.content.push(ContentBlock::Text {
-                        text: current_text.clone(),
-                    });
-                    current_text.clear();
-                } else if !current_thinking.is_empty() {
-                    response.content.push(ContentBlock::Thinking {
-                        thinking: current_thinking.clone(),
-                        signature: current_signature.take(),
-                        cache_control: None,
-                    });
-                    current_thinking.clear();
-                } else if let Some(tool_use) = current_tool_use.take() {
-                    // 构建 tool_use 块
-                    let id = tool_use
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let name = tool_use
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let input = if !current_tool_input.is_empty() {
-                        serde_json::from_str(&current_tool_input).unwrap_or(json!({}))
-                    } else {
-                        json!({})
-                    };
-
+                if let Some(tool_use) = current_tool_use.take() {
+                    let input =
+                        serde_json::from_str(&current_tool_input).unwrap_or_else(|_| json!({}));
                     response.content.push(ContentBlock::ToolUse {
-                        id,
-                        name,
+                        id: tool_use
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        name: tool_use
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
                         input,
-                        signature: None,
+                        signature: tool_use
+                            .get("signature")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string),
                         cache_control: None,
                     });
                     current_tool_input.clear();
+                } else if !current_thinking.is_empty() || current_signature.is_some() {
+                    response.content.push(ContentBlock::Thinking {
+                        thinking: std::mem::take(&mut current_thinking),
+                        signature: current_signature.take(),
+                        cache_control: None,
+                    });
+                } else if !current_text.is_empty() {
+                    response.content.push(ContentBlock::Text {
+                        text: std::mem::take(&mut current_text),
+                    });
                 }
             }
 
@@ -222,7 +210,7 @@ where
             }
 
             "message_stop" => {
-                // Stream 结束
+                saw_message_stop = true;
                 break;
             }
 
@@ -242,10 +230,15 @@ where
         }
     }
 
-    // [FIX #3359] Guarantee at least one content block if upstream returned empty
+    if !saw_message_stop {
+        return Err("Upstream stream ended before a terminal response".to_string());
+    }
+
+    // A legitimate completed stream can be contentless (for example a blocked
+    // response); never manufacture a successful "." answer from an error stream.
     if response.content.is_empty() {
         response.content.push(ContentBlock::Text {
-            text: ".".to_string(),
+            text: String::new(),
         });
     }
 
@@ -331,30 +324,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect_empty_stream_fallback() {
-        // [FIX #3359] 模拟仅包含 message_start 和 message_stop 的空内容流（如单点探测请求）
+    async fn test_collect_empty_completed_stream_is_not_an_error() {
         let sse_data = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gemini-3.7-flash\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         ];
-
-        let byte_stream = stream::iter(
+        let stream = stream::iter(
             sse_data
                 .into_iter()
-                .map(|s| Ok::<Bytes, io::Error>(Bytes::from(s))),
+                .map(|data| Ok::<Bytes, io::Error>(Bytes::from(data))),
         );
-
-        let result = collect_stream_to_json(byte_stream).await;
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
+        let response = collect_stream_to_json(stream)
+            .await
+            .expect("completed stream");
         assert_eq!(response.id, "msg_empty");
-        assert_eq!(response.content.len(), 1);
-        if let ContentBlock::Text { text } = &response.content[0] {
-            assert_eq!(text, ".");
-        } else {
-            panic!("Expected fallback Text block");
-        }
+        assert!(matches!(&response.content[0], ContentBlock::Text { text } if text.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_collect_signature_delta_and_tool_signature() {
+        let sse_data = vec![
+            "event: content_block_start\ndata: {\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning\"}}\n\n",
+            "event: content_block_delta\ndata: {\"delta\":{\"type\":\"signature_delta\",\"signature\":\"think-sig\"}}\n\n",
+            "event: content_block_stop\ndata: {}\n\n",
+            "event: content_block_start\ndata: {\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"read\",\"signature\":\"tool-sig\"}}\n\n",
+            "event: content_block_delta\ndata: {\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "event: content_block_stop\ndata: {}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        ];
+        let stream = stream::iter(
+            sse_data
+                .into_iter()
+                .map(|data| Ok::<Bytes, io::Error>(Bytes::from(data))),
+        );
+        let response = collect_stream_to_json(stream)
+            .await
+            .expect("completed stream");
+        assert!(
+            matches!(&response.content[0], ContentBlock::Thinking { signature, .. } if signature.as_deref() == Some("think-sig"))
+        );
+        assert!(
+            matches!(&response.content[1], ContentBlock::ToolUse { signature, .. } if signature.as_deref() == Some("tool-sig"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_rejects_premature_eof() {
+        let stream = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(
+            "event: content_block_start\ndata: {\"content_block\":{\"type\":\"text\"}}\n\n",
+        ))]);
+        assert!(collect_stream_to_json(stream).await.is_err());
     }
 }

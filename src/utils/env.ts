@@ -7,6 +7,15 @@ export const isTauri = () => {
 };
 
 /**
+ * Return the inference server address reachable from the active runtime.
+ * Browser deployments use their public origin; native clients use loopback.
+ */
+export const getProxyBaseUrl = (port: number): string => {
+    if (!isTauri()) return window.location.origin;
+    return `http://127.0.0.1:${port}`;
+};
+
+/**
  * Detect if running on Linux
  */
 export const isLinux = () => {

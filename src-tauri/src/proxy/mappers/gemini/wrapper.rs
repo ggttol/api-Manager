@@ -2,6 +2,25 @@
 use serde_json::{json, Value};
 use tracing::{debug, error, info};
 
+/// Removes protocol-owned thought-signature fields from Gemini history without
+/// traversing arbitrary application payloads (notably function arguments).
+pub fn remove_history_thought_signatures(body: &mut Value) {
+    let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for content in contents {
+        let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            if let Some(part) = part.as_object_mut() {
+                part.remove("thoughtSignature");
+                part.remove("thought_signature");
+            }
+        }
+    }
+}
+
 /// 包装请求体为 v1internal 格式
 pub fn wrap_request_v2(
     body: &Value,
@@ -33,7 +52,11 @@ pub fn wrap_request_v2(
         .unwrap_or(1);
 
     // 复制 body 以便修改
-    let mut inner_request = body.clone();
+    let mut inner_request = if body.is_object() {
+        body.clone()
+    } else {
+        json!({})
+    };
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
@@ -119,63 +142,26 @@ pub fn wrap_request_v2(
                 &mut inner_request,
                 4,
             ) {
-                compression_applied = true;
-
                 let new_raw = crate::proxy::mappers::context_manager::ContextManager::estimate_gemini_token_usage(&inner_request);
                 let new_usage = calibrator.calibrate(new_raw);
                 let new_ratio = new_usage as f32 / context_limit as f32;
-
                 tracing::info!(
                     "[{}] [Layer-2] [Gemini] Compression result: {:.1}% → {:.1}% (saved {} tokens)",
                     trace_id, usage_ratio * 100.0, new_ratio * 100.0, estimated_usage - new_usage
                 );
-
+                compression_applied = new_ratio <= threshold_l3;
                 usage_ratio = new_ratio;
             }
         }
 
-        // ===== Layer 3: Fork Conversation + XML Summary =====
-        if usage_ratio > threshold_l3 && !compression_applied {
-            tracing::info!(
-                "[{}] [Layer-3] [Gemini] Context pressure ({:.1}%) exceeded threshold ({:.1}%), spawning Fork+Summary in background",
-                trace_id, usage_ratio * 100.0, threshold_l3 * 100.0
+        // Layer 3 performs upstream I/O and must be awaited by the request
+        // handler before it serializes this request. A synchronous mapper must
+        // never spawn work whose forked result is discarded.
+        if usage_ratio > threshold_l3 {
+            tracing::debug!(
+                "[{}] [Layer-3] [Gemini] Context remains above threshold; caller must await summary compression",
+                trace_id
             );
-
-            let tm_opt = tm.cloned();
-            let sid_str = session_id.unwrap_or_default().to_string();
-            let body_clone = inner_request.clone();
-            let trace_id_clone = trace_id.clone();
-            let proj_clone = project_id.to_string();
-            let acc_clone = account_id.unwrap_or_default().to_string();
-
-            if let Some(tm_arc) = tm_opt {
-                tokio::spawn(async move {
-                    match try_compress_gemini_with_summary(
-                        &body_clone,
-                        &trace_id_clone,
-                        &tm_arc,
-                        &sid_str,
-                        &proj_clone,
-                        &acc_clone,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            tracing::info!(
-                                "[{}] [Layer-3] [Gemini] Background Fork+Summary completed successfully",
-                                trace_id_clone
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[{}] [Layer-3] [Gemini] Background Fork+Summary failed: {}",
-                                trace_id_clone,
-                                e
-                            );
-                        }
-                    }
-                });
-            }
         }
     }
 
@@ -229,43 +215,52 @@ pub fn wrap_request_v2(
         .get_mut("contents")
         .and_then(|c| c.as_array_mut())
     {
-        for (i, content) in contents.iter_mut().enumerate() {
-            let mut name_counters: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-
+        let mut name_counters: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut outstanding_calls: std::collections::HashMap<
+            String,
+            std::collections::VecDeque<String>,
+        > = std::collections::HashMap::new();
+        for content in contents.iter_mut() {
             if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 for part in parts {
                     if let Some(obj) = part.as_object_mut() {
                         // 1. 处理 functionCall (Assistant 请求调用工具)
-                        if let Some(fc) = obj.get_mut("functionCall") {
-                            if fc.get("id").is_none() && is_target_claude {
+                        if let Some(fc) = obj.get_mut("functionCall").and_then(Value::as_object_mut)
+                        {
+                            if !fc.contains_key("id") && is_target_claude {
                                 let name =
                                     fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
                                 let count = name_counters.entry(name.to_string()).or_insert(0);
                                 let call_id = format!("call_{}_{}", name, count);
                                 *count += 1;
-
-                                fc.as_object_mut()
-                                    .unwrap()
-                                    .insert("id".to_string(), json!(call_id));
-                                tracing::debug!("[Gemini-Wrap] Request stage: Injected missing call_id '{}' for Claude model", call_id);
+                                outstanding_calls
+                                    .entry(name.to_string())
+                                    .or_default()
+                                    .push_back(call_id.clone());
+                                fc.insert("id".to_string(), json!(call_id));
                             }
                         }
 
                         // 2. 处理 functionResponse (User 回复工具结果)
-                        if let Some(fr) = obj.get_mut("functionResponse") {
-                            if fr.get("id").is_none() && is_target_claude {
-                                // 启发：如果客户端（如 OpenCode）在响应时没带 ID，说明它收到响应时就没 ID。
-                                // 我们在这里生成的 ID 必须与我们在 inject_ids_to_response 中注入响应的 ID 一致。
+                        if let Some(fr) = obj
+                            .get_mut("functionResponse")
+                            .and_then(Value::as_object_mut)
+                        {
+                            if !fr.contains_key("id") && is_target_claude {
                                 let name =
                                     fr.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                                let count = name_counters.entry(name.to_string()).or_insert(0);
-                                let call_id = format!("call_{}_{}", name, count);
-                                *count += 1;
-
-                                fr.as_object_mut()
-                                    .unwrap()
-                                    .insert("id".to_string(), json!(call_id));
+                                let call_id = outstanding_calls
+                                    .get_mut(name)
+                                    .and_then(|calls| calls.pop_front())
+                                    .unwrap_or_else(|| {
+                                        let count =
+                                            name_counters.entry(name.to_string()).or_insert(0);
+                                        let call_id = format!("call_{}_{}", name, count);
+                                        *count += 1;
+                                        call_id
+                                    });
+                                fr.insert("id".to_string(), json!(call_id.clone()));
                                 tracing::debug!("[Gemini-Wrap] Request stage: Injected synced response_id '{}' for Claude model", call_id);
                             }
                         }
@@ -378,13 +373,16 @@ pub fn wrap_request_v2(
                 let default_budget =
                     crate::proxy::model_specs::get_thinking_budget(final_model_name, token);
 
-                let gen_config = inner_request
+                let root = inner_request
                     .as_object_mut()
-                    .unwrap()
-                    .entry("generationConfig")
-                    .or_insert(json!({}))
+                    .expect("inner_request is normalized to an object");
+                let generation_config = root.entry("generationConfig").or_insert(json!({}));
+                if !generation_config.is_object() {
+                    *generation_config = json!({});
+                }
+                let gen_config = generation_config
                     .as_object_mut()
-                    .unwrap();
+                    .expect("object just normalized");
 
                 gen_config.insert(
                     "thinkingConfig".to_string(),
@@ -397,13 +395,16 @@ pub fn wrap_request_v2(
         }
 
         // Re-acquire gen_config to satisfy borrow checker and scope requirements for later logic
-        let gen_config = inner_request
+        let root = inner_request
             .as_object_mut()
-            .unwrap()
-            .entry("generationConfig")
-            .or_insert(json!({}))
+            .expect("inner_request is normalized to an object");
+        let generation_config = root.entry("generationConfig").or_insert(json!({}));
+        if !generation_config.is_object() {
+            *generation_config = json!({});
+        }
+        let gen_config = generation_config
             .as_object_mut()
-            .unwrap();
+            .expect("object just normalized");
 
         // [ADDED v4.1.24] Inject topK=40 and topP=1.0 if not present to match official client
         if !gen_config.contains_key("topK") {
@@ -536,13 +537,16 @@ pub fn wrap_request_v2(
     // 修复: gemini-cli 等客户端发送的 131072 超过部分模型支持的上限，导致 v1internal 返回 400 INVALID_ARGUMENT
     {
         let final_cap = crate::proxy::model_specs::get_max_output_tokens(final_model_name, token);
-        let gen_config = inner_request
+        let root = inner_request
             .as_object_mut()
-            .unwrap()
-            .entry("generationConfig")
-            .or_insert(serde_json::json!({}))
+            .expect("inner_request is normalized to an object");
+        let generation_config = root.entry("generationConfig").or_insert(json!({}));
+        if !generation_config.is_object() {
+            *generation_config = json!({});
+        }
+        let gen_config = generation_config
             .as_object_mut()
-            .unwrap();
+            .expect("object just normalized");
         if let Some(current) = gen_config.get("maxOutputTokens").and_then(|v| v.as_u64()) {
             if current > final_cap {
                 tracing::debug!(
@@ -786,7 +790,10 @@ pub fn wrap_request_v2(
         // 2. snake_case
         if let Some(tool_config_snake) = inner_request.get_mut("tool_config") {
             if let Some(obj) = tool_config_snake.as_object_mut() {
-                obj.insert("include_server_side_tool_invocations".to_string(), json!(true));
+                obj.insert(
+                    "include_server_side_tool_invocations".to_string(),
+                    json!(true),
+                );
             }
         } else {
             inner_request["tool_config"] = json!({
@@ -800,8 +807,7 @@ pub fn wrap_request_v2(
     // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
     if let Some(account_id_str) = account_id {
         let fingerprint = session_id.unwrap_or("default");
-        let generation =
-            crate::proxy::common::session::current_bump(account_id_str, fingerprint);
+        let generation = crate::proxy::common::session::current_bump(account_id_str, fingerprint);
         inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
             account_id_str,
             fingerprint,
@@ -991,37 +997,60 @@ pub fn unwrap_response(response: &Value) -> Value {
 ///
 /// 目点是为了让客户端（如 OpenCode/Vercel AI SDK）能感知到 ID，
 /// 并在下一轮对话中原样带回，从而满足 Google v1internal 对 Claude 模型的校验。
+/// Adds per-invocation IDs for Claude-compatible Gemini function calls.
+///
+/// The upstream may split calls over frames. A process-wide monotonic suffix
+/// avoids reusing an ID when this stateless helper is invoked once per frame.
 pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SYNTHETIC_CALL_ID: AtomicU64 = AtomicU64::new(0);
+
     if !model_name.to_lowercase().contains("claude") {
         return;
     }
 
-    if let Some(candidates) = response
-        .get_mut("candidates")
-        .and_then(|c| c.as_array_mut())
-    {
-        for candidate in candidates {
-            if let Some(parts) = candidate
-                .get_mut("content")
-                .and_then(|c| c.get_mut("parts"))
-                .and_then(|p| p.as_array_mut())
-            {
-                let mut name_counters: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                for part in parts {
-                    if let Some(fc) = part.get_mut("functionCall").and_then(|f| f.as_object_mut()) {
-                        if fc.get("id").is_none() {
-                            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                            let count = name_counters.entry(name.to_string()).or_insert(0);
-                            let call_id = format!("call_{}_{}", name, count);
-                            *count += 1;
+    if response.get("response").is_some() {
+        if let Some(inner) = response.get_mut("response") {
+            inject_ids_to_response(inner, model_name);
+        }
+        return;
+    }
+    let Some(candidates) = response.get_mut("candidates").and_then(Value::as_array_mut) else {
+        return;
+    };
 
-                            fc.insert("id".to_string(), json!(call_id));
-                            tracing::debug!("[Gemini-Wrap] Response stage: Injected synthetic call_id '{}' for client", call_id);
-                        }
-                    }
-                }
+    for candidate in candidates {
+        let Some(parts) = candidate
+            .get_mut("content")
+            .and_then(|content| content.get_mut("parts"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for part in parts {
+            let Some(function_call) = part.get_mut("functionCall").and_then(Value::as_object_mut)
+            else {
+                continue;
+            };
+            if function_call.contains_key("id") {
+                continue;
             }
+
+            let name = function_call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let call_id = format!(
+                "call_{}_{}",
+                name,
+                NEXT_SYNTHETIC_CALL_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            function_call.insert("id".to_string(), json!(call_id));
+            tracing::debug!(
+                "[Gemini-Wrap] Response stage: Injected synthetic call_id '{}' for client",
+                call_id
+            );
         }
     }
 }
@@ -1075,18 +1104,12 @@ The structure MUST be as follows:
     <!-- Format: base64-encoded signature string -->
     <!-- This MUST be copied exactly as-is, no modifications -->
   </latest_thinking_signature>
-</state_snapshot>
-
-**IMPORTANT**:
-1. Code snippets must be complete, including function signatures and key logic
-2. Error messages must be preserved verbatim, including line numbers and stacks
-3. File paths must use absolute paths
-4. The thinking signature must be copied exactly, no modifications
 "#;
 
-async fn try_compress_gemini_with_summary(
+pub async fn compress_gemini_request_with_summary(
     original_request: &Value,
     trace_id: &str,
+    upstream: &std::sync::Arc<crate::proxy::upstream::client::UpstreamClient>,
     token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
     session_id_str: &str,
     project_id: &str,
@@ -1147,20 +1170,17 @@ async fn try_compress_gemini_with_summary(
         Some(session_id_str),
         token_obj.as_ref(),
     );
-
-    let upstream_url = format!(
-        "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal/projects/{}/locations/global/models/{}:generateContent",
-        project_id, INTERNAL_BACKGROUND_TASK
-    );
-
-    let response = reqwest::Client::new()
-        .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&wrapped_summary_body)
-        .send()
+    let response = upstream
+        .call_v1_internal(
+            "generateContent",
+            &access_token,
+            wrapped_summary_body,
+            None,
+            Some(account_id),
+        )
         .await
-        .map_err(|e| format!("API call failed: {}", e))?;
+        .map_err(|e| format!("API call failed: {e}"))?
+        .response;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1173,9 +1193,10 @@ async fn try_compress_gemini_with_summary(
     let gemini_response: Value = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|e| format!("Failed to parse response: {e}"))?;
+    let response = gemini_response.get("response").unwrap_or(&gemini_response);
 
-    let xml_summary = gemini_response
+    let xml_summary = response
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))
@@ -1183,7 +1204,7 @@ async fn try_compress_gemini_with_summary(
         .and_then(|p| p.get(0))
         .and_then(|p| p.get("text"))
         .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
+        .map(str::to_owned)
         .ok_or_else(|| "Failed to extract text from response".to_string())?;
 
     info!(
@@ -1310,11 +1331,6 @@ mod tests {
 
     #[test]
     fn test_gemini_flash_thinking_budget_capping() {
-        // Ensure default config (Auto mode)
-        crate::proxy::config::update_thinking_budget_config(
-            crate::proxy::config::ThinkingBudgetConfig::default(),
-        );
-
         let body = json!({
             "model": "gemini-2.0-flash-thinking-exp",
             "generationConfig": {
@@ -1326,7 +1342,7 @@ mod tests {
         });
 
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        crate::proxy::config::update_thinking_budget_config(
+        let _thinking_budget = crate::proxy::config::override_thinking_budget_config_for_test(
             crate::proxy::config::ThinkingBudgetConfig::default(),
         );
 
@@ -1377,7 +1393,7 @@ mod tests {
     #[test]
     fn test_image_thinking_mode_disabled() {
         // 1. Set global mode to disabled
-        crate::proxy::config::update_image_thinking_mode(Some("disabled".to_string()));
+        let _image_mode = crate::proxy::config::override_image_thinking_mode_for_test("disabled");
 
         // 2. Create a request for an image model (which triggers the image logic)
         // Note: resolve_request_config needs to return image_config for the logic to trigger
@@ -1401,9 +1417,6 @@ mod tests {
         // 3. Verify thinkingConfig has includeThoughts: false
         let thinking_config = gen_config.get("thinkingConfig").unwrap();
         assert_eq!(thinking_config["includeThoughts"], false);
-
-        // 4. Reset global mode
-        crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
     }
 
     #[test]
@@ -1492,17 +1505,15 @@ mod tests {
     #[test]
     fn test_gemini_pro_thinking_budget_processing() {
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Update global config to Custom mode to verify logic execution
-        use crate::proxy::config::{
-            update_thinking_budget_config, ThinkingBudgetConfig, ThinkingBudgetMode,
-        };
+        // Use a scoped Custom policy without changing other mapper tests.
+        use crate::proxy::config::{ThinkingBudgetConfig, ThinkingBudgetMode};
 
-        // Save old config (optional, but good practice if tests ran in parallel, but here it's fine)
-        update_thinking_budget_config(ThinkingBudgetConfig {
-            mode: ThinkingBudgetMode::Custom,
-            custom_value: 1024, // Distinct value
-            effort: None,
-        });
+        let _thinking_budget =
+            crate::proxy::config::override_thinking_budget_config_for_test(ThinkingBudgetConfig {
+                mode: ThinkingBudgetMode::Custom,
+                custom_value: 1024, // Distinct value
+                effort: None,
+            });
 
         let body = json!({
             "model": "gemini-3-pro-preview",
@@ -1529,9 +1540,6 @@ mod tests {
             budget, 1024,
             "Budget should be overridden to 1024 by custom config, proving logic execution"
         );
-
-        // Restore default (Auto 24576)
-        update_thinking_budget_config(ThinkingBudgetConfig::default());
     }
 
     #[cfg(test)]
@@ -1546,7 +1554,7 @@ mod tests {
             // 并且 budget 默认为 16000
 
             // 使用 Auto 模式避免干扰
-            crate::proxy::config::update_thinking_budget_config(
+            let _thinking_budget = crate::proxy::config::override_thinking_budget_config_for_test(
                 crate::proxy::config::ThinkingBudgetConfig {
                     mode: crate::proxy::config::ThinkingBudgetMode::Auto,
                     custom_value: 0,
@@ -1596,7 +1604,7 @@ mod tests {
         #[test]
         fn test_gemini_thinking_injection_default() {
             let _lock = super::TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            crate::proxy::config::update_thinking_budget_config(
+            let _thinking_budget = crate::proxy::config::override_thinking_budget_config_for_test(
                 crate::proxy::config::ThinkingBudgetConfig::default(),
             );
             // 验证 Gemini 模型注入默认预算 24576
@@ -1627,8 +1635,8 @@ mod tests {
 
     #[test]
     fn test_gemini_pro_auto_inject_thinking() {
-        // Reset thinking budget to auto mode at the start to avoid interference from parallel tests
-        crate::proxy::config::update_thinking_budget_config(
+        // Use Auto mode only for this request transformation.
+        let _thinking_budget = crate::proxy::config::override_thinking_budget_config_for_test(
             crate::proxy::config::ThinkingBudgetConfig {
                 mode: crate::proxy::config::ThinkingBudgetMode::Auto,
                 custom_value: 24576,
@@ -1753,7 +1761,7 @@ mod tests {
 
     #[test]
     fn test_gemini_wrapper_context_compression() {
-        crate::proxy::config::update_global_compression_level("high".to_string(), true);
+        let _compression = crate::proxy::config::override_compression_level_for_test("high");
         let body = json!({
             "contents": [
                 {
@@ -1815,5 +1823,47 @@ mod tests {
 
         let text_5 = contents[4]["parts"][0]["text"].as_str().unwrap();
         assert!(text_5.contains("Please"));
+    }
+
+    #[test]
+    fn inject_ids_handles_wrapped_frames_and_never_reuses_a_call_id() {
+        let mut first = json!({
+            "response": {
+                "candidates": [{
+                    "content": {"parts": [{"functionCall": {"name": "read", "args": {"path": "a"}}}]}
+                }]
+            }
+        });
+        let mut second = json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "read", "args": {"path": "b"}}}]}
+            }]
+        });
+
+        inject_ids_to_response(&mut first, "claude-test");
+        inject_ids_to_response(&mut second, "claude-test");
+        let first_id = first["response"]["candidates"][0]["content"]["parts"][0]["functionCall"]
+            ["id"]
+            .as_str()
+            .expect("wrapped response receives an ID");
+        let second_id = second["candidates"][0]["content"]["parts"][0]["functionCall"]["id"]
+            .as_str()
+            .expect("unwrapped response receives an ID");
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn wrapper_tolerates_controlled_non_object_function_shapes() {
+        let malformed = json!({
+            "contents": [{
+                "role": "model",
+                "parts": [{"functionCall": null}, {"functionResponse": null}]
+            }],
+            "generationConfig": []
+        });
+
+        let wrapped = wrap_request(&malformed, "project", "claude-test", None, None, None);
+        assert!(wrapped["request"].is_object());
+        assert!(wrapped["request"]["generationConfig"].is_object());
     }
 }

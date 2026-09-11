@@ -46,19 +46,15 @@ pub struct IpStatsResponse {
 
 /// 获取 IP 访问日志列表
 #[tauri::command]
-pub async fn get_ip_access_logs(query: IpAccessLogQuery) -> Result<IpAccessLogResponse, String> {
-    let offset = (query.page.max(1) - 1) * query.page_size;
-
-    let logs = security_db::get_ip_access_logs(
-        query.page_size,
-        offset,
-        query.search.as_deref(),
-        query.blocked_only,
-    )?;
-
-    // 简单计算总数 (如果需要精确分页,可以添加 count 函数)
-    let total = logs.len();
-
+pub async fn get_ip_access_logs(
+    page: usize,
+    page_size: usize,
+    search: Option<String>,
+    blocked_only: bool,
+) -> Result<IpAccessLogResponse, String> {
+    let offset = (page.max(1) - 1) * page_size;
+    let logs = security_db::get_ip_access_logs(page_size, offset, search.as_deref(), blocked_only)?;
+    let total = security_db::get_ip_access_logs_count(search.as_deref(), blocked_only)? as usize;
     Ok(IpAccessLogResponse { logs, total })
 }
 
@@ -130,7 +126,7 @@ pub async fn clear_ip_blacklist() -> Result<(), String> {
     // 获取所有黑名单条目并逐个删除
     let entries = security_db::get_blacklist()?;
     for entry in entries {
-        security_db::remove_from_blacklist(&entry.ip_pattern)?;
+        security_db::remove_from_blacklist(&entry.id)?;
     }
     Ok(())
 }
@@ -184,7 +180,7 @@ pub async fn clear_ip_whitelist() -> Result<(), String> {
     // 获取所有白名单条目并逐个删除
     let entries = security_db::get_whitelist()?;
     for entry in entries {
-        security_db::remove_from_whitelist(&entry.ip_pattern)?;
+        security_db::remove_from_whitelist(&entry.id)?;
     }
     Ok(())
 }
@@ -220,18 +216,19 @@ pub async fn update_security_config(
     config: crate::proxy::config::SecurityMonitorConfig,
     app_state: State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<(), String> {
-    // 1. 同步保存到配置文件
-    let mut app_config = crate::modules::config::load_app_config()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
-    app_config.proxy.security_monitor = config.clone();
-    crate::modules::config::save_app_config(&app_config)
-        .map_err(|e| format!("Failed to save config: {}", e))?;
+    // Serialize this field update with every other configuration mutation so an
+    // unrelated concurrent save cannot be overwritten by a stale snapshot.
+    let committed = crate::modules::config::update_app_config(|app_config| {
+        app_config.proxy.security_monitor = config;
+        Ok(())
+    })
+    .map_err(|e| format!("Failed to save config: {}", e))?;
 
     // 2. 更新内存中的配置 (如果服务正在运行)
     {
         let mut instance_lock = app_state.instance.write().await;
         if let Some(instance) = instance_lock.as_mut() {
-            instance.config.security_monitor = config.clone();
+            instance.config.security_monitor = committed.proxy.security_monitor.clone();
             // [FIX] 调用 update_security 热更新运行中的中间件配置
             // 这是关键步骤！中间件读取的是 AppState.security (Arc<RwLock<ProxySecurityConfig>>)
             // 必须调用 update_security() 才能使黑白名单配置实时生效

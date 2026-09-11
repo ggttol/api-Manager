@@ -1259,8 +1259,8 @@
     "error_invalid_key": "密码或 API Key 错误，请重试",
     "error_network": "网络连接失败，请检查服务是否正常运行",
     "note": "注意：如果设置了独立的管理密码，请输入管理密码；否则请输入 API_KEY。",
-    "lookup_hint": "如果您忘记了，请运行 docker logs antigravity-manager 寻找 Current API Key 或 Web UI Password",
-    "config_hint": "或执行 grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json 查看。"
+    "lookup_hint": "如已忘记，请检查部署时设置的 WEB_PASSWORD 或 API_KEY（含 ABV_ 前缀版本）；启动日志不会显示明文凭据。",
+    "config_hint": "未使用环境变量覆盖时，请查看数据目录内 gui_config.json 的 proxy.admin_password 或 proxy.api_key。请勿公开该文件。"
   },
   "token_stats": {
     "title": "Token 消费统计",

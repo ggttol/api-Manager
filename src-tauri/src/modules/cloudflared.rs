@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info};
 
 #[cfg(target_os = "windows")]
@@ -87,6 +87,8 @@ pub struct CloudflaredManager {
     process: Arc<RwLock<Option<Child>>>,
     status: Arc<RwLock<CloudflaredStatus>>,
     bin_path: PathBuf,
+    /// Serializes the complete start/stop lifecycle, including installation checks and spawning.
+    lifecycle: Mutex<()>,
     /// 用于通知进程监控任务停止
     shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -104,6 +106,7 @@ impl CloudflaredManager {
             process: Arc::new(RwLock::new(None)),
             status: Arc::new(RwLock::new(CloudflaredStatus::default())),
             bin_path,
+            lifecycle: Mutex::new(()),
             shutdown_tx: RwLock::new(None),
         }
     }
@@ -225,12 +228,10 @@ impl CloudflaredManager {
 
     /// 启动隧道
     pub async fn start(&self, config: CloudflaredConfig) -> Result<CloudflaredStatus, String> {
-        // 检查是否已在运行
-        {
-            let proc = self.process.read().await;
-            if proc.is_some() {
-                return Ok(self.get_status().await);
-            }
+        let _lifecycle = self.lifecycle.lock().await;
+
+        if self.process.read().await.is_some() {
+            return Ok(self.get_status().await);
         }
 
         // 停止之前的监控任务
@@ -294,6 +295,9 @@ impl CloudflaredManager {
 
         // 恢复管道
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // If this manager is dropped during an ungraceful shutdown, do not orphan
+        // a tunnel that it created.
+        cmd.kill_on_drop(true);
 
         // CREATE_NO_WINDOW supresses console window on Windows
         #[cfg(target_os = "windows")]
@@ -384,11 +388,18 @@ impl CloudflaredManager {
         Ok(self.get_status().await)
     }
 
-    /// 停止隧道
     pub async fn stop(&self) -> Result<CloudflaredStatus, String> {
-        let mut proc_lock = self.process.write().await;
-        if let Some(mut child) = proc_lock.take() {
-            let _ = child.kill().await;
+        let _lifecycle = self.lifecycle.lock().await;
+
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
+
+        if let Some(mut child) = self.process.write().await.take() {
+            child
+                .kill()
+                .await
+                .map_err(|e| format!("Failed to stop tunnel: {}", e))?;
             info!("[cloudflared] Tunnel stopped");
         }
 
@@ -400,6 +411,41 @@ impl CloudflaredManager {
         .await;
 
         Ok(self.get_status().await)
+    }
+}
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_manager() -> (tempfile::TempDir, CloudflaredManager) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let bin_dir = data_dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let binary = bin_dir.join("cloudflared");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manager = CloudflaredManager::new(&data_dir.path().to_path_buf());
+        (data_dir, manager)
+    }
+
+    #[tokio::test]
+    async fn concurrent_starts_keep_one_owned_child_and_stop_it() {
+        let (_data_dir, manager) = fake_manager();
+        let config = CloudflaredConfig::default();
+        let (first, second) = tokio::join!(manager.start(config.clone()), manager.start(config));
+
+        assert!(first.unwrap().running);
+        assert!(second.unwrap().running);
+        assert!(manager.process.read().await.is_some());
+
+        manager.stop().await.unwrap();
+        assert!(manager.process.read().await.is_none());
+        assert!(!manager.get_status().await.running);
     }
 }
 

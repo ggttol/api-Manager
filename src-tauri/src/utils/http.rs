@@ -30,11 +30,14 @@ fn create_base_client(timeout_secs: u64) -> Client {
                     builder = builder.proxy(proxy);
                     tracing::info!(
                         "HTTP shared client enabled upstream proxy: {}",
-                        proxy_config.url
+                        crate::proxy::proxy_pool::redact_proxy_url(&proxy_config.url)
                     );
                 }
-                Err(e) => {
-                    tracing::error!("invalid_proxy_url: {}, error: {}", proxy_config.url, e);
+                Err(_) => {
+                    tracing::error!(
+                        "invalid_proxy_url: {}",
+                        crate::proxy::proxy_pool::redact_proxy_url(&proxy_config.url)
+                    );
                 }
             }
         }
@@ -68,11 +71,14 @@ fn create_standard_client(timeout_secs: u64) -> Client {
                     builder = builder.proxy(proxy);
                     tracing::info!(
                         "HTTP standard client enabled upstream proxy: {}",
-                        proxy_config.url
+                        crate::proxy::proxy_pool::redact_proxy_url(&proxy_config.url)
                     );
                 }
-                Err(e) => {
-                    tracing::error!("invalid_proxy_url: {}, error: {}", proxy_config.url, e);
+                Err(_) => {
+                    tracing::error!(
+                        "invalid_proxy_url: {}",
+                        crate::proxy::proxy_pool::redact_proxy_url(&proxy_config.url)
+                    );
                 }
             }
         }

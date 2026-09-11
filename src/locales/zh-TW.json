@@ -1053,8 +1053,8 @@
     "error_invalid_key": "密碼或 API Key 錯誤，請重試",
     "error_network": "網路連線失敗，請檢查服務是否正常運行",
     "note": "注意：如果設置了獨立的管理密碼，請輸入管理密碼；否則請輸入 API_KEY。",
-    "lookup_hint": "如果您忘記了，請運行 docker logs antigravity-manager 尋找 Current API Key 或 Web UI Password",
-    "config_hint": "或執行 grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json 查看。"
+    "lookup_hint": "若已忘記，請檢查部署時設定的 WEB_PASSWORD 或 API_KEY（含 ABV_ 前綴版本）；啟動日誌不會顯示明文憑據。",
+    "config_hint": "未使用環境變數覆寫時，請查看資料目錄內 gui_config.json 的 proxy.admin_password 或 proxy.api_key。請勿公開此檔案。"
   },
   "token_stats": {
     "title": "Token 消費統計",

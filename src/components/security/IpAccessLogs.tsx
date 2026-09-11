@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
 import { Search, AlertTriangle } from 'lucide-react';
@@ -36,36 +36,41 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(50);
     const [search, setSearch] = useState('');
+    const [committedSearch, setCommittedSearch] = useState('');
     const [blockedOnly, setBlockedOnly] = useState(false);
+    const requestGeneration = useRef(0);
 
-    const loadLogs = async () => {
+    const loadLogs = useCallback(async () => {
+        const generation = ++requestGeneration.current;
         setLoading(true);
         setLoadError(false);
         try {
             const res = await invoke<IpAccessLogResponse>('get_ip_access_logs', {
                 page,
-                pageSize: pageSize,
-                search: search || undefined,
-                blockedOnly: blockedOnly,
+                pageSize,
+                search: committedSearch || undefined,
+                blockedOnly,
             });
+            if (generation !== requestGeneration.current) return;
             setLogs(res.logs);
             setTotal(res.total);
         } catch (e) {
+            if (generation !== requestGeneration.current) return;
             setLoadError(true);
             console.error('Failed to load logs', e);
         } finally {
-            setLoading(false);
+            if (generation === requestGeneration.current) setLoading(false);
         }
-    };
+    }, [page, pageSize, committedSearch, blockedOnly]);
 
     useEffect(() => {
-        loadLogs();
-    }, [page, pageSize, blockedOnly, refreshKey]);
+        void loadLogs();
+    }, [loadLogs, refreshKey]);
 
-    // Handle search on enter or blur
+    // Commit the typed search with its page reset in the same render transition.
     const handleSearch = () => {
         setPage(1);
-        loadLogs();
+        setCommittedSearch(search);
     };
 
     return (
@@ -92,7 +97,10 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
                         type="checkbox"
                         className="toggle toggle-sm toggle-error"
                         checked={blockedOnly}
-                        onChange={(e) => setBlockedOnly(e.target.checked)}
+                        onChange={(e) => {
+                            setPage(1);
+                            setBlockedOnly(e.target.checked);
+                        }}
                     />
                 </label>
 
@@ -102,7 +110,10 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
                     <select
                         className="select select-sm select-bordered min-w-[100px]"
                         value={pageSize}
-                        onChange={(e) => setPageSize(Number(e.target.value))}
+                        onChange={(e) => {
+                            setPage(1);
+                            setPageSize(Number(e.target.value));
+                        }}
                     >
                         <option value="20">20{t('security.logs.per_page_suffix')}</option>
                         <option value="50">50{t('security.logs.per_page_suffix')}</option>
@@ -176,7 +187,7 @@ export const IpAccessLogs: React.FC<Props> = ({ refreshKey }) => {
                     <button className="btn btn-xs btn-active">{t('security.logs.page_num', { page })}</button>
                     <button
                         className="btn btn-xs"
-                        disabled={logs.length < pageSize}
+                        disabled={page * pageSize >= total}
                         onClick={() => setPage(p => p + 1)}
                     >
                         {t('security.logs.next_page')}

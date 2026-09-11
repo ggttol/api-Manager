@@ -65,7 +65,6 @@ async fn auth_middleware_internal(
 
     // 过滤心跳和健康检查请求,避免日志噪音
     let is_health_check = path == "/healthz" || path == "/api/health" || path == "/health";
-    let is_internal_endpoint = path.starts_with("/internal/");
     if !path.contains("event_logging") && !is_health_check {
         tracing::info!("Request: {} {}", method, path);
     } else {
@@ -79,6 +78,35 @@ async fn auth_middleware_internal(
 
     let security = security.read().await.clone();
     let effective_mode = security.effective_auth_mode();
+    // Warmup can select and spend a stored account, so it is an internal
+    // capability rather than an inference endpoint. It always requires a
+    // configured gateway key or independent admin credential; user tokens
+    // must never authorize it, including while inference auth is Off.
+    if path == "/internal/warmup" {
+        let supplied_key = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer ").or(Some(value)))
+            .or_else(|| {
+                request
+                    .headers()
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok())
+            });
+        let authorized = supplied_key.is_some_and(|key| {
+            (!security.api_key.is_empty() && key == security.api_key)
+                || security
+                    .admin_password
+                    .as_deref()
+                    .is_some_and(|password| !password.is_empty() && key == password)
+        });
+        return if authorized {
+            Ok(next.run(request).await)
+        } else {
+            Err(StatusCode::UNAUTHORIZED)
+        };
+    }
 
     // 权限检查逻辑
     if !force_strict {
@@ -122,12 +150,6 @@ async fn auth_middleware_internal(
         if matches!(effective_mode, ProxyAuthMode::AllExceptHealth) && is_health_check {
             return Ok(next.run(request).await);
         }
-
-        // 内部端点 (/internal/*) 豁免鉴权 - 用于 warmup 等内部功能
-        if is_internal_endpoint {
-            tracing::debug!("Internal endpoint bypassed auth: {}", path);
-            return Ok(next.run(request).await);
-        }
     } else {
         // Management endpoints always require admin auth; only health checks stay public.
         if is_health_check {
@@ -154,53 +176,53 @@ async fn auth_middleware_internal(
                 .and_then(|h| h.to_str().ok())
         });
 
-    if security.api_key.is_empty()
-        && (security.admin_password.is_none()
-            || security.admin_password.as_ref().unwrap().is_empty())
+    // An unset master inference key disables only master-key authentication.
+    // A separately issued user token can still authorize inference.
+
+    if force_strict
+        && security.api_key.is_empty()
+        && security
+            .admin_password
+            .as_ref()
+            .is_none_or(|password| password.is_empty())
     {
-        if force_strict {
-            tracing::error!("Admin auth is required but both api_key and admin_password are empty; denying request");
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-        tracing::error!("Proxy auth is enabled but api_key is empty; denying request");
+        tracing::error!(
+            "Admin auth is required but both api_key and admin_password are empty; denying request"
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     // 认证逻辑
+    let supplied_key = api_key.filter(|key| !key.is_empty());
     let authorized = if force_strict {
         // 管理接口：优先使用独立的 admin_password，如果没有则回退使用 api_key
         match &security.admin_password {
-            Some(pwd) if !pwd.is_empty() => api_key.map(|k| k == pwd).unwrap_or(false),
-            _ => {
-                // 回退使用 api_key
-                api_key.map(|k| k == security.api_key).unwrap_or(false)
-            }
+            Some(pwd) if !pwd.is_empty() => supplied_key.is_some_and(|key| key == pwd),
+            _ => supplied_key
+                .filter(|key| !security.api_key.is_empty())
+                .is_some_and(|key| key == security.api_key),
         }
     } else {
-        // AI 代理接口：仅允许使用 api_key
-        api_key.map(|k| k == security.api_key).unwrap_or(false)
+        // AI 代理接口：only a configured, nonempty master key can match here.
+        supplied_key
+            .filter(|key| !security.api_key.is_empty())
+            .is_some_and(|key| key == security.api_key)
     };
 
     if authorized {
         Ok(next.run(request).await)
-    } else if !force_strict && api_key.is_some() {
+    } else if !force_strict && supplied_key.is_some() {
         // 尝试验证 UserToken
-        let token = api_key.unwrap();
+        let token = supplied_key.expect("checked above");
 
-        // 提取 IP (复用逻辑)
-        let client_ip = request
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-            .or_else(|| {
-                request
-                    .headers()
-                    .get("x-real-ip")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "127.0.0.1".to_string()); // Default fallback
+        let Some(client_ip) = crate::proxy::middleware::client_ip::resolve_client_ip(
+            &request,
+            &security.trusted_proxies,
+        ) else {
+            tracing::warn!("UserToken rejected because the transport peer is unavailable");
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let client_ip = client_ip.to_string();
 
         // 验证 Token
         match crate::modules::user_token_db::validate_token(token, &client_ip) {
@@ -298,6 +320,7 @@ mod tests {
             allow_lan_access: true,
             port: 8045,
             security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
+            trusted_proxies: Vec::new(),
         }));
         let app = Router::new()
             .route(
@@ -355,5 +378,115 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+    #[tokio::test]
+    async fn empty_inference_key_never_authorizes_empty_header() {
+        use axum::{body::Body, routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let security = Arc::new(RwLock::new(ProxySecurityConfig {
+            auth_mode: ProxyAuthMode::Strict,
+            api_key: String::new(),
+            admin_password: Some("admin-password".into()),
+            allow_lan_access: true,
+            port: 8045,
+            security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
+            trusted_proxies: Vec::new(),
+        }));
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let calls = handler_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                security,
+                auth_middleware,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn warmup_requires_gateway_credential_even_when_inference_auth_is_off() {
+        use axum::{body::Body, routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let security = Arc::new(RwLock::new(ProxySecurityConfig {
+            auth_mode: ProxyAuthMode::Off,
+            api_key: "gateway-key".into(),
+            admin_password: Some("admin-password".into()),
+            allow_lan_access: false,
+            port: 8045,
+            security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
+            trusted_proxies: Vec::new(),
+        }));
+        let app = Router::new()
+            .route(
+                "/internal/warmup",
+                post(move || {
+                    let calls = handler_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                security,
+                auth_middleware,
+            ));
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/warmup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/warmup")
+                    .header("Authorization", "Bearer gateway-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

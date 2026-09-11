@@ -174,8 +174,8 @@ pub fn get_stats() -> Result<crate::proxy::monitor::ProxyStats, String> {
         .query_row(
             "SELECT
             COUNT(*) as total,
-            COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0) as success,
-            COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 THEN 1 ELSE 0 END), 0) as error
+            COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 AND (error IS NULL OR error = '') THEN 1 ELSE 0 END), 0) as success,
+            COALESCE(SUM(CASE WHEN status < 200 OR status >= 400 OR (error IS NOT NULL AND error != '') THEN 1 ELSE 0 END), 0) as error
          FROM request_logs",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -294,77 +294,99 @@ pub fn get_logs_count() -> Result<u64, String> {
     Ok(count)
 }
 
-/// Get count of logs matching search filter
-/// filter: search text to match in url, method, model, or status
-/// errors_only: if true, only count logs with status < 200 or >= 400
-pub fn get_logs_count_filtered(filter: &str, errors_only: bool) -> Result<u64, String> {
+const LOG_FILTER: &str = "
+    (?1 = '' OR url LIKE ?2 OR method LIKE ?2 OR model LIKE ?2
+        OR mapped_model LIKE ?2 OR CAST(status AS TEXT) LIKE ?2
+        OR account_email LIKE ?2 OR client_ip LIKE ?2 OR protocol LIKE ?2)
+    AND (?3 = 0 OR status < 200 OR status >= 400 OR (error IS NOT NULL AND error != ''))
+    AND (?4 IS NULL OR account_email = ?4)";
+
+/// Return all logged account identities, independently of pagination and filters.
+pub fn get_log_accounts() -> Result<Vec<String>, String> {
     let conn = connect_db()?;
-
-    let filter_pattern = format!("%{}%", filter);
-
-    let sql = if errors_only {
-        "SELECT COUNT(*) FROM request_logs WHERE (status < 200 OR status >= 400)"
-    } else if filter.is_empty() {
-        "SELECT COUNT(*) FROM request_logs"
-    } else {
-        "SELECT COUNT(*) FROM request_logs WHERE
-            (url LIKE ?1 OR method LIKE ?1 OR model LIKE ?1 OR CAST(status AS TEXT) LIKE ?1 OR account_email LIKE ?1)"
-    };
-
-    let count: u64 = if filter.is_empty() && !errors_only {
-        conn.query_row(sql, [], |row| row.get(0))
-    } else if errors_only {
-        conn.query_row(sql, [], |row| row.get(0))
-    } else {
-        conn.query_row(sql, [&filter_pattern], |row| row.get(0))
-    }
-    .map_err(|e| e.to_string())?;
-
-    Ok(count)
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT account_email FROM request_logs WHERE account_email IS NOT NULL AND account_email != '' ORDER BY account_email")
+        .map_err(|e| e.to_string())?;
+    let accounts = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    accounts
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
-/// Get logs with search filter and pagination
-/// filter: search text to match in url, method, model, or status
-/// errors_only: if true, only return logs with status < 200 or >= 400
+/// Text search, error status and exact account identity are independent filters.
+pub fn get_logs_count_filtered(
+    filter: &str,
+    errors_only: bool,
+    account_email: Option<&str>,
+) -> Result<u64, String> {
+    query_logs_count_filtered(&connect_db()?, filter, errors_only, account_email)
+}
+
+fn query_logs_count_filtered(
+    conn: &Connection,
+    filter: &str,
+    errors_only: bool,
+    account_email: Option<&str>,
+) -> Result<u64, String> {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM request_logs WHERE {LOG_FILTER}"),
+        params![
+            filter,
+            format!("%{filter}%"),
+            errors_only,
+            account_email.filter(|email| !email.is_empty())
+        ],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn get_logs_filtered(
     filter: &str,
     errors_only: bool,
+    account_email: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<Vec<ProxyRequestLog>, String> {
-    let conn = connect_db()?;
+    query_logs_filtered(
+        &connect_db()?,
+        filter,
+        errors_only,
+        account_email,
+        limit,
+        offset,
+    )
+}
 
-    let filter_pattern = format!("%{}%", filter);
-
-    let sql = if errors_only {
+fn query_logs_filtered(
+    conn: &Connection,
+    filter: &str,
+    errors_only: bool,
+    account_email: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<ProxyRequestLog>, String> {
+    let sql = format!(
         "SELECT id, timestamp, method, url, status, duration, model, error,
-                NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username
-         FROM request_logs
-         WHERE (status < 200 OR status >= 400)
-         ORDER BY timestamp DESC
-         LIMIT ?1 OFFSET ?2"
-    } else if filter.is_empty() {
-        "SELECT id, timestamp, method, url, status, duration, model, error,
-                NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username
-         FROM request_logs
-         ORDER BY timestamp DESC
-         LIMIT ?1 OFFSET ?2"
-    } else {
-        "SELECT id, timestamp, method, url, status, duration, model, error,
-                NULL as request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username
-         FROM request_logs
-         WHERE (url LIKE ?3 OR method LIKE ?3 OR model LIKE ?3 OR CAST(status AS TEXT) LIKE ?3 OR account_email LIKE ?3 OR client_ip LIKE ?3)
-         ORDER BY timestamp DESC
-         LIMIT ?1 OFFSET ?2"
-    };
-
-    let logs: Vec<ProxyRequestLog> = if filter.is_empty() && !errors_only {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let logs_iter = stmt
-            .query_map([limit, offset], |row| {
+                input_tokens, output_tokens, cached_tokens, account_email,
+                mapped_model, protocol, client_ip, username
+         FROM request_logs WHERE {LOG_FILTER}
+         ORDER BY timestamp DESC, id DESC LIMIT ?5 OFFSET ?6"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let logs = stmt
+        .query_map(
+            params![
+                filter,
+                format!("%{filter}%"),
+                errors_only,
+                account_email.filter(|email| !email.is_empty()),
+                limit,
+                offset
+            ],
+            |row| {
                 Ok(ProxyRequestLog {
                     id: row.get(0)?,
                     timestamp: row.get(1)?,
@@ -376,75 +398,20 @@ pub fn get_logs_filtered(
                     error: row.get(7)?,
                     request_body: None,
                     response_body: None,
-                    input_tokens: row.get(10).unwrap_or(None),
-                    output_tokens: row.get(11).unwrap_or(None),
-                    cached_tokens: row.get(12).unwrap_or(None),
-                    account_email: row.get(13).unwrap_or(None),
-                    mapped_model: row.get(14).unwrap_or(None),
-                    protocol: row.get(15).unwrap_or(None),
-                    client_ip: row.get(16).unwrap_or(None),
-                    username: row.get(17).unwrap_or(None),
+                    input_tokens: row.get(8)?,
+                    output_tokens: row.get(9)?,
+                    cached_tokens: row.get(10)?,
+                    account_email: row.get(11)?,
+                    mapped_model: row.get(12)?,
+                    protocol: row.get(13)?,
+                    client_ip: row.get(14)?,
+                    username: row.get(15)?,
                 })
-            })
-            .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
-    } else if errors_only {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let logs_iter = stmt
-            .query_map([limit, offset], |row| {
-                Ok(ProxyRequestLog {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    method: row.get(2)?,
-                    url: row.get(3)?,
-                    status: row.get(4)?,
-                    duration: row.get(5)?,
-                    model: row.get(6)?,
-                    error: row.get(7)?,
-                    request_body: None,
-                    response_body: None,
-                    input_tokens: row.get(10).unwrap_or(None),
-                    output_tokens: row.get(11).unwrap_or(None),
-                    cached_tokens: row.get(12).unwrap_or(None),
-                    account_email: row.get(13).unwrap_or(None),
-                    mapped_model: row.get(14).unwrap_or(None),
-                    protocol: row.get(15).unwrap_or(None),
-                    client_ip: row.get(16).unwrap_or(None),
-                    username: row.get(17).unwrap_or(None),
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
-    } else {
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-        let logs_iter = stmt
-            .query_map(rusqlite::params![limit, offset, filter_pattern], |row| {
-                Ok(ProxyRequestLog {
-                    id: row.get(0)?,
-                    timestamp: row.get(1)?,
-                    method: row.get(2)?,
-                    url: row.get(3)?,
-                    status: row.get(4)?,
-                    duration: row.get(5)?,
-                    model: row.get(6)?,
-                    error: row.get(7)?,
-                    request_body: None,
-                    response_body: None,
-                    input_tokens: row.get(10).unwrap_or(None),
-                    output_tokens: row.get(11).unwrap_or(None),
-                    cached_tokens: row.get(12).unwrap_or(None),
-                    account_email: row.get(13).unwrap_or(None),
-                    mapped_model: row.get(14).unwrap_or(None),
-                    protocol: row.get(15).unwrap_or(None),
-                    client_ip: row.get(16).unwrap_or(None),
-                    username: row.get(17).unwrap_or(None),
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
-    };
-
-    Ok(logs)
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    logs.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 /// Get all logs with full details for export
@@ -564,4 +531,82 @@ pub fn get_token_usage_by_ip(limit: usize, hours: i64) -> Result<Vec<IpTokenStat
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE request_logs (
+                id TEXT PRIMARY KEY, timestamp INTEGER, method TEXT, url TEXT,
+                status INTEGER, duration INTEGER, model TEXT, error TEXT,
+                input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER,
+                account_email TEXT, mapped_model TEXT, protocol TEXT, client_ip TEXT,
+                username TEXT
+            );
+            INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, account_email, client_ip)
+            VALUES
+                ('a-old', 100, 'POST', '/codex/v1/responses', 500, 1, 'gpt', 'a_100%@example.test', '192.0.2.10'),
+                ('a-new', 200, 'POST', '/codex/v1/responses', 429, 1, 'gpt', 'a_100%@example.test', '192.0.2.11'),
+                ('a-ok', 300, 'POST', '/codex/v1/responses', 200, 1, 'gpt', 'a_100%@example.test', '192.0.2.12'),
+                ('b-error', 400, 'POST', '/codex/v1/responses', 500, 1, 'gpt', 'other-a_100%@example.test', '192.0.2.13'),
+                ('a-image', 500, 'POST', '/codex/v1/images/generations', 500, 1, 'gpt-image-2', 'a_100%@example.test', '192.0.2.14');",
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn account_search_and_errors_intersect_before_pagination() {
+        let conn = database();
+        let account = Some("a_100%@example.test");
+        assert_eq!(
+            query_logs_count_filtered(&conn, "responses", true, account).unwrap(),
+            2
+        );
+        let first = query_logs_filtered(&conn, "responses", true, account, 1, 0).unwrap();
+        let second = query_logs_filtered(&conn, "responses", true, account, 1, 1).unwrap();
+        assert_eq!(
+            first.iter().map(|log| log.id.as_str()).collect::<Vec<_>>(),
+            ["a-new"]
+        );
+        assert_eq!(
+            second.iter().map(|log| log.id.as_str()).collect::<Vec<_>>(),
+            ["a-old"]
+        );
+    }
+
+    #[test]
+    fn ip_search_count_matches_visible_results() {
+        let conn = database();
+        assert_eq!(
+            query_logs_count_filtered(&conn, "192.0.2.10", false, None).unwrap(),
+            1
+        );
+        let logs = query_logs_filtered(&conn, "192.0.2.10", false, None, 50, 0).unwrap();
+        assert_eq!(
+            logs.iter().map(|log| log.id.as_str()).collect::<Vec<_>>(),
+            ["a-old"]
+        );
+    }
+
+    #[test]
+    fn semantic_stream_failures_remain_visible_under_errors_only() {
+        let conn = database();
+        conn.execute(
+            "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error)
+             VALUES ('semantic', 600, 'POST', '/codex/v1/responses', 200, 1, 'semantic-model', 'response.failed')",
+            [],
+        ).unwrap();
+        assert_eq!(
+            query_logs_count_filtered(&conn, "semantic-model", true, None).unwrap(),
+            1
+        );
+        let logs = query_logs_filtered(&conn, "semantic-model", true, None, 50, 0).unwrap();
+        assert_eq!(logs[0].id, "semantic");
+        assert_eq!(logs[0].status, 200);
+        assert_eq!(logs[0].error.as_deref(), Some("response.failed"));
+    }
 }

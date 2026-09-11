@@ -9,7 +9,8 @@ const MIN_SIGNATURE_LENGTH: usize = 50;
 // Different cache limits for different layers
 const TOOL_CACHE_LIMIT: usize = 500; // Layer 1: Tool-specific signatures
 const FAMILY_CACHE_LIMIT: usize = 200; // Layer 2: Model family mappings
-const SESSION_CACHE_LIMIT: usize = 1000; // Layer 3: Session-based signatures (largest)
+const SESSION_CACHE_LIMIT: usize = 1000;
+const SESSION_SIGNATURE_HISTORY_LIMIT: usize = 64;
 
 /// Cache entry with timestamp for TTL
 #[derive(Clone, Debug)]
@@ -18,7 +19,20 @@ struct CacheEntry<T> {
     timestamp: SystemTime,
 }
 
-/// Specialized entry for session-based signatures to track message count
+/// Bounded signature history for one session.
+///
+/// Claude uses conversation message counts as keys. Gemini response payloads do not
+/// expose those counts, so their stable response IDs receive a private generated key
+/// that lets chunks of the same response refine one entry without conflating later
+/// responses.
+#[derive(Clone, Debug, Default)]
+struct SessionSignatureHistory {
+    signatures: HashMap<usize, SessionSignatureEntry>,
+    gemini_response_counts: HashMap<String, usize>,
+    next_generated_count: usize,
+}
+
+/// A retained signature and its logical conversation position.
 #[derive(Clone, Debug)]
 struct SessionSignatureEntry {
     signature: String,
@@ -38,6 +52,21 @@ impl<T> CacheEntry<T> {
     }
 }
 
+fn enforce_capacity<T>(cache: &mut HashMap<String, CacheEntry<T>>, limit: usize) {
+    cache.retain(|_, entry| !entry.is_expired());
+    while cache.len() > limit {
+        let oldest_key = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.timestamp)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest_key {
+            cache.remove(&key);
+        } else {
+            break;
+        }
+    }
+}
+
 /// Triple-layer signature cache to handle:
 /// 1. Signature recovery for tool calls (when clients strip them)
 /// 2. Cross-model compatibility checks (preventing Claude signatures on Gemini models)
@@ -53,11 +82,10 @@ pub struct SignatureCache {
     /// Value: Model family identifier (e.g., "claude-3-5-sonnet", "gemini-2.0-flash")
     thinking_families: Mutex<HashMap<String, CacheEntry<String>>>,
 
-    /// Layer 3: Session ID -> Map of Message Count -> Thinking Signature (NEW)
-    /// Key: session fingerprint (e.g., "sid-a1b2c3d4...")
-    /// Value: A map of message count to thought signature
-    /// This prevents signature pollution between different conversations and preserves history
-    session_signatures: Mutex<HashMap<String, CacheEntry<HashMap<usize, SessionSignatureEntry>>>>,
+    /// Layer 3: Session ID -> bounded history of thinking signatures.
+    /// This prevents signature pollution between different conversations while
+    /// preventing an active session from retaining unbounded history.
+    session_signatures: Mutex<HashMap<String, CacheEntry<SessionSignatureHistory>>>,
 
     /// Layer 4: Session ID -> Assistant Reasoning Text History (NEW v4.2.0)
     /// Key: session fingerprint
@@ -94,18 +122,8 @@ impl SignatureCache {
             );
             cache.insert(tool_use_id.to_string(), CacheEntry::new(signature));
 
-            // Clean up expired entries when limit is reached
             if cache.len() > TOOL_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Tool cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
+                enforce_capacity(&mut cache, TOOL_CACHE_LIMIT);
             }
         }
     }
@@ -126,6 +144,12 @@ impl SignatureCache {
         None
     }
 
+    pub fn delete_tool_signature(&self, tool_use_id: &str) {
+        if let Ok(mut cache) = self.tool_signatures.lock() {
+            cache.remove(tool_use_id);
+        }
+    }
+
     /// Store model family for a signature
     pub fn cache_thinking_family(&self, signature: String, family: String) {
         if signature.len() < MIN_SIGNATURE_LENGTH {
@@ -141,16 +165,7 @@ impl SignatureCache {
             cache.insert(signature, CacheEntry::new(family));
 
             if cache.len() > FAMILY_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Family cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
+                enforce_capacity(&mut cache, FAMILY_CACHE_LIMIT);
             }
         }
     }
@@ -172,13 +187,66 @@ impl SignatureCache {
     // ===== Layer 3: Session-based Signature Storage =====
 
     /// Store the thinking signature for a session at a specific message count.
-    /// This is the preferred method for tracking signatures across tool loops.
+    /// Completions may arrive out of order, so this preserves newer counts instead
+    /// of interpreting an older completion as a conversation rewind.
     ///
     /// # Arguments
     /// * `session_id` - Session fingerprint (e.g., "sid-a1b2c3d4...")
     /// * `signature` - The thought signature to store
-    /// * `message_count` - The current message count of the conversation (to detect Rewind)
+    /// * `message_count` - The logical conversation position of the signature
     pub fn cache_session_signature(
+        &self,
+        session_id: &str,
+        signature: String,
+        message_count: usize,
+    ) {
+        self.cache_session_signature_at(session_id, signature, message_count);
+    }
+
+    /// Store or refine a Gemini signature. `response_id` must identify one upstream
+    /// response; repeated stream chunks for that response may replace only a shorter
+    /// partial signature, while another response always receives a distinct slot.
+    pub fn cache_gemini_session_signature(
+        &self,
+        session_id: &str,
+        signature: String,
+        response_id: &str,
+    ) {
+        if signature.len() < MIN_SIGNATURE_LENGTH || response_id.is_empty() {
+            return;
+        }
+
+        if let Ok(mut cache) = self.session_signatures.lock() {
+            let entry = cache
+                .entry(session_id.to_string())
+                .or_insert_with(|| CacheEntry::new(SessionSignatureHistory::default()));
+            entry.timestamp = SystemTime::now();
+
+            let history = &mut entry.data;
+            let message_count = if let Some(count) = history.gemini_response_counts.get(response_id)
+            {
+                *count
+            } else {
+                history.next_generated_count = history
+                    .next_generated_count
+                    .max(history.signatures.keys().max().copied().unwrap_or_default())
+                    .saturating_add(1);
+                let count = history.next_generated_count;
+                history
+                    .gemini_response_counts
+                    .insert(response_id.to_owned(), count);
+                count
+            };
+            Self::store_session_signature(history, signature, message_count);
+            Self::enforce_session_history_limit(history);
+
+            if cache.len() > SESSION_CACHE_LIMIT {
+                enforce_capacity(&mut cache, SESSION_CACHE_LIMIT);
+            }
+        }
+    }
+
+    fn cache_session_signature_at(
         &self,
         session_id: &str,
         signature: String,
@@ -191,65 +259,47 @@ impl SignatureCache {
         if let Ok(mut cache) = self.session_signatures.lock() {
             let entry = cache
                 .entry(session_id.to_string())
-                .or_insert_with(|| CacheEntry::new(HashMap::new()));
-
-            // Update timestamp to refresh TTL
+                .or_insert_with(|| CacheEntry::new(SessionSignatureHistory::default()));
             entry.timestamp = SystemTime::now();
+            Self::store_session_signature(&mut entry.data, signature, message_count);
+            Self::enforce_session_history_limit(&mut entry.data);
 
-            // Detect if a rewind happened (e.g. if we have cached signatures with message_count
-            // greater than the current message_count, those should be cleared since that future is gone).
-            entry.data.retain(|&mc, _| {
-                if mc > message_count {
-                    tracing::info!(
-                        "[SignatureCache] Rewind detected for {} at count {}: removing future signature at count {}.",
-                        session_id,
-                        message_count,
-                        mc
-                    );
-                    false
-                } else {
-                    true
-                }
-            });
-
-            let should_store = match entry.data.get(&message_count) {
-                None => true,
-                Some(existing) => {
-                    // Same message count: only update if the new signature is longer (more complete)
-                    signature.len() > existing.signature.len()
-                }
-            };
-
-            if should_store {
-                tracing::debug!(
-                    "[SignatureCache] Session {} (msg_count={}) -> storing signature (len={})",
-                    session_id,
-                    message_count,
-                    signature.len()
-                );
-                entry.data.insert(
-                    message_count,
-                    SessionSignatureEntry {
-                        signature,
-                        message_count,
-                    },
-                );
-            }
-
-            // Cleanup when limit is reached (Session cache has largest limit)
             if cache.len() > SESSION_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::info!(
-                        "[SignatureCache] Session cache cleanup: {} -> {} entries (limit: {})",
-                        before,
-                        after,
-                        SESSION_CACHE_LIMIT
-                    );
-                }
+                enforce_capacity(&mut cache, SESSION_CACHE_LIMIT);
             }
+        }
+    }
+
+    fn store_session_signature(
+        history: &mut SessionSignatureHistory,
+        signature: String,
+        message_count: usize,
+    ) {
+        let should_store = match history.signatures.get(&message_count) {
+            None => true,
+            Some(existing) => signature.len() > existing.signature.len(),
+        };
+
+        if should_store {
+            history.signatures.insert(
+                message_count,
+                SessionSignatureEntry {
+                    signature,
+                    message_count,
+                },
+            );
+        }
+    }
+
+    fn enforce_session_history_limit(history: &mut SessionSignatureHistory) {
+        while history.signatures.len() > SESSION_SIGNATURE_HISTORY_LIMIT {
+            let Some(oldest_count) = history.signatures.keys().min().copied() else {
+                break;
+            };
+            history.signatures.remove(&oldest_count);
+            history
+                .gemini_response_counts
+                .retain(|_, count| *count != oldest_count);
         }
     }
 
@@ -260,7 +310,12 @@ impl SignatureCache {
             if let Some(entry) = cache.get(session_id) {
                 if !entry.is_expired() {
                     // Find the signature with the maximum message_count (the latest one)
-                    if let Some(sig_entry) = entry.data.values().max_by_key(|e| e.message_count) {
+                    if let Some(sig_entry) = entry
+                        .data
+                        .signatures
+                        .values()
+                        .max_by_key(|e| e.message_count)
+                    {
                         tracing::debug!(
                             "[SignatureCache] Session {} (latest, msg_count={}) -> HIT (len={})",
                             session_id,
@@ -287,7 +342,7 @@ impl SignatureCache {
         if let Ok(cache) = self.session_signatures.lock() {
             if let Some(entry) = cache.get(session_id) {
                 if !entry.is_expired() {
-                    if let Some(sig_entry) = entry.data.get(&message_count) {
+                    if let Some(sig_entry) = entry.data.signatures.get(&message_count) {
                         tracing::debug!(
                             "[SignatureCache] Session {} (msg_count={}) -> HIT (len={})",
                             session_id,
@@ -333,18 +388,8 @@ impl SignatureCache {
                 entry.data[turn_index] = reasoning;
             }
 
-            // Session cache cleanup if limit exceeded
             if cache.len() > SESSION_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Session reasoning cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
+                enforce_capacity(&mut cache, SESSION_CACHE_LIMIT);
             }
         }
     }
@@ -432,6 +477,50 @@ mod tests {
     }
 
     #[test]
+    fn test_active_signature_caches_enforce_capacity() {
+        let cache = SignatureCache::new();
+        for i in 0..=TOOL_CACHE_LIMIT {
+            cache.cache_tool_signature(&format!("tool-{i}"), "x".repeat(MIN_SIGNATURE_LENGTH));
+        }
+        assert_eq!(
+            cache
+                .tool_signatures
+                .lock()
+                .ok()
+                .map(|entries| entries.len()),
+            Some(TOOL_CACHE_LIMIT)
+        );
+
+        for i in 0..=FAMILY_CACHE_LIMIT {
+            cache.cache_thinking_family(format!("{i:0>50}"), format!("family-{i}"));
+        }
+        assert_eq!(
+            cache
+                .thinking_families
+                .lock()
+                .ok()
+                .map(|entries| entries.len()),
+            Some(FAMILY_CACHE_LIMIT)
+        );
+
+        for i in 0..=SESSION_CACHE_LIMIT {
+            cache.cache_session_signature(
+                &format!("session-{i}"),
+                "y".repeat(MIN_SIGNATURE_LENGTH),
+                1,
+            );
+        }
+        assert_eq!(
+            cache
+                .session_signatures
+                .lock()
+                .ok()
+                .map(|entries| entries.len()),
+            Some(SESSION_CACHE_LIMIT)
+        );
+    }
+
+    #[test]
     fn test_session_signature() {
         let cache = SignatureCache::new();
         let sig1 = "a".repeat(60);
@@ -462,19 +551,68 @@ mod tests {
             Some(sig2.clone())
         );
 
-        // Rewind: Shorter signature MUST replace if message count is lower
+        // A delayed completion for an earlier turn must not erase newer history.
         cache.cache_session_signature("sid-test123", sig1.clone(), 3);
         assert_eq!(
             cache.get_session_signature("sid-test123"),
+            Some(sig2.clone())
+        );
+        assert_eq!(
+            cache.get_session_signature_at("sid-test123", 3),
             Some(sig1.clone())
         );
 
-        // Too short signature should be ignored entirely (even if rewind)
+        // Too short signatures are ignored.
         cache.cache_session_signature("sid-test123", sig3, 1);
-        assert_eq!(cache.get_session_signature("sid-test123"), Some(sig1));
+        assert_eq!(cache.get_session_signature("sid-test123"), Some(sig2));
 
         // Different session should be isolated
         assert!(cache.get_session_signature("sid-other").is_none());
+    }
+
+    #[test]
+    fn test_session_signature_history_is_bounded() {
+        let cache = SignatureCache::new();
+        for count in 0..=SESSION_SIGNATURE_HISTORY_LIMIT {
+            cache.cache_session_signature("active", format!("{count:0>50}"), count);
+        }
+
+        let history = cache
+            .session_signatures
+            .lock()
+            .ok()
+            .expect("session signature cache lock must be available");
+        let history = &history["active"].data;
+        assert_eq!(history.signatures.len(), SESSION_SIGNATURE_HISTORY_LIMIT);
+        assert!(history
+            .signatures
+            .contains_key(&SESSION_SIGNATURE_HISTORY_LIMIT));
+        assert!(!history.signatures.contains_key(&0));
+    }
+
+    #[test]
+    fn test_gemini_response_identity_only_merges_partial_updates() {
+        let cache = SignatureCache::new();
+        let first = "a".repeat(MIN_SIGNATURE_LENGTH);
+        let first_complete = "a".repeat(MIN_SIGNATURE_LENGTH + 1);
+        let second = "b".repeat(MIN_SIGNATURE_LENGTH);
+
+        cache.cache_gemini_session_signature("gemini", first, "response-1");
+        cache.cache_gemini_session_signature("gemini", first_complete.clone(), "response-1");
+        cache.cache_gemini_session_signature("gemini", second.clone(), "response-2");
+
+        assert_eq!(cache.get_session_signature("gemini"), Some(second));
+        let history = cache
+            .session_signatures
+            .lock()
+            .ok()
+            .expect("session signature cache lock must be available");
+        assert_eq!(history["gemini"].data.signatures.len(), 2);
+        assert!(history["gemini"]
+            .data
+            .signatures
+            .values()
+            .any(|entry| entry.signature == first_complete));
     }
 
     #[test]

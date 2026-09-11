@@ -273,6 +273,22 @@ impl NonStreamingProcessor {
             }
         }
 
+        // Gemini can place the signature in its own part after the thought text.
+        // Associate it with the accumulated thought instead of dropping it.
+        if signature.is_some()
+            && part.function_call.is_none()
+            && part.text.is_none()
+            && part.inline_data.is_none()
+        {
+            if self.thinking_builder.is_empty() {
+                self.trailing_signature = signature;
+            } else {
+                self.thinking_signature = signature;
+                self.flush_thinking();
+            }
+            return;
+        }
+
         // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
             self.flush_thinking();
@@ -545,7 +561,11 @@ impl NonStreamingProcessor {
                         .unwrap_or_else(|_| serde_json::json!({ "input": input_str.trim() }));
 
                     self.content_blocks.push(ContentBlock::ToolUse {
-                        id: format!("{}-xml", tool_name),
+                        id: format!(
+                            "{}-xml-{}",
+                            tool_name,
+                            crate::proxy::common::utils::generate_random_id()
+                        ),
                         name: tool_name.to_string(),
                         input: input_json,
                         signature: None,

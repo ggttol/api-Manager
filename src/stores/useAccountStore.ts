@@ -2,6 +2,22 @@ import { create } from 'zustand';
 import { Account } from '../types/account';
 import * as accountService from '../services/accountService';
 
+let accountsRequestVersion = 0;
+let currentAccountRequestVersion = 0;
+
+const invalidateAccountsRead = () => {
+    accountsRequestVersion += 1;
+};
+
+const invalidateCurrentAccountRead = () => {
+    currentAccountRequestVersion += 1;
+};
+
+const invalidateAccountReads = () => {
+    invalidateAccountsRead();
+    invalidateCurrentAccountRead();
+};
+
 interface AccountState {
     accounts: Account[];
     currentAccount: Account | null;
@@ -40,28 +56,37 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     error: null,
 
     fetchAccounts: async () => {
+        const requestVersion = ++accountsRequestVersion;
         set({ loading: true, error: null });
         try {
-            console.log('[Store] Fetching accounts...');
             const accounts = await accountService.listAccounts();
-            set({ accounts, loading: false });
+            if (requestVersion === accountsRequestVersion) {
+                set({ accounts, loading: false });
+            }
         } catch (error) {
-            console.error('[Store] Fetch accounts failed:', error);
-            set({ error: String(error), loading: false });
+            if (requestVersion === accountsRequestVersion) {
+                set({ error: String(error), loading: false });
+            }
         }
     },
 
     fetchCurrentAccount: async () => {
+        const requestVersion = ++currentAccountRequestVersion;
         set({ loading: true, error: null });
         try {
             const account = await accountService.getCurrentAccount();
-            set({ currentAccount: account, loading: false });
+            if (requestVersion === currentAccountRequestVersion) {
+                set({ currentAccount: account, loading: false });
+            }
         } catch (error) {
-            set({ error: String(error), loading: false });
+            if (requestVersion === currentAccountRequestVersion) {
+                set({ error: String(error), loading: false });
+            }
         }
     },
 
     addAccount: async (email: string, refreshToken: string) => {
+        invalidateAccountsRead();
         set({ loading: true, error: null });
         try {
             await accountService.addAccount(email, refreshToken);
@@ -74,9 +99,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     },
 
     deleteAccount: async (accountId: string) => {
+        invalidateAccountReads();
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccount(accountId);
+            invalidateAccountReads();
             await Promise.all([
                 get().fetchAccounts(),
                 get().fetchCurrentAccount()
@@ -89,9 +116,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     },
 
     deleteAccounts: async (accountIds: string[]) => {
+        invalidateAccountReads();
         set({ loading: true, error: null });
         try {
             await accountService.deleteAccounts(accountIds);
+            invalidateAccountReads();
             await Promise.all([
                 get().fetchAccounts(),
                 get().fetchCurrentAccount()
@@ -105,8 +134,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
 
     switchAccount: async (accountId: string, targetIde?: string) => {
         set({ loading: true, error: null });
+        invalidateCurrentAccountRead();
         try {
             await accountService.switchAccount(accountId, targetIde);
+            invalidateCurrentAccountRead();
             await get().fetchCurrentAccount();
             set({ loading: false });
         } catch (error) {
@@ -119,6 +150,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.fetchAccountQuota(accountId);
+            invalidateAccountsRead();
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {
@@ -131,6 +163,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             const stats = await accountService.refreshAllQuotas();
+            invalidateAccountsRead();
             await get().fetchAccounts();
             set({ loading: false });
             return stats;
@@ -140,33 +173,26 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 
-    /**
-     * 重新排序账号列表
-     * 采用乐观更新策略：先更新本地状态再调用后端持久化，以提供流畅的拖拽体验
-     */
     reorderAccounts: async (accountIds: string[]) => {
         const { accounts } = get();
+        if (accountIds.length !== accounts.length || new Set(accountIds).size !== accounts.length) {
+            throw new Error('Account reorder requires a complete account order');
+        }
 
-        // 创建 ID 到账号的映射
         const accountMap = new Map(accounts.map(acc => [acc.id, acc]));
-
-        // 按新顺序重建账号数组
-        const reorderedAccounts = accountIds
+        const finalAccounts = accountIds
             .map(id => accountMap.get(id))
             .filter((acc): acc is Account => acc !== undefined);
+        if (finalAccounts.length !== accounts.length) {
+            throw new Error('Account reorder contains an unknown account');
+        }
 
-        // 添加未在新顺序中的账号（保持原有顺序）
-        const remainingAccounts = accounts.filter(acc => !accountIds.includes(acc.id));
-        const finalAccounts = [...reorderedAccounts, ...remainingAccounts];
-
-        // 乐观更新本地状态
+        invalidateAccountsRead();
         set({ accounts: finalAccounts });
-
         try {
             await accountService.reorderAccounts(accountIds);
+            invalidateAccountsRead();
         } catch (error) {
-            // 后端失败时回滚到原始顺序
-            console.error('[AccountStore] Reorder accounts failed:', error);
             set({ accounts });
             throw error;
         }
@@ -176,6 +202,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.startOAuthLogin();
+            invalidateAccountsRead();
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {
@@ -188,6 +215,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.completeOAuthLogin();
+            invalidateAccountsRead();
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {
@@ -209,6 +237,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.importV1Accounts();
+            invalidateAccountsRead();
             await get().fetchAccounts();
             set({ loading: false });
         } catch (error) {
@@ -221,6 +250,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.importFromDb();
+            invalidateAccountReads();
             await Promise.all([
                 get().fetchAccounts(),
                 get().fetchCurrentAccount()
@@ -236,6 +266,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.importFromCustomDb(path);
+            invalidateAccountReads();
             await Promise.all([
                 get().fetchAccounts(),
                 get().fetchCurrentAccount()
@@ -263,6 +294,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     toggleProxyStatus: async (accountId: string, enable: boolean, reason?: string) => {
         try {
             await accountService.toggleProxyStatus(accountId, enable, reason);
+            invalidateAccountsRead();
             await get().fetchAccounts();
         } catch (error) {
             console.error('[AccountStore] Toggle proxy status failed:', error);
@@ -301,6 +333,7 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     updateAccountLabel: async (accountId: string, label: string) => {
         try {
             await accountService.updateAccountLabel(accountId, label);
+            invalidateAccountsRead();
             // 乐观更新本地状态
             const { accounts } = get();
             const updatedAccounts = accounts.map(acc =>

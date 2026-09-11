@@ -92,6 +92,7 @@ where
                             }
                         }
                         Err(e) => {
+                            state.upstream_failed = true;
                             let error_json = serde_json::json!({
                                 "type": "error",
                                 "error": {
@@ -104,15 +105,20 @@ where
                         }
                     }
                 }
-                Ok(None) => break, // Stream 正常结束
+                Ok(None) => break,
                 Err(_) => {
                     // [FIX #Bug1] Timeout - send keepalive ping but track consecutive count
                     consecutive_pings += 1;
                     if consecutive_pings >= MAX_CONSECUTIVE_PINGS {
-                        tracing::error!(
-                            "[{}] Stream idle for {}s ({}x 20s timeout), terminating",
-                            trace_id, consecutive_pings * 20, consecutive_pings
-                        );
+                        state.upstream_failed = true;
+                        let error_json = serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "overloaded_error",
+                                "message": "Upstream stream ended before a terminal response"
+                            }
+                        });
+                        yield Ok(state.emit("error", error_json));
                         break;
                     }
                     tracing::debug!(
@@ -141,58 +147,47 @@ where
              buffer.clear();
         }
 
-        // [FIX #Bug3] Post-thinking interruption recovery
-        // If we have sent thinking but NO content (text/tool_use) and the stream ended,
-        // we must provide a fallback to prevent loop hang on client side.
-        if state.has_thinking && !state.has_content {
-            tracing::warn!("[{}] Stream interrupted after thinking (No Content). Triggering recovery...", trace_id);
+        for chunk in state.flush_incomplete_mcp_xml() {
+            yield Ok(chunk);
+        }
+        if !state.upstream_failed {
+            for chunk in state.emit_pending_finish() {
+                yield Ok(chunk);
+            }
+        }
 
-            // 1. Force close thinking block if open
+        if !state.terminal_received && !state.upstream_failed {
+            state.upstream_failed = true;
+            let error_json = serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Upstream stream ended before a terminal response"
+                }
+            });
+            yield Ok(state.emit("error", error_json));
+        }
+
+        // Recovery is only valid before terminal emission and never converts an
+        // upstream failure or premature EOF into a successful Claude response.
+        if !state.upstream_failed && !state.message_stop_sent && state.has_thinking && !state.has_content {
+            tracing::warn!("[{}] Stream interrupted after thinking (No Content). Triggering recovery...", trace_id);
             if state.current_block_type() == crate::proxy::mappers::claude::streaming::BlockType::Thinking {
-               let close_chunks = state.end_block();
-               for chunk in close_chunks {
+               for chunk in state.end_block() {
                    yield Ok(chunk);
                }
             }
-
-            // 2. Inject recovery text block to inform user
-            let recovery_msg = "\n\n[System] Upstream model interrupted after thinking. (Recovered by Antigravity)";
-            let start_chunks = state.start_block(
+            for chunk in state.start_block(
                 crate::proxy::mappers::claude::streaming::BlockType::Text,
-                serde_json::json!({ "type": "text", "text": recovery_msg })
-            );
-            for chunk in start_chunks { yield Ok(chunk); }
-            let stop_chunks = state.end_block();
-            for chunk in stop_chunks { yield Ok(chunk); }
-
-            // 3. Mark as content received
-            state.has_content = true;
-
-            // 4. [FIX #Bug3] Explicitly emit message_delta + message_stop.
-            // Previously, the recovery path relied on emit_force_stop() below,
-            // but if message_stop_sent was already true (e.g. from a partial finish),
-            // emit_force_stop() would be a no-op and the client would hang in loop.
-            if !state.message_stop_sent {
-                let recovery_usage = crate::proxy::mappers::claude::models::Usage {
-                    input_tokens: 0,
-                    output_tokens: 100, // Minimal non-zero to satisfy client
-                    cache_read_input_tokens: None,
-                    cache_creation_input_tokens: None,
-                    server_tool_use: None,
-                };
-                let delta = serde_json::json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                    "usage": recovery_usage
-                });
-                yield Ok(state.emit("message_delta", delta));
-                yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
-                state.message_stop_sent = true;
+                serde_json::json!({ "type": "text", "text": "\n\n[System] Upstream model interrupted after thinking. (Recovered by Antigravity)" })
+            ) {
+                yield Ok(chunk);
             }
-        } else if !state.has_content && !state.has_thinking {
-            // [FIX #3359] Empty response recovery (e.g. single dot prompt health check)
-            // If the upstream ended immediately without generating thinking or text content,
-            // we must ensure message_start and at least one text block are sent before termination.
+            for chunk in state.end_block() {
+                yield Ok(chunk);
+            }
+            state.has_content = true;
+        } else if !state.upstream_failed && !state.message_stop_sent && !state.has_content && !state.has_thinking {
             if !state.message_start_sent {
                 let dummy_start = serde_json::json!({
                     "responseId": format!("msg_recovered_{}", chrono::Utc::now().timestamp_millis()),
@@ -200,38 +195,22 @@ where
                 });
                 yield Ok(state.emit_message_start(&dummy_start));
             }
-
-            let start_chunks = state.start_block(
+            for chunk in state.start_block(
                 crate::proxy::mappers::claude::streaming::BlockType::Text,
                 serde_json::json!({ "type": "text", "text": "." }),
-            );
-            for chunk in start_chunks {
+            ) {
                 yield Ok(chunk);
             }
-            let stop_chunks = state.end_block();
-            for chunk in stop_chunks {
+            for chunk in state.end_block() {
                 yield Ok(chunk);
             }
             state.has_content = true;
-
-            let recovery_usage = crate::proxy::mappers::claude::models::Usage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_input_tokens: None,
-                cache_creation_input_tokens: None,
-                server_tool_use: None,
-            };
-            let delta = serde_json::json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                "usage": recovery_usage
-            });
-            yield Ok(state.emit("message_delta", delta));
         }
 
-        // Ensure termination events are sent
-        for chunk in emit_force_stop(&mut state) {
-            yield Ok(chunk);
+        if !state.upstream_failed {
+            for chunk in emit_force_stop(&mut state) {
+                yield Ok(chunk);
+            }
         }
     })
 }
@@ -247,57 +226,85 @@ fn process_sse_line(
         return None;
     }
 
+    if state.message_stop_sent {
+        return None;
+    }
+
     let data_str = line[6..].trim();
     if data_str.is_empty() {
         return None;
     }
 
     if data_str == "[DONE]" {
-        let chunks = emit_force_stop(state);
-        if chunks.is_empty() {
+        if state.terminal_received {
             return None;
         }
-        return Some(chunks);
+        state.upstream_failed = true;
+        return Some(vec![state.emit(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Upstream stream ended before a terminal response"
+                }
+            }),
+        )]);
     }
 
-    // 解析 JSON
     let json_value: serde_json::Value = match serde_json::from_str(data_str) {
-        Ok(v) => v,
+        Ok(value) => value,
         Err(_) => return None,
     };
+    if let Some(error) = json_value.get("error") {
+        state.upstream_failed = true;
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Upstream error");
+        return Some(vec![state.emit(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": message
+                }
+            }),
+        )]);
+    }
 
     let mut chunks = Vec::new();
-
-    // 解包 response 字段 (如果存在)
     let raw_json = json_value.get("response").unwrap_or(&json_value);
-
-    // 发送 message_start
+    let usage = raw_json
+        .get("usageMetadata")
+        .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok());
+    state.record_terminal_metadata(None, usage.clone());
     if !state.message_start_sent {
         chunks.push(state.emit_message_start(raw_json));
     }
 
-    // 捕获 groundingMetadata (Web Search)
     if let Some(candidate) = raw_json.get("candidates").and_then(|c| c.get(0)) {
         if let Some(grounding) = candidate.get("groundingMetadata") {
-            // 提取搜索词
             if let Some(query) = grounding
                 .get("webSearchQueries")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.get(0))
-                .and_then(|v| v.as_str())
+                .and_then(|value| value.as_array())
+                .and_then(|values| values.first())
+                .and_then(|value| value.as_str())
             {
                 state.web_search_query = Some(query.to_string());
             }
-
-            // 提取结果块
-            if let Some(chunks_arr) = grounding.get("groundingChunks").and_then(|v| v.as_array()) {
-                state.grounding_chunks = Some(chunks_arr.clone());
-            } else if let Some(chunks_arr) = grounding
-                .get("grounding_metadata")
-                .and_then(|m| m.get("groundingChunks"))
-                .and_then(|v| v.as_array())
+            if let Some(values) = grounding
+                .get("groundingChunks")
+                .and_then(|value| value.as_array())
             {
-                state.grounding_chunks = Some(chunks_arr.clone());
+                state.grounding_chunks = Some(values.clone());
+            } else if let Some(values) = grounding
+                .get("grounding_metadata")
+                .and_then(|value| value.get("groundingChunks"))
+                .and_then(|value| value.as_array())
+            {
+                state.grounding_chunks = Some(values.clone());
             }
         }
     }
@@ -342,10 +349,6 @@ fn process_sse_line(
         .and_then(|cand| cand.get("finishReason"))
         .and_then(|f| f.as_str())
     {
-        let usage = raw_json
-            .get("usageMetadata")
-            .and_then(|u| serde_json::from_value::<UsageMetadata>(u.clone()).ok());
-
         if let Some(ref u) = usage {
             let cached_tokens = u.cached_content_token_count.unwrap_or(0);
             let cache_info = if cached_tokens > 0 {
@@ -366,7 +369,7 @@ fn process_sse_line(
             );
         }
 
-        chunks.extend(state.emit_finish(Some(finish_reason), usage.as_ref()));
+        state.record_terminal_metadata(Some(finish_reason), usage);
     }
 
     if chunks.is_empty() {
@@ -518,18 +521,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_process_sse_line_done() {
+    fn test_process_sse_line_done_reports_premature_eof() {
         let mut state = StreamingState::new();
         let result = process_sse_line("data: [DONE]", &mut state, "test_id", "test@example.com");
-        assert!(result.is_some());
         let chunks = result.unwrap();
-        assert!(!chunks.is_empty());
-
         let all_text: String = chunks
             .iter()
             .map(|b| String::from_utf8(b.to_vec()).unwrap_or_default())
             .collect();
-        assert!(all_text.contains("message_stop"));
+        assert!(all_text.contains("event: error"));
+        assert!(all_text.contains(r#""type":"overloaded_error""#));
+        assert!(!all_text.contains("message_stop"));
     }
 
     #[test]
@@ -556,12 +558,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thinking_only_interruption_recovery() {
+    async fn test_thinking_only_interruption_reports_failure() {
         use futures::StreamExt;
 
-        // 1. 模拟一个只发送 Thinking 然后就结束的流
+        // A stream containing only thinking then ending has not completed successfully.
         let mock_stream = async_stream::stream! {
-            // 发送 Thinking 块
             let thinking_json = serde_json::json!({
                 "candidates": [{
                     "content": {
@@ -572,11 +573,8 @@ mod tests {
                 "responseId": "msg_interrupted"
             });
             yield Ok::<_, String>(bytes::Bytes::from(format!("data: {}\n\n", thinking_json)));
-
-            // 然后突然结束 (没有 Text, 没有 Usage, 直接 None)
         };
 
-        // 2. 创建转换后的流
         let mut claude_stream = create_claude_sse_stream(
             Box::pin(mock_stream),
             "trace_test".to_string(),
@@ -585,12 +583,11 @@ mod tests {
             false,
             1_000,
             None,
-            1,          // message_count
-            None,       // client_adapter
-            Vec::new(), // registered_tool_names
+            1,
+            None,
+            Vec::new(),
         );
 
-        // 3. 收集输出
         let mut all_chunks = Vec::new();
         while let Some(result) = claude_stream.next().await {
             if let Ok(bytes) = result {
@@ -599,15 +596,33 @@ mod tests {
         }
         let output = all_chunks.join("");
 
-        // 4. 验证恢复逻辑
-        // 必须包含 Thinking
         assert!(output.contains("Thinking..."));
+        assert!(output.contains("event: error"));
+        assert!(output.contains(r#""type":"overloaded_error""#));
+        assert!(!output.contains("message_stop"));
+    }
+    #[test]
+    fn terminal_usage_metadata_arriving_after_finish_is_emitted_before_message_stop() {
+        let mut state = StreamingState::new();
+        let finish = r#"data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]},"finishReason":"STOP"}],"modelVersion":"test","responseId":"123"}"#;
+        let pre_terminal =
+            process_sse_line(finish, &mut state, "test_id", "test@example.com").unwrap();
+        let pre_terminal: String = pre_terminal
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        assert!(!pre_terminal.contains("message_stop"));
 
-        // 必须包含恢复的系统提示
-        assert!(output.contains("Recovered by Antigravity"));
+        let usage = r#"data: {"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":11}}"#;
+        assert!(process_sse_line(usage, &mut state, "test_id", "test@example.com").is_none());
 
-        // 必须包含模拟的 Usage
-        assert!(output.contains("\"usage\":"));
-        assert!(output.contains("\"output_tokens\":100")); // Should contain the recovery usage
+        let terminal: String = state
+            .emit_pending_finish()
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        assert!(terminal.contains("\"input_tokens\":7"));
+        assert!(terminal.contains("\"output_tokens\":11"));
+        assert!(terminal.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
     }
 }

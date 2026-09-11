@@ -67,9 +67,9 @@ impl RtkCleaner {
 
     /// Group similar consecutive lines by replacing digit clusters with a placeholder
     /// and collapsing runs of identical "skeletons".
-    pub fn group_similar_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    pub fn group_similar_lines(lines: &[&str]) -> Vec<String> {
         if lines.len() < 3 {
-            return lines.to_vec();
+            return lines.iter().map(|line| (*line).to_string()).collect();
         }
 
         let mut result = Vec::new();
@@ -80,12 +80,11 @@ impl RtkCleaner {
             let current_trimmed = current.trim();
 
             if current_trimmed.is_empty() || current_trimmed.len() < 5 {
-                result.push(current);
+                result.push(current.to_string());
                 index += 1;
                 continue;
             }
 
-            // Extract "skeleton" by replacing all digits with '#'
             let get_skeleton =
                 |s: &str| -> String { DIGITS_RE.replace_all(s.trim(), "#").to_string() };
 
@@ -101,8 +100,7 @@ impl RtkCleaner {
                     continue;
                 }
 
-                let next_skeleton = get_skeleton(next_trimmed);
-                if next_skeleton == current_skeleton {
+                if get_skeleton(next_trimmed) == current_skeleton {
                     run_end += 1;
                 } else {
                     break;
@@ -111,23 +109,11 @@ impl RtkCleaner {
 
             let run_len = run_end - index;
             if run_len >= 3 {
-                // We have a run of 3 or more similar lines. Keep the first line,
-                // add a placeholder indicating collapsed lines, and keep the last line of the run.
-                result.push(lines[index]);
-
-                // Construct placeholder string
-                // We use static allocation for the placeholder to avoid lifetime issues
-                let collapsed_msg = Box::leak(
-                    format!("... [Collapsed {} similar lines] ...", run_len - 2).into_boxed_str(),
-                );
-                result.push(collapsed_msg);
-
-                result.push(lines[run_end - 1]);
+                result.push(lines[index].to_string());
+                result.push(format!("... [Collapsed {} similar lines] ...", run_len - 2));
+                result.push(lines[run_end - 1].to_string());
             } else {
-                // Copy the elements as-is
-                for i in index..run_end {
-                    result.push(lines[i]);
-                }
+                result.extend(lines[index..run_end].iter().map(|line| (*line).to_string()));
             }
 
             index = run_end;
@@ -137,9 +123,13 @@ impl RtkCleaner {
     }
 
     /// Smart truncate: Keep top N and bottom N lines, but scan the middle and preserve error lines.
-    pub fn smart_truncate(lines: &[&str], max_lines: usize) -> String {
+    pub fn smart_truncate<T: AsRef<str>>(lines: &[T], max_lines: usize) -> String {
         if lines.len() <= max_lines {
-            return lines.join("\n");
+            return lines
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>()
+                .join("\n");
         }
 
         // Determine how many lines to keep at head and tail
@@ -153,7 +143,7 @@ impl RtkCleaner {
 
         // 1. Keep Head
         for i in 0..head_end {
-            output.push(lines[i].to_string());
+            output.push(lines[i].as_ref().to_string());
         }
 
         // 2. Scan Middle and extract only errors/failures
@@ -161,7 +151,7 @@ impl RtkCleaner {
         let mut skipped_count = 0;
 
         for i in head_end..tail_start {
-            let line = lines[i];
+            let line = lines[i].as_ref();
             if ERROR_KEYWORDS_RE.is_match(line) {
                 middle_errors.push(line.to_string());
             } else {
@@ -186,7 +176,7 @@ impl RtkCleaner {
 
         // 4. Keep Tail
         for i in tail_start..lines.len() {
-            output.push(lines[i].to_string());
+            output.push(lines[i].as_ref().to_string());
         }
 
         output.join("\n")

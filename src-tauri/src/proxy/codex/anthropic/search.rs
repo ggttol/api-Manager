@@ -132,9 +132,9 @@ pub(super) fn result(item: &Value, id: &str) -> Result<(Value, Value), CodexErro
         .ok_or_else(|| CodexError::upstream("Native web search has no action"))?;
     let mut input = action.clone();
     input.as_object_mut().unwrap().remove("sources");
-    // Keep query/queries and open_page/find action data faithfully; no fabricated search query.
+    // Keep query/queries and native action data faithfully; no fabricated search query.
     match upstream_string(action, "type")? {
-        "search" | "open_page" | "find" => {}
+        "search" | "open_page" | "find" | "find_in_page" => {}
         _ => return Err(CodexError::upstream("Unsupported native web search action")),
     }
     let mut sources = Vec::new();
@@ -790,6 +790,44 @@ mod tests {
                 .status,
             StatusCode::CONFLICT
         );
+    }
+    #[tokio::test]
+    async fn find_in_page_search_maps_in_unary_and_streaming_modes() {
+        let mut call = native_call(false);
+        call["action"] = json!({
+            "type":"find_in_page",
+            "url":"https://example.com/docs",
+            "pattern":"installation"
+        });
+        let output = json!([call.clone(), native_message(false)]);
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let scope = [7; 32];
+        let unary = convert_response(
+            terminal(output.clone()),
+            &manager,
+            &scope,
+            "origin-account",
+            "native",
+        )
+        .await
+        .unwrap();
+        assert_eq!(unary["content"][0]["type"], "server_tool_use");
+        assert_eq!(unary["content"][0]["input"]["type"], "find_in_page");
+        assert_eq!(unary["content"][1]["type"], "web_search_tool_result");
+
+        let mut mapper = StreamMapper::new("native".into());
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"response.created", "response":{"id":"response-find"}}),
+            json!({"type":"response.output_item.done", "output_index":0, "item":call}),
+            json!({"type":"response.output_item.done", "output_index":1, "item":native_message(false)}),
+            json!({"type":"response.completed", "response":terminal(output)}),
+        ] {
+            events.extend(mapper.event(&event).unwrap());
+        }
+        assert!(events.iter().any(|event| event["type"] == "message_stop"));
+        assert_eq!(accumulate(&events), mapper.replay_wire().unwrap());
     }
 
     #[tokio::test]

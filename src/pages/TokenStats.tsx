@@ -92,96 +92,84 @@ const TokenStats: React.FC = () => {
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState(false);
     const [showAllSeries, setShowAllSeries] = useState(false);
+    const [reloadSequence, setReloadSequence] = useState(0);
 
-    const fetchData = async () => {
-        setLoading(true);
-        setLoadError(false);
-        try {
-            let hours = 24;
-            let data: TokenStatsAggregated[] = [];
-            let modelTrend: ModelTrendPoint[] = [];
-            let accountTrend: AccountTrendPoint[] = [];
-
-            switch (timeRange) {
-                case 'hourly':
-                    hours = 24;
-                    data = await invoke<TokenStatsAggregated[]>('get_token_stats_hourly', { hours: 24 });
-                    modelTrend = await invoke<ModelTrendPoint[]>('get_token_stats_model_trend_hourly', { hours: 24 });
-                    accountTrend = await invoke<AccountTrendPoint[]>('get_token_stats_account_trend_hourly', { hours: 24 });
-                    break;
-                case 'daily':
-                    hours = 168;
-                    data = await invoke<TokenStatsAggregated[]>('get_token_stats_daily', { days: 7 });
-                    modelTrend = await invoke<ModelTrendPoint[]>('get_token_stats_model_trend_daily', { days: 7 });
-                    accountTrend = await invoke<AccountTrendPoint[]>('get_token_stats_account_trend_daily', { days: 7 });
-                    break;
-                case 'weekly':
-                    hours = 720;
-                    data = await invoke<TokenStatsAggregated[]>('get_token_stats_weekly', { weeks: 4 });
-                    modelTrend = await invoke<ModelTrendPoint[]>('get_token_stats_model_trend_daily', { days: 30 });
-                    accountTrend = await invoke<AccountTrendPoint[]>('get_token_stats_account_trend_daily', { days: 30 });
-                    break;
-            }
-
-            setChartData(data.map(point => ({
-                ...point,
-                total_cached_tokens: point.total_cached_tokens || 0,
-                uncached_input_tokens: Math.max((point.total_input_tokens || 0) - (point.total_cached_tokens || 0), 0)
-            })));
-
-            const models = new Set<string>();
-            modelTrend.forEach(point => {
-                Object.keys(point.model_data).forEach(m => models.add(m));
-            });
-            const modelList = Array.from(models);
-            setAllModels(modelList);
-
-            const transformedTrend = modelTrend.map(point => {
-                const row: Record<string, any> = { period: point.period };
-                modelList.forEach(model => {
-                    row[model] = point.model_data[model] || 0;
-                });
-                return row;
-            });
-            setModelTrendData(transformedTrend);
-
-            // Process Account Trend Data
-            const accountsSet = new Set<string>();
-            accountTrend.forEach(point => {
-                Object.keys(point.account_data).forEach(acc => accountsSet.add(acc));
-            });
-            const accountList = Array.from(accountsSet);
-            setAllAccounts(accountList);
-
-            const transformedAccountTrend = accountTrend.map(point => {
-                const row: Record<string, any> = { period: point.period };
-                accountList.forEach(acc => {
-                    row[acc] = point.account_data[acc] || 0;
-                });
-                return row;
-            });
-            setAccountTrendData(transformedAccountTrend);
-
-            const [accounts, models_stats, summaryData] = await Promise.all([
-                invoke<AccountTokenStats[]>('get_token_stats_by_account', { hours }),
-                invoke<ModelTokenStats[]>('get_token_stats_by_model', { hours }),
-                invoke<TokenStatsSummary>('get_token_stats_summary', { hours })
-            ]);
-
-            setAccountData(accounts);
-            setModelData(models_stats);
-            setSummary(summaryData);
-        } catch (error) {
-            setLoadError(true);
-            console.error('Failed to fetch token stats:', error);
-        } finally {
-            setLoading(false);
-        }
-    };
+    const fetchGeneration = useRef(0);
 
     useEffect(() => {
-        fetchData();
-    }, [timeRange]);
+        const generation = ++fetchGeneration.current;
+        const controller = new AbortController();
+        const requestOptions = { signal: controller.signal };
+        const range = timeRange;
+        setLoading(true);
+        setLoadError(false);
+
+        const load = async () => {
+            const hours = range === 'hourly' ? 24 : range === 'daily' ? 168 : 672;
+            const aggregate = range === 'hourly'
+                ? invoke<TokenStatsAggregated[]>('get_token_stats_hourly', { hours }, requestOptions)
+                : range === 'daily'
+                    ? invoke<TokenStatsAggregated[]>('get_token_stats_daily', { days: 7 }, requestOptions)
+                    : invoke<TokenStatsAggregated[]>('get_token_stats_weekly', { weeks: 4 }, requestOptions);
+            const modelTrend = range === 'hourly'
+                ? invoke<ModelTrendPoint[]>('get_token_stats_model_trend_hourly', { hours }, requestOptions)
+                : invoke<ModelTrendPoint[]>('get_token_stats_model_trend_daily', { days: range === 'daily' ? 7 : 28 }, requestOptions);
+            const accountTrend = range === 'hourly'
+                ? invoke<AccountTrendPoint[]>('get_token_stats_account_trend_hourly', { hours }, requestOptions)
+                : invoke<AccountTrendPoint[]>('get_token_stats_account_trend_daily', { days: range === 'daily' ? 7 : 28 }, requestOptions);
+
+            try {
+                const [data, modelTrendData, accountTrendData, accounts, models, summaryData] = await Promise.all([
+                    aggregate,
+                    modelTrend,
+                    accountTrend,
+                    invoke<AccountTokenStats[]>('get_token_stats_by_account', { hours }, requestOptions),
+                    invoke<ModelTokenStats[]>('get_token_stats_by_model', { hours }, requestOptions),
+                    invoke<TokenStatsSummary>('get_token_stats_summary', { hours }, requestOptions),
+                ]);
+                if (generation !== fetchGeneration.current) return;
+
+                const chart = data.map(point => ({
+                    ...point,
+                    total_cached_tokens: point.total_cached_tokens || 0,
+                    uncached_input_tokens: Math.max((point.total_input_tokens || 0) - (point.total_cached_tokens || 0), 0),
+                }));
+                const modelList = Array.from(new Set(modelTrendData.flatMap(point => Object.keys(point.model_data))));
+                const transformedModelTrend = modelTrendData.map(point => {
+                    const row: Record<string, any> = { period: point.period };
+                    modelList.forEach(model => { row[model] = point.model_data[model] || 0; });
+                    return row;
+                });
+                const accountList = Array.from(new Set(accountTrendData.flatMap(point => Object.keys(point.account_data))));
+                const transformedAccountTrend = accountTrendData.map(point => {
+                    const row: Record<string, any> = { period: point.period };
+                    accountList.forEach(account => { row[account] = point.account_data[account] || 0; });
+                    return row;
+                });
+
+                setChartData(chart);
+                setAllModels(modelList);
+                setModelTrendData(transformedModelTrend);
+                setAllAccounts(accountList);
+                setAccountTrendData(transformedAccountTrend);
+                setAccountData(accounts);
+                setModelData(models);
+                setSummary(summaryData);
+            } catch (error) {
+                if (generation !== fetchGeneration.current) return;
+                setLoadError(true);
+                console.error('Failed to fetch token stats:', error);
+            } finally {
+                if (generation === fetchGeneration.current) setLoading(false);
+            }
+        };
+
+        void load();
+        return () => {
+            fetchGeneration.current += 1;
+            controller.abort();
+        };
+    }, [timeRange, reloadSequence]);
 
     const otherLabel = t('console.stats_other', { defaultValue: i18n.language.startsWith('zh') ? '其他' : 'Other' });
     const trend = useMemo(() => {
@@ -376,7 +364,7 @@ const TokenStats: React.FC = () => {
                 <PageHeader
                     title={t('nav.token_stats')}
                     description={t('console.stats_description', { defaultValue: i18n.language.startsWith('zh') ? '查看用量趋势、模型分布与账号明细。' : 'Explore usage trends, model distribution and account details.' })}
-                    actions={<button onClick={fetchData} disabled={loading} className="console-button">
+                    actions={<button onClick={() => setReloadSequence(sequence => sequence + 1)} disabled={loading} className="console-button">
                         <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />{t('common.refresh')}
                     </button>}
                 />

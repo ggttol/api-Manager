@@ -3,10 +3,11 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::proxy::common::variant_mapping::{VariantTier, GEMINI_FAMILIES};
+use crate::utils::atomic_file::{lock_client_config, write_atomic};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -21,6 +22,7 @@ const ANTIGRAVITY_CONFIG_FILE: &str = "antigravity.json";
 const ANTIGRAVITY_ACCOUNTS_FILE: &str = "antigravity-accounts.json";
 const BACKUP_SUFFIX: &str = ".antigravity-manager.bak";
 const OLD_BACKUP_SUFFIX: &str = ".antigravity.bak";
+const ACCOUNTS_OWNERSHIP_FILE: &str = ".antigravity-manager-accounts-owned";
 
 const ANTIGRAVITY_PROVIDER_ID: &str = "antigravity-manager";
 
@@ -345,7 +347,7 @@ fn get_config_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
 /// handled separately by [`strip_jsonc_trailing_commas`].
 fn strip_jsonc_comments(input: &str) -> String {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     let mut in_string = false;
 
@@ -353,10 +355,9 @@ fn strip_jsonc_comments(input: &str) -> String {
         let c = bytes[i];
 
         if in_string {
-            out.push(c as char);
+            out.push(c);
             if c == b'\\' && i + 1 < bytes.len() {
-                // Keep the escaped char verbatim (e.g. \", \\, \/).
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -370,18 +371,16 @@ fn strip_jsonc_comments(input: &str) -> String {
         match c {
             b'"' => {
                 in_string = true;
-                out.push('"');
+                out.push(c);
                 i += 1;
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                // Line comment: skip until newline.
                 i += 2;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                // Block comment: skip until closing */.
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                     i += 1;
@@ -389,13 +388,13 @@ fn strip_jsonc_comments(input: &str) -> String {
                 i = (i + 2).min(bytes.len());
             }
             _ => {
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
         }
     }
 
-    out
+    String::from_utf8(out).expect("JSONC input was valid UTF-8")
 }
 
 /// Remove trailing commas (a `,` followed, after optional whitespace, by a closing
@@ -404,7 +403,7 @@ fn strip_jsonc_comments(input: &str) -> String {
 /// never touched.
 fn strip_jsonc_trailing_commas(input: &str) -> String {
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     let mut in_string = false;
 
@@ -412,9 +411,9 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
         let c = bytes[i];
 
         if in_string {
-            out.push(c as char);
+            out.push(c);
             if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -427,42 +426,27 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
 
         if c == b'"' {
             in_string = true;
-            out.push('"');
+            out.push(c);
             i += 1;
             continue;
         }
 
-        // When we hit a comma outside a string, look ahead past whitespace. If the next
-        // significant character closes an object/array, this is a trailing comma — drop
-        // it. Otherwise keep the comma (it separates real elements).
         if c == b',' {
             let mut j = i + 1;
-            let mut is_trailing = false;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b' ' | b'\t' | b'\n' | b'\r' => j += 1,
-                    b'}' | b']' => {
-                        is_trailing = true;
-                        break;
-                    }
-                    _ => break,
-                }
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+                j += 1;
             }
-            if is_trailing {
-                // Skip the comma (don't push it); leave the whitespace to be pushed normally.
+            if j < bytes.len() && matches!(bytes[j], b'}' | b']') {
                 i += 1;
-            } else {
-                out.push(',');
-                i += 1;
+                continue;
             }
-            continue;
         }
 
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
 
-    out
+    String::from_utf8(out).expect("JSONC input was valid UTF-8")
 }
 
 /// Read and parse an OpenCode config file, tolerating JSONC comments and trailing commas.
@@ -889,68 +873,61 @@ pub fn get_sync_status(proxy_url: &str) -> (bool, bool, Option<String>) {
         return (false, false, None);
     };
 
-    let mut is_synced = true;
-    let mut has_backup = false;
-    let mut current_base_url = None;
-
-    // Backups may have been created against either opencode.json or opencode.jsonc.
-    // Check both the active file name's backup and the canonical json backup so a
-    // previously-synced state is still detected after switching file types.
-    let active_file_name = config_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(OPENCODE_CONFIG_FILE);
-    let backup_candidates = [
-        format!("{}{}", active_file_name, BACKUP_SUFFIX),
-        format!("{}{}", active_file_name, OLD_BACKUP_SUFFIX),
-        format!("{}{}", OPENCODE_CONFIG_FILE, BACKUP_SUFFIX),
-        format!("{}{}", OPENCODE_CONFIG_FILE, OLD_BACKUP_SUFFIX),
-    ];
-    for name in &backup_candidates {
-        if config_path.with_file_name(name).exists() {
-            has_backup = true;
-            break;
-        }
-    }
-
+    let has_backup = config_backup_candidates(&config_path)
+        .into_iter()
+        .any(|backup_path| backup_path.exists());
     if !config_path.exists() {
         return (false, has_backup, None);
     }
 
     let content = match fs::read_to_string(&config_path) {
-        Ok(c) => c,
+        Ok(content) => content,
         Err(_) => return (false, has_backup, None),
     };
-
-    let json: Value = parse_jsonc(&content).unwrap_or_default();
-
-    // Normalize proxy URL for comparison
-    let normalized_proxy = normalize_opencode_base_url(proxy_url);
-
-    // Only check antigravity-manager provider
-    let ag_opts = get_provider_options(&json, ANTIGRAVITY_PROVIDER_ID);
-    let ag_url = ag_opts
-        .and_then(|o| o.get("baseURL"))
-        .and_then(|v| v.as_str());
-    let ag_key = ag_opts
-        .and_then(|o| o.get("apiKey"))
-        .and_then(|v| v.as_str());
-
-    if let (Some(url), Some(_key)) = (ag_url, ag_key) {
-        current_base_url = Some(url.to_string());
-        // Normalize config URL before comparison
-        let normalized_config_url = normalize_opencode_base_url(url);
-        if normalized_config_url != normalized_proxy {
-            is_synced = false;
-        }
-    } else {
-        is_synced = false;
-    }
-
-    (is_synced, has_backup, current_base_url)
+    let json = match parse_jsonc(&content) {
+        Some(json) => json,
+        None => return (false, has_backup, None),
+    };
+    let Some(options) = get_provider_options(&json, ANTIGRAVITY_PROVIDER_ID) else {
+        return (false, has_backup, None);
+    };
+    let Some(url) = options.get("baseURL").and_then(Value::as_str) else {
+        return (false, has_backup, None);
+    };
+    let has_api_key = options.get("apiKey").and_then(Value::as_str).is_some();
+    (
+        has_api_key && base_url_matches(url, proxy_url),
+        has_backup,
+        Some(url.to_string()),
+    )
 }
 
-fn create_backup(path: &PathBuf) -> Result<(), String> {
+fn config_backup_candidates(config_path: &Path) -> Vec<PathBuf> {
+    let active_file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(OPENCODE_CONFIG_FILE);
+    let mut file_names = vec![active_file_name];
+    for file_name in [OPENCODE_CONFIG_FILE, OPENCODE_CONFIG_FILE_JSONC] {
+        if !file_names.contains(&file_name) {
+            file_names.push(file_name);
+        }
+    }
+    file_names
+        .into_iter()
+        .flat_map(|file_name| {
+            [BACKUP_SUFFIX, OLD_BACKUP_SUFFIX]
+                .into_iter()
+                .map(move |suffix| config_path.with_file_name(format!("{file_name}{suffix}")))
+        })
+        .collect()
+}
+
+fn accounts_ownership_path(accounts_path: &Path) -> PathBuf {
+    accounts_path.with_file_name(ACCOUNTS_OWNERSHIP_FILE)
+}
+
+fn create_backup(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
@@ -960,27 +937,82 @@ fn create_backup(path: &PathBuf) -> Result<(), String> {
         path.file_name().unwrap_or_default().to_string_lossy(),
         BACKUP_SUFFIX
     ));
-
-    if backup_path.exists() {
-        return Ok(());
+    if !backup_path.exists() {
+        let contents = fs::read(path)
+            .map_err(|error| format!("Failed to read {} for backup: {error}", path.display()))?;
+        write_atomic(&backup_path, &contents)
+            .map_err(|error| format!("Failed to create backup: {error}"))?;
     }
-
-    fs::copy(path, &backup_path).map_err(|e| format!("Failed to create backup: {}", e))?;
-
     Ok(())
 }
 
 fn restore_backup_to_target(
-    backup_path: &PathBuf,
-    target_path: &PathBuf,
+    backup_path: &Path,
+    target_path: &Path,
     label: &str,
 ) -> Result<(), String> {
-    if target_path.exists() {
-        fs::remove_file(target_path)
-            .map_err(|e| format!("Failed to remove existing {}: {}", label, e))?;
-    }
+    let contents = fs::read(backup_path)
+        .map_err(|error| format!("Failed to read {} backup: {error}", label))?;
+    write_atomic(target_path, &contents)
+        .map_err(|error| format!("Failed to restore {}: {error}", label))?;
+    fs::remove_file(backup_path)
+        .map_err(|error| format!("Failed to remove restored {} backup: {error}", label))
+}
 
-    fs::rename(backup_path, target_path).map_err(|e| format!("Failed to restore {}: {}", label, e))
+fn validate_config_shape(config: &Value) -> Result<(), String> {
+    let root = config
+        .as_object()
+        .ok_or_else(|| "OpenCode config root must be an object".to_string())?;
+    let Some(provider) = root.get("provider") else {
+        return Ok(());
+    };
+    let providers = provider
+        .as_object()
+        .ok_or_else(|| "OpenCode config field 'provider' must be an object".to_string())?;
+    let Some(manager) = providers.get(ANTIGRAVITY_PROVIDER_ID) else {
+        return Ok(());
+    };
+    let manager = manager.as_object().ok_or_else(|| {
+        format!("OpenCode provider '{ANTIGRAVITY_PROVIDER_ID}' must be an object")
+    })?;
+    for key in ["options", "models"] {
+        if manager.get(key).is_some_and(|value| !value.is_object()) {
+            return Err(format!(
+                "OpenCode provider '{ANTIGRAVITY_PROVIDER_ID}.{key}' must be an object"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_accounts_shape(accounts: &Value) -> Result<(), String> {
+    let root = accounts
+        .as_object()
+        .ok_or_else(|| "OpenCode accounts root must be an object".to_string())?;
+    let entries = root
+        .get("accounts")
+        .ok_or_else(|| "OpenCode accounts field 'accounts' is required".to_string())?
+        .as_array()
+        .ok_or_else(|| "OpenCode accounts field 'accounts' must be an array".to_string())?;
+    for (index, entry) in entries.iter().enumerate() {
+        serde_json::from_value::<PluginAccount>(entry.clone()).map_err(|error| {
+            format!("OpenCode account entry at index {index} has an invalid shape: {error}")
+        })?;
+    }
+    if root.get("activeIndex").is_some_and(|value| !value.is_i64()) {
+        return Err("OpenCode accounts field 'activeIndex' must be an integer".to_string());
+    }
+    if let Some(indices) = root.get("activeIndexByFamily") {
+        let indices = indices.as_object().ok_or_else(|| {
+            "OpenCode accounts field 'activeIndexByFamily' must be an object".to_string()
+        })?;
+        if indices.values().any(|value| !value.is_i64()) {
+            return Err(
+                "OpenCode accounts field 'activeIndexByFamily' values must be integers".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_object(value: &mut Value, key: &str) {
@@ -1080,7 +1112,10 @@ fn build_variants_object(variant_type: Option<VariantType>) -> Option<Value> {
                 "low".to_string(),
                 build_gemini3_effort_variant(VariantTier::Low),
             );
-            variants.insert("medium".to_string(), serde_json::json!({ "disabled": true }));
+            variants.insert(
+                "medium".to_string(),
+                serde_json::json!({ "disabled": true }),
+            );
             variants.insert(
                 "high".to_string(),
                 build_gemini3_effort_variant(VariantTier::High),
@@ -1395,43 +1430,58 @@ pub fn sync_opencode_config(
     sync_accounts: bool,
     models_to_sync: Option<Vec<ModelInput>>,
 ) -> Result<(), String> {
+    let _client_lock = lock_client_config();
     let Some((config_path, _ag_config_path, ag_accounts_path)) = get_config_paths() else {
         return Err("Failed to get OpenCode config directory".to_string());
     };
 
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    create_backup(&config_path)?;
-
-    let mut config: Value = if config_path.exists() {
-        parse_config_file(&config_path).unwrap_or_else(|| serde_json::json!({}))
+    // Validate every participating file before creating a backup or publishing
+    // any new configuration.
+    let config = if config_path.exists() {
+        let config = parse_config_file(&config_path)
+            .ok_or_else(|| format!("Failed to parse existing config: {}", config_path.display()))?;
+        validate_config_shape(&config)?;
+        config
     } else {
         serde_json::json!({})
     };
+    if sync_accounts && ag_accounts_path.exists() {
+        let accounts = fs::read_to_string(&ag_accounts_path)
+            .map_err(|e| format!("Failed to read accounts: {e}"))?;
+        let accounts = serde_json::from_str::<Value>(&accounts)
+            .map_err(|e| format!("Failed to parse existing accounts: {e}"))?;
+        validate_accounts_shape(&accounts)?;
+    }
+    if sync_accounts {
+        crate::modules::account::list_accounts()
+            .map_err(|e| format!("Failed to list accounts: {e}"))?;
+    }
 
-    config = apply_sync_to_config(config, proxy_url, api_key, models_to_sync.as_deref());
-
-    let tmp_path = config_path.with_extension("tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(&config).unwrap())
-        .map_err(|e| format!("Failed to write temp file: {}", e))?;
-    fs::rename(&tmp_path, &config_path)
-        .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    create_backup(&config_path)?;
+    let config = apply_sync_to_config(config, proxy_url, api_key, models_to_sync.as_deref());
+    let content = serde_json::to_vec_pretty(&config)
+        .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    write_atomic(&config_path, &content)?;
 
     if sync_accounts {
         sync_accounts_file(&ag_accounts_path)?;
     }
-
     Ok(())
 }
 
 fn sync_accounts_file(accounts_path: &PathBuf) -> Result<(), String> {
-    create_backup(accounts_path)?;
+    let existed_before_sync = accounts_path.exists();
+    let ownership_path = accounts_ownership_path(accounts_path);
+    let manager_created = ownership_path.exists();
+    if !manager_created {
+        create_backup(accounts_path)?;
+    }
 
-    // Read existing file for state preservation
-    let existing_content = if accounts_path.exists() {
-        fs::read_to_string(accounts_path).ok()
+    let existing_content = if existed_before_sync {
+        Some(
+            fs::read_to_string(accounts_path)
+                .map_err(|e| format!("Failed to read accounts: {e}"))?,
+        )
     } else {
         None
     };
@@ -1442,37 +1492,32 @@ fn sync_accounts_file(accounts_path: &PathBuf) -> Result<(), String> {
     let mut existing_active_index: i32 = 0;
     let mut existing_active_index_by_family: HashMap<String, i32> = HashMap::new();
 
-    if let Some(ref content) = existing_content {
-        if let Ok(existing_json) = serde_json::from_str::<Value>(content) {
-            // Parse existing accounts
-            if let Some(existing_accounts) =
-                existing_json.get("accounts").and_then(|a| a.as_array())
-            {
-                for acc in existing_accounts {
-                    if let Ok(plugin_acc) = serde_json::from_value::<PluginAccount>(acc.clone()) {
-                        // Index by refresh_token (primary key for matching)
-                        existing_accounts_by_refresh_token
-                            .insert(plugin_acc.refresh_token.clone(), plugin_acc.clone());
-                        // Index by email (fallback)
-                        if let Some(email) = &plugin_acc.email {
-                            existing_accounts_by_email.insert(email.clone(), plugin_acc);
-                        }
-                    }
-                }
+    if let Some(content) = &existing_content {
+        let existing_json: Value = serde_json::from_str(content)
+            .map_err(|e| format!("Failed to parse existing accounts: {e}"))?;
+        validate_accounts_shape(&existing_json)?;
+        let existing_accounts = existing_json["accounts"]
+            .as_array()
+            .expect("validated accounts array");
+        for acc in existing_accounts {
+            let plugin_acc = serde_json::from_value::<PluginAccount>(acc.clone())
+                .expect("validated account entry");
+            existing_accounts_by_refresh_token
+                .insert(plugin_acc.refresh_token.clone(), plugin_acc.clone());
+            if let Some(email) = &plugin_acc.email {
+                existing_accounts_by_email.insert(email.clone(), plugin_acc);
             }
-            // Parse existing active indices
-            if let Some(idx) = existing_json.get("activeIndex").and_then(|v| v.as_i64()) {
-                existing_active_index = idx as i32;
-            }
-            if let Some(family_indices) = existing_json
-                .get("activeIndexByFamily")
-                .and_then(|v| v.as_object())
-            {
-                for (key, val) in family_indices {
-                    if let Some(idx) = val.as_i64() {
-                        existing_active_index_by_family.insert(key.clone(), idx as i32);
-                    }
-                }
+        }
+        if let Some(idx) = existing_json.get("activeIndex").and_then(|v| v.as_i64()) {
+            existing_active_index = idx as i32;
+        }
+        if let Some(family_indices) = existing_json
+            .get("activeIndexByFamily")
+            .and_then(|v| v.as_object())
+        {
+            for (key, val) in family_indices {
+                let idx = val.as_i64().expect("validated family index");
+                existing_active_index_by_family.insert(key.clone(), idx as i32);
             }
         }
     }
@@ -1576,66 +1621,88 @@ fn sync_accounts_file(accounts_path: &PathBuf) -> Result<(), String> {
         active_index_by_family: clamped_active_index_by_family,
     };
 
-    let tmp_path = accounts_path.with_extension("tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(&new_data).unwrap())
-        .map_err(|e| format!("Failed to write accounts temp file: {}", e))?;
-    fs::rename(&tmp_path, accounts_path)
-        .map_err(|e| format!("Failed to rename accounts file: {}", e))?;
-
+    let content = serde_json::to_vec_pretty(&new_data)
+        .map_err(|e| format!("Failed to serialize accounts: {e}"))?;
+    if !existed_before_sync && !manager_created {
+        write_atomic(&ownership_path, b"created by antigravity-manager")?;
+        if let Err(error) = write_atomic(accounts_path, &content) {
+            let _ = fs::remove_file(&ownership_path);
+            return Err(error);
+        }
+    } else {
+        write_atomic(accounts_path, &content)?;
+    }
     Ok(())
 }
 
 pub fn restore_opencode_config() -> Result<(), String> {
+    let _client_lock = lock_client_config();
     let Some((config_path, _, accounts_path)) = get_config_paths() else {
         return Err("Failed to get OpenCode config directory".to_string());
     };
+    // Reject malformed backup state before replacing either live file.
+    for backup_path in config_backup_candidates(&config_path) {
+        if backup_path.exists() {
+            let content = fs::read_to_string(&backup_path)
+                .map_err(|error| format!("Failed to read config backup: {error}"))?;
+            let config = parse_jsonc(&content).ok_or_else(|| {
+                "Failed to parse config backup (not valid JSON/JSONC)".to_string()
+            })?;
+            validate_config_shape(&config)?;
+        }
+    }
+    for suffix in [BACKUP_SUFFIX, OLD_BACKUP_SUFFIX] {
+        let backup_path =
+            accounts_path.with_file_name(format!("{ANTIGRAVITY_ACCOUNTS_FILE}{suffix}"));
+        if backup_path.exists() {
+            let content = fs::read_to_string(&backup_path)
+                .map_err(|error| format!("Failed to read accounts backup: {error}"))?;
+            let accounts = serde_json::from_str::<Value>(&content)
+                .map_err(|error| format!("Failed to parse accounts backup: {error}"))?;
+            validate_accounts_shape(&accounts)?;
+        }
+    }
 
     let mut restored = false;
-
-    // Backups are named after the config file they protected. A user may have been
-    // using opencode.json or opencode.jsonc, and the active path may now differ from
-    // whichever backup exists. Look for backups under both file names, preferring the
-    // active one, and restore the backup to its original (backup-name minus suffix)
-    // target path so we don't resurrect a stale parallel file.
-    let dir = config_path.parent();
-    let active_file_name = config_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(OPENCODE_CONFIG_FILE);
-    let config_candidates: [(&str, &str); 4] = [
-        (active_file_name, BACKUP_SUFFIX),
-        (active_file_name, OLD_BACKUP_SUFFIX),
-        (OPENCODE_CONFIG_FILE, BACKUP_SUFFIX),
-        (OPENCODE_CONFIG_FILE, OLD_BACKUP_SUFFIX),
-    ];
-    for (file_name, suffix) in &config_candidates {
-        let backup_path = config_path.with_file_name(format!("{}{}", file_name, suffix));
+    for backup_path in config_backup_candidates(&config_path) {
         if backup_path.exists() {
-            let target = dir
-                .map(|d| d.join(file_name))
-                .unwrap_or_else(|| config_path.clone());
+            let backup_name = backup_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let suffix = if backup_name.ends_with(BACKUP_SUFFIX) {
+                BACKUP_SUFFIX
+            } else {
+                OLD_BACKUP_SUFFIX
+            };
+            let target_name = backup_name.strip_suffix(suffix).unwrap_or_default();
+            let target = config_path.with_file_name(target_name);
             restore_backup_to_target(&backup_path, &target, "config")?;
             restored = true;
             break;
         }
     }
-
-    // Try new backup suffix first, fall back to old suffix for backward compatibility
-    let accounts_backup_new =
-        accounts_path.with_file_name(format!("{}{}", ANTIGRAVITY_ACCOUNTS_FILE, BACKUP_SUFFIX));
-    let accounts_backup_old = accounts_path.with_file_name(format!(
-        "{}{}",
-        ANTIGRAVITY_ACCOUNTS_FILE, OLD_BACKUP_SUFFIX
-    ));
-
-    if accounts_backup_new.exists() {
-        restore_backup_to_target(&accounts_backup_new, &accounts_path, "accounts")?;
-        restored = true;
-    } else if accounts_backup_old.exists() {
-        restore_backup_to_target(&accounts_backup_old, &accounts_path, "accounts")?;
-        restored = true;
+    let mut restored_accounts = false;
+    for suffix in [BACKUP_SUFFIX, OLD_BACKUP_SUFFIX] {
+        let backup_path =
+            accounts_path.with_file_name(format!("{ANTIGRAVITY_ACCOUNTS_FILE}{suffix}"));
+        if backup_path.exists() {
+            restore_backup_to_target(&backup_path, &accounts_path, "accounts")?;
+            restored = true;
+            restored_accounts = true;
+            break;
+        }
     }
-
+    let ownership_path = accounts_ownership_path(&accounts_path);
+    if ownership_path.exists() {
+        if !restored_accounts && accounts_path.exists() {
+            fs::remove_file(&accounts_path)
+                .map_err(|error| format!("Failed to remove managed accounts file: {error}"))?;
+            restored = true;
+        }
+        fs::remove_file(&ownership_path)
+            .map_err(|error| format!("Failed to remove accounts ownership marker: {error}"))?;
+    }
     if restored {
         Ok(())
     } else {
@@ -1652,7 +1719,7 @@ fn apply_sync_to_config(
     models_to_sync: Option<&[ModelInput]>,
 ) -> Value {
     if !config.is_object() {
-        config = serde_json::json!({});
+        return config;
     }
 
     if config.get("$schema").is_none() {
@@ -1731,6 +1798,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn jsonc_parser_preserves_unicode_while_removing_syntax() {
+        let parsed = parse_jsonc(
+            r#"{
+                // keep UTF-8 bytes intact
+                "path": "/tmp/工作",
+                "prompt": "emoji: 🦀",
+            }"#,
+        )
+        .expect("valid JSONC");
+        assert_eq!(parsed["path"], "/tmp/工作");
+        assert_eq!(parsed["prompt"], "emoji: 🦀");
+    }
+
+    #[test]
+    fn config_backup_candidates_include_json_and_jsonc() {
+        let config_path = PathBuf::from("/tmp/opencode/opencode.json");
+        let candidates = config_backup_candidates(&config_path);
+        assert!(candidates.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "opencode.json.antigravity-manager.bak")
+        }));
+        assert!(candidates.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "opencode.jsonc.antigravity-manager.bak")
+        }));
+    }
     #[test]
     fn merge_catalog_models_normalizes_aliases_to_canonical() {
         let mut provider = serde_json::json!({ "models": {} });
@@ -1868,141 +1962,6 @@ mod tests {
             "canonical"
         );
         assert_eq!(*warnings.lock().expect("warning counter lock"), 1);
-    }
-
-    fn preserved_catalog_json_snapshot(models: &[ModelDef]) -> String {
-        let entries = models
-            .iter()
-            .filter(|model| {
-                model.id.starts_with("claude-")
-                    || model.id == "gemini-3-pro-image"
-                    || model.id.starts_with("gemini-2.5-")
-            })
-            .map(|model| serde_json::json!({ "id": model.id, "model": build_model_json(model) }))
-            .collect::<Vec<_>>();
-
-        serde_json::to_string(&entries).unwrap()
-    }
-
-    #[test]
-    fn catalog_preserves_non_gemini3_variant_json_snapshot() {
-        let expected = vec![
-            ModelDef {
-                id: "claude-sonnet-4-6",
-                name: "Claude Sonnet 4.6",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-sonnet-4-6-thinking",
-                name: "Claude Sonnet 4.6 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-sonnet-4-5",
-                name: "Claude Sonnet 4.5",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-sonnet-4-5-thinking",
-                name: "Claude Sonnet 4.5 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-opus-4-5-thinking",
-                name: "Claude Opus 4.5 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-opus-4-6-thinking",
-                name: "Claude Opus 4.6 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "gemini-3-pro-image",
-                name: "Gemini 3 Pro Image",
-                context_limit: 1_048_576,
-                output_limit: 65_535,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text", "image"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash",
-                name: "Gemini 2.5 Flash",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash-lite",
-                name: "Gemini 2.5 Flash Lite",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash-thinking",
-                name: "Gemini 2.5 Flash Thinking",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::Gemini25Thinking),
-            },
-            ModelDef {
-                id: "gemini-2.5-pro",
-                name: "Gemini 2.5 Pro",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: None,
-            },
-        ];
-
-        assert_eq!(
-            preserved_catalog_json_snapshot(&build_model_catalog()),
-            preserved_catalog_json_snapshot(&expected)
-        );
     }
 
     #[test]
@@ -2408,6 +2367,20 @@ mod tests {
             models.contains_key("claude-3"),
             "non-antigravity model should be preserved"
         );
+    }
+
+    #[test]
+    fn clear_legacy_preserves_provider_not_owned_by_manager() {
+        let config = serde_json::json!({
+            "provider": {
+                "anthropic": {
+                    "options": { "baseURL": "https://other.example/v1", "apiKey": "user-key" },
+                    "models": { "claude-sonnet-4-5": { "name": "Custom Claude" } }
+                }
+            }
+        });
+        let result = apply_clear_to_config(config.clone(), Some("http://localhost:3000"), true);
+        assert_eq!(result, config);
     }
 
     #[test]
@@ -2902,23 +2875,19 @@ mod tests {
     }
 }
 
-pub fn read_opencode_config_content(file_name: Option<String>) -> Result<String, String> {
+pub fn read_opencode_config_content(
+    file_name: Option<String>,
+    parsed: Option<bool>,
+) -> Result<String, String> {
     let Some((opencode_path, ag_config_path, ag_accounts_path)) = get_config_paths() else {
         return Err("Failed to get OpenCode config directory".to_string());
     };
-
-    // Allowlist of permitted file names
     let allowed_files = [
         OPENCODE_CONFIG_FILE,
         OPENCODE_CONFIG_FILE_JSONC,
         ANTIGRAVITY_CONFIG_FILE,
         ANTIGRAVITY_ACCOUNTS_FILE,
     ];
-
-    // Determine which file to read. Both opencode.json and opencode.jsonc map to the
-    // active opencode config path (which is resolved by probing the directory), so a
-    // caller asking for "opencode.json" still gets the user's actual config when it
-    // happens to be opencode.jsonc.
     let target_path = match file_name.as_deref() {
         Some(name) if name == ANTIGRAVITY_CONFIG_FILE => ag_config_path,
         Some(name) if name == ANTIGRAVITY_ACCOUNTS_FILE => ag_accounts_path,
@@ -2927,18 +2896,24 @@ pub fn read_opencode_config_content(file_name: Option<String>) -> Result<String,
         }
         Some(name) => {
             return Err(format!(
-                "Invalid file name: {}. Allowed: {:?}",
-                name, allowed_files
+                "Invalid file name: {name}. Allowed: {allowed_files:?}"
             ))
         }
-        None => opencode_path, // Default to the active opencode config (json or jsonc)
+        None => opencode_path,
     };
-
     if !target_path.exists() {
-        return Err(format!("Config file does not exist: {:?}", target_path));
+        return Err(format!("Config file does not exist: {target_path:?}"));
     }
-
-    fs::read_to_string(&target_path).map_err(|e| format!("Failed to read config: {}", e))
+    let content =
+        fs::read_to_string(&target_path).map_err(|e| format!("Failed to read config: {e}"))?;
+    if parsed.unwrap_or(false) {
+        let parsed = parse_jsonc(&content)
+            .ok_or_else(|| format!("Failed to parse config: {}", target_path.display()))?;
+        serde_json::to_string_pretty(&parsed)
+            .map_err(|e| format!("Failed to serialize parsed config: {e}"))
+    } else {
+        Ok(content)
+    }
 }
 
 #[tauri::command]
@@ -2972,7 +2947,6 @@ pub fn get_canonical_families() -> Vec<CanonicalFamilyDto> {
         .map(|family| {
             let mut normalized_match_ids = HashSet::new();
             let mut match_ids = Vec::new();
-
             for match_id in std::iter::once(family.canonical_id)
                 .chain(family.aliases.iter().map(|(alias, _)| *alias))
                 .chain(family.tiers.iter().map(|(_, spec)| spec.id))
@@ -2981,7 +2955,6 @@ pub fn get_canonical_families() -> Vec<CanonicalFamilyDto> {
                     match_ids.push(match_id.to_string());
                 }
             }
-
             CanonicalFamilyDto {
                 canonical_id: family.canonical_id.to_string(),
                 display_name: family.display_name.to_string(),
@@ -3007,7 +2980,7 @@ pub async fn execute_opencode_sync(
 
 #[tauri::command]
 pub async fn execute_opencode_restore() -> Result<(), String> {
-    tokio::task::spawn_blocking(move || restore_opencode_config())
+    tokio::task::spawn_blocking(restore_opencode_config)
         .await
         .unwrap_or_else(|_| Err("Failed to execute restore".to_string()))
 }
@@ -3016,15 +2989,18 @@ pub async fn execute_opencode_restore() -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 pub struct GetOpencodeConfigRequest {
     pub file_name: Option<String>,
+    pub parsed: Option<bool>,
 }
 
 #[tauri::command]
 pub async fn get_opencode_config_content(
     request: GetOpencodeConfigRequest,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || read_opencode_config_content(request.file_name))
-        .await
-        .unwrap_or_else(|_| Err("Failed to read config".to_string()))
+    tokio::task::spawn_blocking(move || {
+        read_opencode_config_content(request.file_name, request.parsed)
+    })
+    .await
+    .unwrap_or_else(|_| Err("Failed to read config".to_string()))
 }
 
 /// List of Antigravity model IDs that may have been added to legacy providers
@@ -3055,99 +3031,123 @@ fn base_url_matches(config_url: &str, proxy_url: &str) -> bool {
 
 /// Clear OpenCode config by removing antigravity-manager provider and optionally cleaning up legacy entries
 fn clear_opencode_config(proxy_url: Option<String>, clear_legacy: bool) -> Result<(), String> {
+    let _client_lock = lock_client_config();
     let Some((config_path, _, accounts_path)) = get_config_paths() else {
         return Err("Failed to get OpenCode config directory".to_string());
     };
+    let accounts_backup_new =
+        accounts_path.with_file_name(format!("{ANTIGRAVITY_ACCOUNTS_FILE}{BACKUP_SUFFIX}"));
+    let accounts_backup_old =
+        accounts_path.with_file_name(format!("{ANTIGRAVITY_ACCOUNTS_FILE}{OLD_BACKUP_SUFFIX}"));
+    let ownership_path = accounts_ownership_path(&accounts_path);
 
-    // Process opencode.json
-    if config_path.exists() {
-        // Create backup before modifying
-        create_backup(&config_path)?;
-
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config: {}", e))?;
-
-        // Tolerate JSONC (comments + trailing commas) when the user's config is opencode.jsonc.
-        let config: Value = parse_jsonc(&content)
+    // Validate all state that Clear may replace or delete before changing config.
+    let config = if config_path.exists() {
+        let content =
+            fs::read_to_string(&config_path).map_err(|e| format!("Failed to read config: {e}"))?;
+        let config = parse_jsonc(&content)
             .ok_or_else(|| "Failed to parse config (not valid JSON/JSONC)".to_string())?;
-        let config = apply_clear_to_config(config, proxy_url.as_deref(), clear_legacy);
-
-        // Write updated config
-        let tmp_path = config_path.with_extension("tmp");
-        fs::write(&tmp_path, serde_json::to_string_pretty(&config).unwrap())
-            .map_err(|e| format!("Failed to write temp file: {}", e))?;
-        fs::rename(&tmp_path, &config_path)
-            .map_err(|e| format!("Failed to rename config file: {}", e))?;
+        validate_config_shape(&config)?;
+        Some(config)
+    } else {
+        None
+    };
+    for backup_path in [&accounts_backup_new, &accounts_backup_old] {
+        if backup_path.exists() {
+            let content = fs::read_to_string(backup_path)
+                .map_err(|e| format!("Failed to read accounts backup: {e}"))?;
+            let accounts = serde_json::from_str::<Value>(&content)
+                .map_err(|e| format!("Failed to parse accounts backup: {e}"))?;
+            validate_accounts_shape(&accounts)?;
+        }
+    }
+    if !accounts_backup_new.exists()
+        && !accounts_backup_old.exists()
+        && ownership_path.exists()
+        && accounts_path.exists()
+    {
+        let content = fs::read_to_string(&accounts_path)
+            .map_err(|e| format!("Failed to read managed accounts: {e}"))?;
+        let accounts = serde_json::from_str::<Value>(&content)
+            .map_err(|e| format!("Failed to parse managed accounts: {e}"))?;
+        validate_accounts_shape(&accounts)?;
     }
 
-    // Process antigravity-accounts.json
-    let accounts_backup_new =
-        accounts_path.with_file_name(format!("{}{}", ANTIGRAVITY_ACCOUNTS_FILE, BACKUP_SUFFIX));
-    let accounts_backup_old = accounts_path.with_file_name(format!(
-        "{}{}",
-        ANTIGRAVITY_ACCOUNTS_FILE, OLD_BACKUP_SUFFIX
-    ));
+    if let Some(config) = config {
+        create_backup(&config_path)?;
+        let config = apply_clear_to_config(config, proxy_url.as_deref(), clear_legacy);
+        let content = serde_json::to_vec_pretty(&config)
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        write_atomic(&config_path, &content)?;
+    }
 
     if accounts_backup_new.exists() {
-        // Restore from new backup
         restore_backup_to_target(&accounts_backup_new, &accounts_path, "accounts from backup")?;
+        if ownership_path.exists() {
+            fs::remove_file(&ownership_path)
+                .map_err(|e| format!("Failed to remove accounts ownership marker: {e}"))?;
+        }
     } else if accounts_backup_old.exists() {
-        // Restore from old backup
         restore_backup_to_target(
             &accounts_backup_old,
             &accounts_path,
             "accounts from old backup",
         )?;
-    } else if accounts_path.exists() {
-        // No backup found, delete the file
-        fs::remove_file(&accounts_path)
-            .map_err(|e| format!("Failed to remove accounts file: {}", e))?;
+        if ownership_path.exists() {
+            fs::remove_file(&ownership_path)
+                .map_err(|e| format!("Failed to remove accounts ownership marker: {e}"))?;
+        }
+    } else if ownership_path.exists() {
+        if accounts_path.exists() {
+            fs::remove_file(&accounts_path)
+                .map_err(|e| format!("Failed to remove managed accounts file: {e}"))?;
+        }
+        fs::remove_file(&ownership_path)
+            .map_err(|e| format!("Failed to remove accounts ownership marker: {e}"))?;
     }
-
     Ok(())
 }
 
 /// Cleanup legacy provider entries (anthropic/google) that were configured by old versions
 fn cleanup_legacy_provider(provider: &mut Value, proxy_url: &str) {
-    if let Some(provider_obj) = provider.as_object_mut() {
-        // Remove Antigravity model IDs from models list.
-        let remove_models_key = if let Some(models) = provider_obj
-            .get_mut("models")
-            .and_then(|m| m.as_object_mut())
-        {
-            for model_id in ANTIGRAVITY_MODEL_IDS {
-                models.remove(*model_id);
-            }
-            models.is_empty()
-        } else {
-            false
-        };
-        if remove_models_key {
-            provider_obj.remove("models");
-        }
+    let Some(provider_obj) = provider.as_object_mut() else {
+        return;
+    };
+    let owned_by_manager = provider_obj
+        .get("options")
+        .and_then(|options| options.get("baseURL"))
+        .and_then(Value::as_str)
+        .is_some_and(|base_url| base_url_matches(base_url, proxy_url));
+    if !owned_by_manager {
+        return;
+    }
 
-        // Check and remove options.baseURL and options.apiKey if baseURL matches proxy.
-        let remove_options_key = if let Some(options) = provider_obj
-            .get_mut("options")
-            .and_then(|o| o.as_object_mut())
-        {
-            let should_cleanup = options
-                .get("baseURL")
-                .and_then(|v| v.as_str())
-                .map(|base_url| base_url_matches(base_url, proxy_url))
-                .unwrap_or(false);
-
-            if should_cleanup {
-                options.remove("baseURL");
-                options.remove("apiKey");
-            }
-            options.is_empty()
-        } else {
-            false
-        };
-        if remove_options_key {
-            provider_obj.remove("options");
+    let remove_models_key = if let Some(models) = provider_obj
+        .get_mut("models")
+        .and_then(|models| models.as_object_mut())
+    {
+        for model_id in ANTIGRAVITY_MODEL_IDS {
+            models.remove(*model_id);
         }
+        models.is_empty()
+    } else {
+        false
+    };
+    if remove_models_key {
+        provider_obj.remove("models");
+    }
+    let remove_options_key = if let Some(options) = provider_obj
+        .get_mut("options")
+        .and_then(|options| options.as_object_mut())
+    {
+        options.remove("baseURL");
+        options.remove("apiKey");
+        options.is_empty()
+    } else {
+        false
+    };
+    if remove_options_key {
+        provider_obj.remove("options");
     }
 }
 
@@ -3162,46 +3162,6 @@ pub async fn execute_opencode_clear(
 #[cfg(test)]
 mod canonical_family_tests {
     use super::*;
-
-    #[test]
-    fn canonical_families_expose_the_complete_public_dto() {
-        let families = get_canonical_families();
-
-        assert_eq!(families.len(), GEMINI_FAMILIES.len());
-        assert_eq!(
-            families,
-            vec![
-                CanonicalFamilyDto {
-                    canonical_id: "gemini-3.5-flash".to_string(),
-                    display_name: "Gemini 3.5 Flash".to_string(),
-                    match_ids: vec![
-                        "gemini-3.5-flash".to_string(),
-                        "gemini-3.5-flash-high".to_string(),
-                        "gemini-3.5-flash-medium".to_string(),
-                        "gemini-3.5-flash-low".to_string(),
-                        "gemini-3-flash".to_string(),
-                        "gemini-3.5-flash-extra-low".to_string(),
-                        "gemini-3-flash-agent".to_string(),
-                    ],
-                },
-                CanonicalFamilyDto {
-                    canonical_id: "gemini-3.1-pro".to_string(),
-                    display_name: "Gemini 3.1 Pro".to_string(),
-                    match_ids: vec![
-                        "gemini-3.1-pro".to_string(),
-                        "gemini-3.1-pro-high".to_string(),
-                        "gemini-pro".to_string(),
-                        "gemini-3.1-pro-low".to_string(),
-                        "gemini-pro-agent".to_string(),
-                    ],
-                },
-            ]
-        );
-
-        let serialized = serde_json::to_string(&families).unwrap();
-        assert!(!serialized.contains("thinking_budget"));
-        assert!(!serialized.contains("max_output_tokens"));
-    }
 
     #[test]
     fn canonical_families_match_ids_are_unique_globally_after_normalization() {

@@ -214,8 +214,7 @@ install_linux() {
 
     case "$PKG_MANAGER" in
         apt)
-            run sudo dpkg -i "$DOWNLOAD_PATH"
-            run sudo apt-get install -f -y  # Fix dependencies if needed
+            run sudo apt-get install -y "$DOWNLOAD_PATH"
             ;;
         dnf)
             run sudo dnf install -y "$DOWNLOAD_PATH"
@@ -246,9 +245,16 @@ install_linux() {
                 if [[ -f "$rc_file" ]] && grep -qF "$install_dir" "$rc_file" 2>/dev/null; then
                     info "PATH entry already in $rc_file"
                 else
-                    run echo "$export_line" >> "$rc_file"
-                    info "Added ${install_dir} to PATH in $rc_file"
-                    warn "Run: source $rc_file  (or restart terminal)"
+                    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+                        echo -e "${YELLOW}[DRY-RUN]${NC} append to $rc_file: $export_line"
+                    else
+                        if [[ "$shell_name" == "fish" ]]; then
+                            mkdir -p "$(dirname "$rc_file")"
+                        fi
+                        printf '%s\n' "$export_line" >> "$rc_file"
+                        info "Added ${install_dir} to PATH in $rc_file"
+                        warn "Run: source $rc_file  (or restart terminal)"
+                    fi
                 fi
             fi
             ;;

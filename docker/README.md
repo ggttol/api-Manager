@@ -48,7 +48,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.y
 - 前端有改動：先在本地重新 `npm run build`，再重跑 `build` + `up -d`
 
 **Git 部署提醒**
-- 若服務器不在本地構建前端，請確保 `dist/` 已提交到倉庫（本版本已從 `.gitignore` 移除）。
+- `dist/` 为忽略的构建产物，不提交到仓库。使用本地前端复用方案时，必须先执行上述前端构建，并将完整 `dist/` 随发布包传到服务器；默认 Dockerfile 会自行构建前端。
 
 ## 🚀 快速開始
 
@@ -60,7 +60,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.localdist.y
 > *   **API Key**：通過 `-e API_KEY=xxx` 設置，用於所有 AI 協議的 API 調用鑒權。
 > *   **Web 管理密碼**：通過 `-e WEB_PASSWORD=xxx` 設置，僅用於 Web UI 登錄。
 > *   **默認行為**：若未設置 `WEB_PASSWORD`，系統會自動回退使用 `API_KEY` 作為登錄密碼。若兩者皆未設置，則生成隨機 Key。
-> *   **查看方式**：執行 `docker logs antigravity-manager` 尋找 `Current API Key` 或 `Web UI Password`，或執行 `grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json` 查看。
+> *   **查看方式**：启动日志不会输出明文凭据。请检查部署环境变量，或数据目录内 `gui_config.json` 的 `proxy.api_key` / `proxy.admin_password`；请勿公开这些内容。
 
 ```bash
 # 啟動容器 (請替换 your-secret-key 為強密鑰)

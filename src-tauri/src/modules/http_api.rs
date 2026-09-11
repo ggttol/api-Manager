@@ -215,6 +215,8 @@ struct LogsRequest {
     filter: String,
     #[serde(default)]
     errors_only: bool,
+    #[serde(default)]
+    account_email: Option<String>,
 }
 
 // ============================================================================
@@ -443,22 +445,31 @@ async fn get_logs(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let limit = if params.limit == 0 { 50 } else { params.limit };
 
-    let total =
-        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
+    let total = proxy_db::get_logs_count_filtered(
+        &params.filter,
+        params.errors_only,
+        params.account_email.as_deref(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
 
-    let logs =
-        proxy_db::get_logs_filtered(&params.filter, params.errors_only, limit, params.offset)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: e }),
-                )
-            })?;
+    let logs = proxy_db::get_logs_filtered(
+        &params.filter,
+        params.errors_only,
+        params.account_email.as_deref(),
+        limit,
+        params.offset,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
 
     Ok(Json(LogsResponse { total, logs }))
 }

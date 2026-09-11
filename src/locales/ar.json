@@ -1010,8 +1010,8 @@
     "placeholder": "أدخل كلمة مرور الإدارة أو مفتاح API",
     "btn_login": "تحقق ودخول",
     "note": "ملاحظة: إذا تم تعيين كلمة مرور إدارة منفصلة، يرجى إدخالها؛ وإلا، أدخل مفتاح API.",
-    "lookup_hint": "إذا نسيت، قم بتشغيل docker logs antigravity-manager للعثور على مفتاح API الحالي أو كلمة مرور واجهة الويب",
-    "config_hint": "أو قم بتشغيل grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json للعرض."
+    "lookup_hint": "إذا نسيت بيانات الدخول، فتحقق من WEB_PASSWORD أو API_KEY (بما في ذلك المتغيرات ذات البادئة ABV_) في إعدادات النشر. لا تعرض سجلات بدء التشغيل بيانات الدخول.",
+    "config_hint": "إذا لم تُستخدم متغيرات البيئة لتجاوز الإعدادات، فتحقق من proxy.admin_password أو proxy.api_key في ملف gui_config.json داخل مجلد البيانات. لا تشارك هذا الملف."
   },
   "token_stats": {
     "title": "إحصائيات استهلاك التوكن",

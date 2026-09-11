@@ -19,32 +19,30 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
     useEffect(() => {
         if (isTauri()) return;
 
-        // 检查 Session 存储 (优先)
+        // Listen independently of restoring an existing session key.
+        const handleUnauthorized = () => {
+            sessionStorage.removeItem('abv_admin_api_key');
+            localStorage.removeItem('abv_admin_api_key');
+            setIsAuthenticated(false);
+        };
+        window.addEventListener('abv-unauthorized', handleUnauthorized);
+
+        // Check session storage first.
         const sessionKey = sessionStorage.getItem('abv_admin_api_key');
         if (sessionKey) {
             setIsAuthenticated(true);
             setApiKey(sessionKey);
-            return;
+        } else {
+            // Migrate the legacy persistent key into the session.
+            const savedKey = localStorage.getItem('abv_admin_api_key');
+            if (savedKey) {
+                sessionStorage.setItem('abv_admin_api_key', savedKey);
+                localStorage.removeItem('abv_admin_api_key');
+                setIsAuthenticated(true);
+                setApiKey(savedKey);
+            }
         }
 
-        // 检查本地存储 (迁移逻辑)
-        const savedKey = localStorage.getItem('abv_admin_api_key');
-        if (savedKey) {
-            // 迁移到 sessionStorage 并清理 localStorage
-            sessionStorage.setItem('abv_admin_api_key', savedKey);
-            localStorage.removeItem('abv_admin_api_key');
-            setIsAuthenticated(true);
-            setApiKey(savedKey);
-        }
-
-        // 监听全局 401 事件
-        const handleUnauthorized = () => {
-            sessionStorage.removeItem('abv_admin_api_key');
-            localStorage.removeItem('abv_admin_api_key'); // 双重清理确保万一
-            setIsAuthenticated(false);
-        };
-
-        window.addEventListener('abv-unauthorized', handleUnauthorized);
         return () => window.removeEventListener('abv-unauthorized', handleUnauthorized);
     }, []);
 
@@ -80,9 +78,8 @@ export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ childr
                 sessionStorage.removeItem('abv_admin_api_key');
                 setError(t('login.error_invalid_key'));
             } else {
-                // 其他错误，但可能密码是对的
-                setIsAuthenticated(true);
-                window.location.reload();
+                sessionStorage.removeItem('abv_admin_api_key');
+                setError(`${t('login.error_network')} (HTTP ${response.status})`);
             }
         } catch (err) {
             // 网络错误等

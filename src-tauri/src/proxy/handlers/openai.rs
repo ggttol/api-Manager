@@ -18,6 +18,7 @@ use crate::proxy::upstream::client::mask_email;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 const MAX_INPUT_IMAGES: usize = 16;
+const MAX_OUTPUT_IMAGES: usize = 10;
 const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TOTAL_INPUT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
@@ -65,6 +66,14 @@ fn validate_input_image_limits(
         ));
     }
     Ok(())
+}
+
+fn validate_output_image_count(n: usize) -> Result<(), String> {
+    if (1..=MAX_OUTPUT_IMAGES).contains(&n) {
+        Ok(())
+    } else {
+        Err(format!("'n' must be between 1 and {MAX_OUTPUT_IMAGES}"))
+    }
 }
 
 fn normalized_image_from_bytes(
@@ -275,12 +284,22 @@ fn stream_chunk_has_error_event(bytes: &[u8]) -> bool {
         let Ok(payload) = serde_json::from_str::<Value>(data.trim()) else {
             return false;
         };
-
+        let response = payload.get("response");
         matches!(
             payload.get("type").and_then(Value::as_str),
             Some("error" | "response.failed")
         ) || payload.get("error").is_some_and(|error| !error.is_null())
+            || response.is_some_and(|response| {
+                response.get("status").and_then(Value::as_str) == Some("failed")
+                    || response.get("error").is_some_and(|error| !error.is_null())
+            })
     })
+}
+
+fn stream_chunk_is_heartbeat(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    text.starts_with(':') || text.starts_with("data: :")
 }
 
 fn response_has_inline_image_data(value: &Value) -> bool {
@@ -350,6 +369,45 @@ fn responses_input_item_type(item: &Value) -> &str {
         .unwrap_or("")
 }
 
+/// Canonicalize the Responses string shorthand before any caller removes
+/// `input`. All Responses entry points use the array form internally.
+fn normalize_responses_input(body: &mut Value) {
+    let Some(Value::String(text)) = body.get_mut("input") else {
+        return;
+    };
+    let text = std::mem::take(text);
+    body["input"] = json!([{ "type": "message", "role": "user", "content": text }]);
+}
+
+fn responses_tool_name(item: &Value, fallback: &str) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or(fallback);
+    match item.get("namespace").and_then(Value::as_str) {
+        Some(namespace)
+            if !namespace.is_empty() && !name.starts_with(&format!("{namespace}__")) =>
+        {
+            format!("{namespace}__{name}")
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn declared_custom_tool_names(tools: Option<&[Value]>) -> std::collections::HashSet<String> {
+    tools
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("custom"))
+        .filter_map(|tool| {
+            tool.get("name")
+                .or_else(|| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                })
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
 fn push_responses_content_part(
     mut part: Value,
     text_parts: &mut Vec<String>,
@@ -403,6 +461,16 @@ fn push_responses_content_part(
             media_parts.push(json!({
                 "type": "audio_url",
                 "audio_url": audio_url
+            }));
+            Ok(())
+        } else {
+            Err(part)
+        }
+    } else if part_type == "video_url" {
+        if let Some(video_url) = part.as_object_mut().and_then(|obj| obj.remove("video_url")) {
+            media_parts.push(json!({
+                "type": "video_url",
+                "video_url": video_url
             }));
             Ok(())
         } else {
@@ -833,6 +901,20 @@ fn responses_usage_value(chat_response: &OpenAIResponse) -> Value {
 }
 
 fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
+    let incomplete_reason =
+        chat_response
+            .choices
+            .iter()
+            .find_map(|choice| match choice.finish_reason.as_deref() {
+                Some("length") => Some("max_output_tokens"),
+                Some("content_filter") => Some("content_filter"),
+                _ => None,
+            });
+    let item_status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
     let mut output = Vec::new();
 
     for choice in &chat_response.choices {
@@ -845,7 +927,7 @@ fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
             output.push(json!({
                 "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
                 "type": "reasoning",
-                "status": "completed",
+                "status": item_status,
                 "summary": [{ "type": "summary_text", "text": reasoning }]
             }));
         }
@@ -877,7 +959,7 @@ fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
                 "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
                 "type": "message",
                 "role": "assistant",
-                "status": "completed",
+                "status": item_status,
                 "content": content
             }));
         }
@@ -894,7 +976,7 @@ fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
             output.push(json!({
                 "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
                 "type": "function_call",
-                "status": "completed",
+                "status": item_status,
                 "call_id": call_id,
                 "name": function.name,
                 "arguments": function.arguments
@@ -907,9 +989,9 @@ fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
         "object": "response",
         "type": "response",
         "created_at": chrono::Utc::now().timestamp(),
-        "status": "completed",
-        "error": null,
+        "status": if incomplete_reason.is_some() { "incomplete" } else { "completed" },
         "output": output,
+        "incomplete_details": incomplete_reason.map(|reason| json!({ "reason": reason })),
         "model": chat_response.model,
         "usage": responses_usage_value(chat_response)
     })
@@ -949,9 +1031,11 @@ mod stream_peek_tests {
     use super::into_history_without_inline_media;
     use super::is_codex_transcript_only_assistant_message;
     use super::is_edit_image_field;
+    use super::normalize_responses_input;
     use super::omit_media_before_latest_user_turn;
     use super::parse_generation_input_images;
     use super::response_has_inline_image_data;
+    use super::responses_content_parts;
     use super::responses_input_item_type;
     use super::responses_message_parts;
     use super::responses_routing_session_id;
@@ -959,10 +1043,39 @@ mod stream_peek_tests {
     use super::save_session_unless_response_cancelled;
     use super::stream_chunk_has_error_event;
     use super::stream_chunk_has_image_data;
+    use super::validate_output_image_count;
+    #[test]
+    fn responses_string_input_and_video_parts_are_preserved() {
+        let mut body = json!({ "input": "sentinel request" });
+        normalize_responses_input(&mut body);
+        assert_eq!(
+            body["input"],
+            json!([{ "type": "message", "role": "user", "content": "sentinel request" }])
+        );
+
+        let (text, media, unhandled) = responses_content_parts(Some(json!([{
+            "type": "video_url",
+            "video_url": { "url": "data:video/mp4;base64,AQ==" }
+        }])));
+        assert!(text.is_empty());
+        assert!(unhandled.is_empty());
+        assert_eq!(media[0]["type"], "video_url");
+    }
+
+    #[test]
+    fn output_image_count_is_positive_and_bounded() {
+        assert!(validate_output_image_count(1).is_ok());
+        assert!(validate_output_image_count(MAX_OUTPUT_IMAGES).is_ok());
+        assert!(validate_output_image_count(0).is_err());
+        assert!(validate_output_image_count(MAX_OUTPUT_IMAGES + 1).is_err());
+    }
+
     use super::validate_input_image_limits;
     use super::validate_responses_image_data_url;
     use super::validate_responses_input_image_limits;
-    use super::{MAX_INPUT_IMAGES, MAX_INPUT_IMAGE_BYTES, MAX_TOTAL_INPUT_IMAGE_BYTES};
+    use super::{
+        MAX_INPUT_IMAGES, MAX_INPUT_IMAGE_BYTES, MAX_OUTPUT_IMAGES, MAX_TOTAL_INPUT_IMAGE_BYTES,
+    };
     use crate::proxy::mappers::openai::{transform_openai_request, OpenAIRequest};
     use serde_json::{json, Value};
 
@@ -993,6 +1106,15 @@ mod stream_peek_tests {
             responses_routing_session_id(None, Some("resp-missing"), None, "resp-child"),
             "resp-missing"
         );
+    }
+
+    #[test]
+    fn failed_response_envelope_is_an_error_event() {
+        let chunk = br#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"upstream_error"}}}
+
+"#;
+        assert!(stream_chunk_has_error_event(chunk));
     }
 
     #[test]
@@ -1435,6 +1557,30 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
     }
 
     #[test]
+    fn responses_compat_marks_truncated_output_incomplete() {
+        let chat_response = serde_json::from_value(json!({
+            "id": "chatcmpl_test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gemini-3.6-flash-high",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "partial" },
+                "finish_reason": "length"
+            }]
+        }))
+        .expect("valid truncated response fixture");
+
+        let response = convert_chat_response_to_responses(&chat_response);
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(response["output"][0]["status"], "incomplete");
+    }
+
+    #[test]
     fn identifies_codex_transcript_only_assistant_messages() {
         let thought = json!({
             "type": "message",
@@ -1771,14 +1917,16 @@ pub async fn handle_chat_completions(
     let debug_cfg = state.debug_logging.read().await.clone();
     let original_body =
         debug_logger::is_enabled(&debug_cfg).then(|| debug_value_without_inline_data(&body));
+    let normalized_interaction_ledger = body.get("_interaction_ledger").cloned();
 
     // [NEW] 自动检测并转换 Responses 格式
     // 如果请求包含 instructions 或 input 但没有 messages，则认为是 Responses 格式
-    let is_responses_format = !body.get("messages").is_some()
+    let is_responses_format = body.get("messages").is_none()
         && (body.get("instructions").is_some() || body.get("input").is_some());
 
     if is_responses_format {
         debug!("Detected Responses API format, converting to Chat Completions format");
+        body["messages"] = json!([]);
 
         // 转换 instructions 为 system message
         if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
@@ -1787,11 +1935,6 @@ pub async fn handle_chat_completions(
                     "role": "system",
                     "content": instructions
                 });
-
-                // 初始化 messages 数组
-                if !body.get("messages").is_some() {
-                    body["messages"] = json!([]);
-                }
 
                 // 将 system message 插入到开头
                 if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
@@ -1825,9 +1968,10 @@ pub async fn handle_chat_completions(
         }
     }
 
-    let normalized_interaction_ledger = body.get("_interaction_ledger").cloned();
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
+    crate::proxy::mappers::openai::request::validate_openai_tool_choice(&openai_req)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {
@@ -1954,6 +2098,7 @@ pub async fn handle_chat_completions(
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
     let mut retry_state = RequestRetryState::default();
+    let mut retried_without_thinking = false;
     let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
     let mut image_permit = None;
     let mut failure_statuses = FailureStatusTracker::default();
@@ -2219,28 +2364,21 @@ pub async fn handle_chat_completions(
 
                 let mut first_data_chunk = None;
                 let mut retry_this_account = false;
+                let first_data_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(300);
 
-                // Loop to skip heartbeats during peek
                 loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
-                        openai_stream.next(),
-                    )
-                    .await
-                    {
+                    match tokio::time::timeout_at(first_data_deadline, openai_stream.next()).await {
                         Ok(Some(Ok(bytes))) => {
                             if bytes.is_empty() {
                                 continue;
                             }
 
-                            let text = String::from_utf8_lossy(&bytes);
                             // Skip SSE comments/pings (heartbeats)
-                            if text.trim().starts_with(":") || text.trim().starts_with("data: :") {
+                            if stream_chunk_is_heartbeat(&bytes) {
                                 tracing::debug!("[OpenAI] Skipping peek heartbeat");
                                 continue;
                             }
-
-                            // Check for error events
                             if stream_chunk_has_error_event(&bytes) {
                                 tracing::warn!("[OpenAI] Error detected during peek, retrying...");
                                 last_error = "Error event during peek".to_string();
@@ -2297,10 +2435,16 @@ pub async fn handle_chat_completions(
                     let mut s = Box::pin(combined_stream);
                     let mut saw_image_data = false;
                     let mut stream_failed = false;
+                    let mut idle_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(300);
 
                     loop {
-                        match tokio::time::timeout(std::time::Duration::from_secs(300), s.next()).await {
+                        match tokio::time::timeout_at(idle_deadline, s.next()).await {
                             Ok(Some(Ok(bytes))) => {
+                                if !stream_chunk_is_heartbeat(&bytes) {
+                                    idle_deadline =
+                                        tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+                                }
                                 if stream_chunk_has_error_event(&bytes) {
                                     stream_failed = true;
                                 }
@@ -2554,13 +2698,39 @@ pub async fn handle_chat_completions(
             .await;
         }
 
-        // 确定重试策略
+        let signature_error =
+            crate::proxy::handlers::common::is_invalid_signature_error(status_code, &error_text);
+        if signature_error && !retried_without_thinking {
+            tracing::warn!(
+                "[OpenAI] Signature error detected on account {}, rebuilding once without thinking",
+                email
+            );
+            retried_without_thinking = true;
+            openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
+                thinking_type: Some("disabled".to_string()),
+                ..Default::default()
+            });
+            let signatures = crate::proxy::SignatureCache::global();
+            signatures.delete_session_signature(&session_id);
+            for message in &openai_req.messages {
+                for call in message.tool_calls.iter().flatten() {
+                    signatures.delete_tool_signature(&call.id);
+                }
+            }
+            if openai_req.model.ends_with("-thinking") {
+                openai_req.model = openai_req.model.trim_end_matches("-thinking").to_string();
+            }
+            retry_credentials = Some((access_token, project_id, email, account_id, 0));
+            continue;
+        }
+
+        // Determine retry strategy only after the bounded signature recovery transition.
         let strategy = retry_state.determine_strategy(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
-            false,
+            retried_without_thinking,
         );
         let should_mark_limited =
             status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500;
@@ -2679,49 +2849,6 @@ pub async fn handle_chat_completions(
                 max_attempts
             );
             continue;
-        }
-
-        // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
-            && (error_text.contains("Invalid `signature`")
-                || error_text.contains("thinking.signature")
-                || error_text.contains("Invalid signature")
-                || error_text.contains("Corrupted thought signature"))
-        {
-            tracing::warn!(
-                "[OpenAI] Signature error detected on account {}, retrying without thinking",
-                email
-            );
-
-            // [FIX #3391] 彻底清除 thinking 配置并去除 -thinking 模型后缀，确保下一轮重试时完全关闭思考
-            openai_req.thinking = None;
-            if openai_req.model.ends_with("-thinking") {
-                openai_req.model = openai_req.model.trim_end_matches("-thinking").to_string();
-            }
-
-            // 追加修复提示词到最后一条用户消息
-            if let Some(last_msg) = openai_req.messages.last_mut() {
-                if last_msg.role == "user" {
-                    let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
-
-                    if let Some(content) = &mut last_msg.content {
-                        use crate::proxy::mappers::openai::{OpenAIContent, OpenAIContentBlock};
-                        match content {
-                            OpenAIContent::String(s) => {
-                                s.push_str(repair_prompt);
-                            }
-                            OpenAIContent::Array(arr) => {
-                                arr.push(OpenAIContentBlock::Text {
-                                    text: repair_prompt.to_string(),
-                                });
-                            }
-                        }
-                        tracing::debug!("[OpenAI] Appended repair prompt to last user message");
-                    }
-                }
-            }
-
-            continue; // 重试
         }
 
         // [FIX session-1M] 上游按 sessionId 在服务端累计会话输入,长工具循环会把累计推过 1M,
@@ -2889,6 +3016,7 @@ pub async fn handle_completions(
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    normalize_responses_input(&mut body);
     debug!(
         "Received /v1/completions or /v1/responses payload: {} bytes",
         serialized_json_len(&body)
@@ -2896,7 +3024,7 @@ pub async fn handle_completions(
     let debug_cfg = state.debug_logging.read().await.clone();
     let original_body =
         debug_logger::is_enabled(&debug_cfg).then(|| debug_value_without_inline_data(&body));
-    let is_responses_api = uri.path() == "/v1/responses";
+    let is_responses_api = matches!(uri.path(), "/v1/responses" | "/responses");
     let is_codex_style = body.get("input").is_some() || body.get("instructions").is_some();
     let store_response = responses_store_enabled(&body);
 
@@ -3058,7 +3186,8 @@ pub async fn handle_completions(
                                 .unwrap_or("unknown")
                         };
 
-                        call_id_to_name.insert(call_id.to_string(), name.to_string());
+                        let name = responses_tool_name(item, name);
+                        call_id_to_name.insert(call_id.to_string(), name.clone());
                         tracing::debug!("Mapped call_id {} to name {}", call_id, name);
                     }
                     _ => {}
@@ -3126,10 +3255,7 @@ pub async fn handle_completions(
                     }
                     "function_call" | "custom_tool_call" | "local_shell_call"
                     | "web_search_call" => {
-                        let mut name = item
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        let mut name = responses_tool_name(&item, "unknown");
                         let mut args_str = item
                             .get("arguments")
                             .and_then(|v| v.as_str())
@@ -3148,7 +3274,7 @@ pub async fn handle_completions(
                                     .unwrap_or_else(|_| "{}".to_string());
                             }
                         } else if item_type == "local_shell_call" {
-                            name = "shell";
+                            name = "shell".to_string();
                             if let Some(action) = item.get("action") {
                                 if let Some(exec) = action.get("exec") {
                                     // Map to ShellCommandToolCallParams (string command) or ShellToolCallParams (array command)
@@ -3174,7 +3300,7 @@ pub async fn handle_completions(
                                 }
                             }
                         } else if item_type == "web_search_call" {
-                            name = "google_search";
+                            name = "google_search".to_string();
                             if let Some(action) = item.get("action") {
                                 let mut args_obj = serde_json::Map::new();
                                 if let Some(q) = action.get("query") {
@@ -3500,6 +3626,10 @@ pub async fn handle_completions(
             return (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)).into_response();
         }
     };
+    if let Err(e) = crate::proxy::mappers::openai::request::validate_openai_tool_choice(&openai_req)
+    {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
 
     // Safety: Inject empty message if needed
     if openai_req.messages.is_empty() {
@@ -3534,13 +3664,14 @@ pub async fn handle_completions(
 
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
+    let client_custom_tool_names = declared_custom_tool_names(openai_req.tools.as_deref());
 
     crate::proxy::mappers::context_manager::ContextManager::restore_openai_reasoning_content(
         &mut openai_req.messages,
         &signature_session_id_str,
     );
 
-    let experimental_cfg = state.experimental.read().await;
+    let experimental_cfg = state.experimental.read().await.clone();
     let compression_level = if experimental_cfg.compression_level == "disabled" {
         if experimental_cfg.enable_usage_scaling {
             "high".to_string()
@@ -3672,12 +3803,10 @@ pub async fn handle_completions(
                 trace_id, usage_ratio * 100.0, threshold_l3 * 100.0
             );
 
-            let token_manager_clone = token_manager.clone();
-
             match try_compress_openai_with_summary(
                 &openai_req,
                 &trace_id,
-                &token_manager_clone,
+                &state,
                 &signature_session_id_str,
             )
             .await
@@ -3820,7 +3949,7 @@ pub async fn handle_completions(
                             headers,
                             format!("Token error: {}", e),
                         )
-                            .into_response()
+                            .into_response();
                     }
                 }
             };
@@ -3951,7 +4080,7 @@ pub async fn handle_completions(
         let status = response.status();
         if status.is_success() {
             // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
+            token_manager.mark_account_success(&account_id);
 
             if list_response {
                 use axum::body::Body;
@@ -4002,6 +4131,7 @@ pub async fn handle_completions(
                             response_id_for_save.clone(),
                             completion_tx,
                             store_response,
+                            Some(client_custom_tool_names.clone()),
                         )
                     } else {
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
@@ -4013,25 +4143,20 @@ pub async fn handle_completions(
                         )
                     };
 
-                    // [P1 FIX] Enhanced Peek logic (Reused from above/standard)
+                    // Skip synthetic heartbeats without extending the first-content deadline.
                     let mut first_data_chunk = None;
                     let mut retry_this_account = false;
-
+                    let first_data_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                     loop {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
-                            openai_stream.next(),
-                        )
-                        .await
+                        match tokio::time::timeout_at(first_data_deadline, openai_stream.next())
+                            .await
                         {
                             Ok(Some(Ok(bytes))) => {
                                 if bytes.is_empty() {
                                     continue;
                                 }
-                                let text = String::from_utf8_lossy(&bytes);
-                                if text.trim().starts_with(":")
-                                    || text.trim().starts_with("data: :")
-                                {
+                                if stream_chunk_is_heartbeat(&bytes) {
                                     continue;
                                 }
                                 if stream_chunk_has_error_event(&bytes) {
@@ -4145,15 +4270,14 @@ pub async fn handle_completions(
                         Some(client_tool_names.clone()),
                     );
 
-                    // Peek Logic (Repeated for safety/correctness on this stream type)
+                    // Skip synthetic heartbeats without extending the first-content deadline.
                     let mut first_data_chunk = None;
                     let mut retry_this_account = false;
+                    let first_data_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                     loop {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
-                            openai_stream.next(),
-                        )
-                        .await
+                        match tokio::time::timeout_at(first_data_deadline, openai_stream.next())
+                            .await
                         {
                             Ok(Some(Ok(bytes))) => {
                                 if bytes.is_empty() {
@@ -4223,7 +4347,8 @@ pub async fn handle_completions(
                     use crate::proxy::mappers::openai::collector::collect_stream_to_json;
                     match collect_stream_to_json(combined_stream).await {
                         Ok(chat_resp) => {
-                            let is_responses_api = uri.path() == "/v1/responses";
+                            let is_responses_api =
+                                matches!(uri.path(), "/v1/responses" | "/responses");
 
                             if is_responses_api {
                                 let mut resp = convert_chat_response_to_responses(&chat_resp);
@@ -4236,7 +4361,7 @@ pub async fn handle_completions(
                                     .into_iter()
                                     .filter_map(into_history_without_inline_media)
                                     .collect();
-                                if store_response {
+                                if store_response && resp["status"] == "completed" {
                                     crate::proxy::http_session_store::save_session_delta(
                                         response_id_for_save.clone(),
                                         session_parent,
@@ -4372,9 +4497,7 @@ pub async fn handle_completions(
                 Some(&client_tool_names),
             );
 
-            let is_responses_api = uri.path() == "/v1/responses";
-
-            if is_responses_api {
+            if matches!(uri.path(), "/v1/responses" | "/responses") {
                 let resp = convert_chat_response_to_responses(&chat_resp);
                 if debug_logger::is_enabled(&debug_cfg) {
                     let payload = json!({
@@ -4754,9 +4877,21 @@ pub async fn handle_images_generations_internal(
         .and_then(|v| v.as_str())
         .unwrap_or("gemini-3.1-flash-image");
 
-    let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let n = match body.get("n") {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "'n' must be a positive integer".to_string(),
+                None,
+            ))?,
+        None => 1,
+    };
 
-    let size = body.get("size").and_then(|v| v.as_str());
+    if let Err(message) = validate_output_image_count(n) {
+        return Err((StatusCode::BAD_REQUEST, message, None));
+    }
 
     let response_format = body
         .get("response_format")
@@ -4764,6 +4899,14 @@ pub async fn handle_images_generations_internal(
         .unwrap_or("b64_json");
 
     let quality = body.get("quality").and_then(|v| v.as_str());
+    let size = match body.get("size") {
+        Some(value) if !value.is_null() => Some(value.as_str().ok_or((
+            StatusCode::BAD_REQUEST,
+            "Invalid size: expected a string".to_string(),
+            None,
+        ))?),
+        _ => None,
+    };
 
     let image_size = generation_image_size_param(&body)
         .map_err(|message| (StatusCode::BAD_REQUEST, message, None))?;
@@ -5248,9 +5391,16 @@ pub async fn handle_images_edits(
                 .await
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Prompt read error: {}", e)))?;
         } else if name == "n" {
-            if let Ok(val) = field.text().await {
-                n = val.parse().unwrap_or(1);
-            }
+            let value = field
+                .text()
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("n read error: {}", e)))?;
+            n = value.parse::<usize>().map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "'n' must be a positive integer".to_string(),
+                )
+            })?;
         } else if name == "size" {
             let val = field
                 .text()
@@ -5291,9 +5441,11 @@ pub async fn handle_images_edits(
     if prompt.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Missing prompt".to_string()));
     }
+    if let Err(message) = validate_output_image_count(n) {
+        return Err((StatusCode::BAD_REQUEST, message));
+    }
 
     tracing::info!(
-        model = model,
         n = n,
         size = size.as_deref().unwrap_or("auto"),
         aspect_ratio = aspect_ratio.as_deref().unwrap_or("auto"),
@@ -5850,12 +6002,18 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
         let mut translation_state = TranslationState {
             response_id: format!("resp-{}", &Uuid::new_v4().to_string()[..24]),
             item_id: format!("item-{}", &Uuid::new_v4().to_string()[..16]),
+            reasoning_item_id: format!("msg_thought_{}", &Uuid::new_v4().to_string()[..16]),
             message_output_index: None,
+            reasoning_output_index: None,
             next_output_index: 0,
             tool_output_indices: std::collections::HashMap::new(),
             message_item_added: false,
+            reasoning_item_added: false,
             content_part_added: false,
             accumulated_text: String::new(),
+            accumulated_reasoning: String::new(),
+            terminal_error: None,
+            incomplete_reason: None,
             tool_calls: std::collections::HashMap::new(),
             tool_calls_added: std::collections::HashSet::new(),
         };
@@ -5877,7 +6035,7 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("Stream chunk error: {:?}", e);
+                    translation_state.terminal_error = Some(json!({ "message": e.to_string() }));
                     break;
                 }
             };
@@ -5950,14 +6108,18 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
             .await;
         }
 
-        session_state.last_response_output =
-            into_history_without_inline_media(completed_output).unwrap_or_else(|| json!([]));
-        session_state.last_response_id = translation_state.response_id.clone();
-        session_state.last_response_pending_tool_call_ids = translation_state
-            .tool_calls
-            .values()
-            .map(|(_, call_id, _, _)| call_id.clone())
-            .collect();
+        if translation_state.terminal_error.is_none()
+            && translation_state.incomplete_reason.is_none()
+        {
+            session_state.last_response_output =
+                into_history_without_inline_media(completed_output).unwrap_or_else(|| json!([]));
+            session_state.last_response_id = translation_state.response_id.clone();
+            session_state.last_response_pending_tool_call_ids = translation_state
+                .tool_calls
+                .values()
+                .map(|(_, call_id, _, _)| call_id.clone())
+                .collect();
+        }
     }
 }
 
@@ -6043,6 +6205,7 @@ fn normalize_responses_websocket_request(
     mut payload: Value,
     state: &mut WebsocketSessionState,
 ) -> Result<Value, String> {
+    normalize_responses_input(&mut payload);
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -6306,6 +6469,7 @@ fn repair_tool_calls(
 }
 
 fn convert_codex_to_openai_request(mut body: Value) -> Value {
+    normalize_responses_input(&mut body);
     let instructions = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -6351,11 +6515,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                         .and_then(|v| v.as_str())
                         .or_else(|| item.get("id").and_then(|v| v.as_str()))
                         .unwrap_or("unknown");
-                    let mut name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let mut name = responses_tool_name(item, "unknown");
                     if item_type == "local_shell_call" || name == "local_shell_call" {
                         name = "shell".to_string();
                     } else if item_type == "web_search_call" || name == "web_search_call" {
@@ -6403,10 +6563,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                     }
                 }
                 "function_call" | "custom_tool_call" | "local_shell_call" | "web_search_call" => {
-                    let mut name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
+                    let mut name = responses_tool_name(&item, "unknown");
                     let mut args_str = item
                         .get("arguments")
                         .and_then(|v| v.as_str())
@@ -6424,7 +6581,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                                 .unwrap_or_else(|_| "{}".to_string());
                         }
                     } else if item_type == "local_shell_call" || name == "local_shell_call" {
-                        name = "shell";
+                        name = "shell".to_string();
                         if let Some(action) = item.get("action") {
                             if let Some(exec) = action.get("exec") {
                                 let mut args_obj = serde_json::Map::new();
@@ -6446,7 +6603,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                             }
                         }
                     } else if item_type == "web_search_call" || name == "web_search_call" {
-                        name = "google_search";
+                        name = "google_search".to_string();
                         if let Some(action) = item.get("action") {
                             let mut args_obj = serde_json::Map::new();
                             if let Some(q) = action.get("query") {
@@ -6552,12 +6709,18 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
 struct TranslationState {
     response_id: String,
     item_id: String,
+    reasoning_item_id: String,
     message_output_index: Option<u32>,
+    reasoning_output_index: Option<u32>,
     next_output_index: u32,
     tool_output_indices: std::collections::HashMap<u32, u32>,
     message_item_added: bool,
+    reasoning_item_added: bool,
     content_part_added: bool,
     accumulated_text: String,
+    accumulated_reasoning: String,
+    terminal_error: Option<Value>,
+    incomplete_reason: Option<&'static str>,
     tool_calls: std::collections::HashMap<u32, (String, String, String, String)>,
     tool_calls_added: std::collections::HashSet<u32>,
 }
@@ -6573,108 +6736,68 @@ async fn translate_openai_chunk_to_ws(
     socket: &mut WebSocket,
     ws_events: &mut Vec<Value>,
 ) {
-    if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+    if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+        state.terminal_error = Some(error.clone());
+        return;
+    }
+    if let Some(finish_reason) = chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| {
+            choices
+                .iter()
+                .find_map(|choice| choice.get("finish_reason"))
+        })
+        .and_then(Value::as_str)
+    {
+        state.incomplete_reason = match finish_reason {
+            "length" | "max_tokens" => Some("max_output_tokens"),
+            "content_filter" => Some("content_filter"),
+            _ => None,
+        };
+    }
+    if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
-                if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
                     if !reasoning.is_empty() {
-                        let message_output_index = match state.message_output_index {
-                            Some(idx) => idx,
+                        let output_index = match state.reasoning_output_index {
+                            Some(index) => index,
                             None => {
-                                let idx = state.next_output_index;
+                                let index = state.next_output_index;
                                 state.next_output_index += 1;
-                                state.message_output_index = Some(idx);
-                                idx
+                                state.reasoning_output_index = Some(index);
+                                index
                             }
                         };
-                        let reasoning_ev = json!({
-                            "type": "response.reasoning_summary_text.delta",
-                            "sequence_number": 0,
-                            "item_id": &state.item_id,
-                            "output_index": message_output_index,
-                            "summary_index": 0,
-                            "delta": reasoning
-                        });
-                        send_ws_event(socket, ws_events, &reasoning_ev).await;
-
-                        if !state.message_item_added {
-                            let item_added = json!({
-                                "type": "response.output_item.added",
-                                "output_index": message_output_index,
-                                "item": {
-                                    "id": &state.item_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "phase": "commentary",
-                                    "status": "in_progress",
-                                    "content": []
-                                }
-                            });
+                        if !state.reasoning_item_added {
+                            let item_added = json!({"type":"response.output_item.added","output_index":output_index,"item":{"id":&state.reasoning_item_id,"type":"message","role":"assistant","phase":"commentary","status":"in_progress","content":[]}});
                             send_ws_event(socket, ws_events, &item_added).await;
-
-                            let part_added = json!({
-                                "type": "response.content_part.added",
-                                "item_id": &state.item_id,
-                                "output_index": message_output_index,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": ""
-                                }
-                            });
+                            let part_added = json!({"type":"response.content_part.added","item_id":&state.reasoning_item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":""}});
                             send_ws_event(socket, ws_events, &part_added).await;
-                            state.message_item_added = true;
-                            state.content_part_added = true;
+                            state.reasoning_item_added = true;
                         }
-
-                        let delta_ev = json!({
-                            "type": "response.output_text.delta",
-                            "item_id": &state.item_id,
-                            "output_index": message_output_index,
-                            "content_index": 0,
-                            "delta": reasoning
-                        });
-                        send_ws_event(socket, ws_events, &delta_ev).await;
-                        state.accumulated_text.push_str(reasoning);
+                        let event = json!({"type":"response.reasoning_summary_text.delta","item_id":&state.reasoning_item_id,"output_index":output_index,"summary_index":0,"delta":reasoning});
+                        send_ws_event(socket, ws_events, &event).await;
+                        state.accumulated_reasoning.push_str(reasoning);
                     }
                 }
 
-                if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                if let Some(content) = delta.get("content").and_then(Value::as_str) {
                     if !content.is_empty() {
                         let message_output_index = match state.message_output_index {
-                            Some(idx) => idx,
+                            Some(index) => index,
                             None => {
-                                let idx = state.next_output_index;
+                                let index = state.next_output_index;
                                 state.next_output_index += 1;
-                                state.message_output_index = Some(idx);
-                                idx
+                                state.message_output_index = Some(index);
+                                index
                             }
                         };
                         if !state.message_item_added {
-                            let item_added = json!({
-                                "type": "response.output_item.added",
-                                "output_index": message_output_index,
-                                "item": {
-                                    "id": &state.item_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "phase": "commentary",
-                                    "status": "in_progress",
-                                    "content": []
-                                }
-                            });
+                            let item_added = json!({"type":"response.output_item.added","output_index":message_output_index,"item":{"id":&state.item_id,"type":"message","role":"assistant","phase":"final_answer","status":"in_progress","content":[]}});
                             send_ws_event(socket, ws_events, &item_added).await;
-
-                            let part_added = json!({
-                                "type": "response.content_part.added",
-                                "item_id": &state.item_id,
-                                "output_index": message_output_index,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": ""
-                                }
-                            });
+                            let part_added = json!({"type":"response.content_part.added","item_id":&state.item_id,"output_index":message_output_index,"content_index":0,"part":{"type":"output_text","text":""}});
                             send_ws_event(socket, ws_events, &part_added).await;
                             state.message_item_added = true;
                             state.content_part_added = true;
@@ -6789,6 +6912,35 @@ async fn finalize_ws_events(
     session_state: &mut WebsocketSessionState,
     ws_events: &mut Vec<Value>,
 ) -> Value {
+    if let Some(error) = state.terminal_error.as_ref() {
+        let failed = json!({
+            "type": "response.failed",
+            "response": {
+                "id": &state.response_id,
+                "object": "response",
+                "status": "failed",
+                "error": error,
+                "output": []
+            }
+        });
+        send_ws_event(socket, ws_events, &failed).await;
+        return json!([]);
+    }
+    if let Some(reason) = state.incomplete_reason {
+        let incomplete = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": &state.response_id,
+                "object": "response",
+                "status": "incomplete",
+                "incomplete_details": { "reason": reason },
+                "output": []
+            }
+        });
+        send_ws_event(socket, ws_events, &incomplete).await;
+        return json!([]);
+    }
+
     let mut output_items = Vec::new();
     let mut tool_keys: Vec<u32> = state.tool_calls.keys().cloned().collect();
     tool_keys.sort();
@@ -6985,34 +7137,42 @@ The structure MUST be as follows:
 async fn call_openai_gemini_sync(
     model: &str,
     request: &OpenAIRequest,
-    token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
+    state: &AppState,
     trace_id: &str,
 ) -> Result<String, String> {
-    let (access_token, project_id, _, account_id, _wait_ms) = token_manager
-        .get_token("gemini", false, None, model)
+    let configured_model = crate::proxy::common::model_mapping::resolve_model_route(
+        model,
+        &*state.custom_mapping.read().await,
+    );
+    let (access_token, project_id, _, account_id, _wait_ms) = state
+        .token_manager
+        .get_token("gemini", false, None, &configured_model)
         .await
         .map_err(|e| format!("Failed to get account: {}", e))?;
-
-    let token_obj = token_manager.get_token_by_id(&account_id);
-    let session_id = format!("bg_sid_{}", chrono::Utc::now().timestamp_subsec_millis());
+    let mapped_model = state
+        .token_manager
+        .resolve_dynamic_model_for_account(&account_id, &configured_model)
+        .await;
+    let token_obj = state.token_manager.get_token_by_id(&account_id);
     let (gemini_body, _, _, _) =
-        transform_openai_request(request, &project_id, &session_id, token_obj.as_ref());
+        transform_openai_request(request, &project_id, &mapped_model, token_obj.as_ref());
 
-    let upstream_url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-        model
+    debug!(
+        "[{}] [OpenAI-BG] Calling v1internal Gemini model: {}",
+        trace_id, mapped_model
     );
-
-    debug!("[{}] [OpenAI-BG] Calling Gemini API: {}", trace_id, model);
-
-    let response = reqwest::Client::new()
-        .post(&upstream_url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&gemini_body)
-        .send()
+    let response = state
+        .upstream
+        .call_v1_internal(
+            "generateContent",
+            &access_token,
+            gemini_body,
+            None,
+            Some(account_id.as_str()),
+        )
         .await
-        .map_err(|e| format!("API call failed: {}", e))?;
+        .map_err(|e| format!("API call failed: {}", e))?
+        .response;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -7026,23 +7186,26 @@ async fn call_openai_gemini_sync(
         .json()
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
-
     gemini_response
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
+        .and_then(Value::as_array)
+        .and_then(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .find(|text| !text.is_empty())
+        })
+        .map(str::to_owned)
         .ok_or_else(|| "Failed to extract text from response".to_string())
 }
 
 async fn try_compress_openai_with_summary(
     original_request: &OpenAIRequest,
     trace_id: &str,
-    token_manager: &std::sync::Arc<crate::proxy::TokenManager>,
+    state: &AppState,
     session_id_str: &str,
 ) -> Result<OpenAIRequest, String> {
     info!(
@@ -7098,13 +7261,9 @@ async fn try_compress_openai_with_summary(
         trace_id, INTERNAL_BACKGROUND_TASK
     );
 
-    let xml_summary = call_openai_gemini_sync(
-        INTERNAL_BACKGROUND_TASK,
-        &summary_request,
-        token_manager,
-        trace_id,
-    )
-    .await?;
+    let xml_summary =
+        call_openai_gemini_sync(INTERNAL_BACKGROUND_TASK, &summary_request, state, trace_id)
+            .await?;
 
     info!(
         "[{}] [Layer-3] [OpenAI] Generated XML summary (len: {} chars)",

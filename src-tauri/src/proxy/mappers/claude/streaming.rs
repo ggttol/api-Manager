@@ -5,7 +5,7 @@ use super::models::*;
 use super::utils::to_claude_usage;
 use crate::proxy::mappers::estimation_calibrator::get_calibrator;
 // use crate::proxy::mappers::signature_store::store_thought_signature; // Deprecated
-use crate::proxy::common::client_adapter::{ClientAdapter, SignatureBufferStrategy}; // [NEW]
+use crate::proxy::common::client_adapter::ClientAdapter;
 use crate::proxy::SignatureCache;
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -207,8 +207,12 @@ pub struct StreamingState {
     used_tool: bool,
     signatures: SignatureManager,
     trailing_signature: Option<String>,
+    pending_finish_reason: Option<String>,
+    latest_usage: Option<UsageMetadata>,
+    pub terminal_received: bool,
+    pub upstream_failed: bool,
     pub web_search_query: Option<String>,
-    pub grounding_chunks: Option<Vec<serde_json::Value>>,
+    pub grounding_chunks: Option<Vec<Value>>,
     // [IMPROVED] Error recovery 状态追踪 (prepared for future use)
     #[allow(dead_code)]
     parse_error_count: usize,
@@ -248,6 +252,10 @@ impl StreamingState {
             used_tool: false,
             signatures: SignatureManager::new(),
             trailing_signature: None,
+            pending_finish_reason: None,
+            latest_usage: None,
+            terminal_received: false,
+            upstream_failed: false,
             web_search_query: None,
             grounding_chunks: None,
             // [IMPROVED] 初始化 error recovery 字段
@@ -412,6 +420,33 @@ impl StreamingState {
         )
     }
 
+    /// Records terminal metadata without closing the Claude message. Gemini can
+    /// legally supply usage in a later metadata-only frame.
+    pub fn record_terminal_metadata(
+        &mut self,
+        finish_reason: Option<&str>,
+        usage_metadata: Option<UsageMetadata>,
+    ) {
+        if let Some(reason) = finish_reason {
+            self.pending_finish_reason = Some(reason.to_string());
+            self.terminal_received = true;
+        }
+        if usage_metadata.is_some() {
+            self.latest_usage = usage_metadata;
+        }
+    }
+
+    /// Completes a previously observed upstream terminal response after all
+    /// frames (including trailing usage metadata) have been consumed.
+    pub fn emit_pending_finish(&mut self) -> Vec<Bytes> {
+        let finish_reason = self.pending_finish_reason.take();
+        let usage = self.latest_usage.take();
+        match finish_reason {
+            Some(reason) => self.emit_finish(Some(&reason), usage.as_ref()),
+            None => Vec::new(),
+        }
+    }
+
     /// 发送结束事件
     pub fn emit_finish(
         &mut self,
@@ -489,7 +524,7 @@ impl StreamingState {
             }
         }
 
-        // 确定 stop_reason
+        self.terminal_received = finish_reason.is_some();
         let stop_reason = if self.used_tool {
             "tool_use"
         } else if finish_reason == Some("MAX_TOKENS") {
@@ -572,6 +607,23 @@ impl StreamingState {
     /// 获取 trailing signature (仅用于检查)
     pub fn has_trailing_signature(&self) -> bool {
         self.trailing_signature.is_some()
+    }
+    /// Emit an unresolved MCP fragment as literal text on termination.  It may be
+    /// an incomplete tool call or documentation that merely resembles one.
+    pub fn flush_incomplete_mcp_xml(&mut self) -> Vec<Bytes> {
+        if !self.in_mcp_xml || self.mcp_xml_buffer.is_empty() {
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.mcp_xml_buffer);
+        self.in_mcp_xml = false;
+        let mut chunks = Vec::new();
+        if self.current_block_type() != BlockType::Text {
+            chunks.extend(self.start_block(BlockType::Text, json!({ "type": "text", "text": "" })));
+        }
+        self.text_delta_emitted_this_turn = true;
+        self.has_content = true;
+        chunks.push(self.emit_delta("text_delta", json!({ "text": text })));
+        chunks
     }
 
     /// 处理 SSE 解析错误，实现优雅降级
@@ -686,33 +738,26 @@ impl<'a> PartProcessor<'a> {
 
         // 1. FunctionCall 处理
         if let Some(fc) = &part.function_call {
-            // 先处理 trailingSignature (B4/C3 场景)
-            if self.state.has_trailing_signature() {
-                chunks.extend(self.state.end_block());
-                if let Some(trailing_sig) = self.state.trailing_signature.take() {
-                    chunks.push(self.state.emit(
-                        "content_block_start",
-                        json!({
-                            "type": "content_block_start",
-                            "index": self.state.current_block_index(),
-                            "content_block": { "type": "thinking", "thinking": "" }
-                        }),
-                    ));
-                    chunks.push(
-                        self.state
-                            .emit_delta("thinking_delta", json!({ "thinking": "" })),
-                    );
-                    chunks.push(
-                        self.state
-                            .emit_delta("signature_delta", json!({ "signature": trailing_sig })),
-                    );
-                    chunks.extend(self.state.end_block());
-                }
-            }
+            chunks.extend(self.emit_trailing_signature_block());
 
             chunks.extend(self.process_function_call(fc, signature));
             // [FIX #859] Mark that we have received actual content (tool use)
             self.state.has_content = true;
+            return chunks;
+        }
+
+        // Gemini may deliver a signature in its own part after thought text.  It belongs
+        // to the open thinking block, not to a synthetic text block.
+        if signature.is_some() && part.text.is_none() && part.inline_data.is_none() {
+            // A signature may arrive after text or other non-thinking output.
+            // Cache it immediately: no subsequent block is required to make it
+            // available for the next request.
+            self.cache_thinking_signature(signature.clone());
+            if self.state.current_block_type() == BlockType::Thinking {
+                self.state.store_signature(signature);
+            } else {
+                self.state.set_trailing_signature(signature);
+            }
             return chunks;
         }
 
@@ -740,43 +785,49 @@ impl<'a> PartProcessor<'a> {
         chunks
     }
 
+    fn emit_trailing_signature_block(&mut self) -> Vec<Bytes> {
+        let mut chunks = self.state.end_block();
+        if let Some(signature) = self.state.trailing_signature.take() {
+            chunks.extend(self.state.start_block(
+                BlockType::Thinking,
+                json!({ "type": "thinking", "thinking": "" }),
+            ));
+            self.state.store_signature(Some(signature));
+            chunks.extend(self.state.end_block());
+        }
+        chunks
+    }
+
+    fn cache_thinking_signature(&self, signature: Option<String>) {
+        let Some(sig) = signature else { return };
+        if let Some(model) = &self.state.model_name {
+            SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
+        }
+        if let Some(session_id) = &self.state.session_id {
+            SignatureCache::global().cache_session_signature(
+                session_id,
+                sig,
+                self.state.message_count,
+            );
+        }
+    }
+
     /// 处理 Thinking
     fn process_thinking(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
 
-        // 处理之前的 trailingSignature
+        // A standalone signature can follow either thinking, text, or a function call.
+        // Close the preceding block and run it through the state machine so its start,
+        // delta, and stop share one index.
         if self.state.has_trailing_signature() {
-            chunks.extend(self.state.end_block());
-            if let Some(trailing_sig) = self.state.trailing_signature.take() {
-                chunks.push(self.state.emit(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": self.state.current_block_index(),
-                        "content_block": { "type": "thinking", "thinking": "" }
-                    }),
-                ));
-                chunks.push(
-                    self.state
-                        .emit_delta("thinking_delta", json!({ "thinking": "" })),
-                );
-                chunks.push(
-                    self.state
-                        .emit_delta("signature_delta", json!({ "signature": trailing_sig })),
-                );
-                chunks.extend(self.state.end_block());
-            }
+            chunks.extend(self.emit_trailing_signature_block());
         }
-
-        // 开始或继续 thinking 块
         if self.state.current_block_type() != BlockType::Thinking {
             chunks.extend(self.state.start_block(
                 BlockType::Thinking,
                 json!({ "type": "thinking", "thinking": "" }),
             ));
         }
-
-        // [FIX #859] Mark that we have received thinking content
         self.state.has_thinking = true;
 
         if !text.is_empty() {
@@ -786,46 +837,8 @@ impl<'a> PartProcessor<'a> {
             );
         }
 
-        // [NEW] Apply Client Adapter Strategy
-        let use_fifo = self
-            .state
-            .client_adapter
-            .as_ref()
-            .map(|a| a.signature_buffer_strategy() == SignatureBufferStrategy::Fifo)
-            .unwrap_or(false);
-
-        // [IMPROVED] Store signature to global cache
-        if let Some(ref sig) = signature {
-            // 1. Cache family if we know the model
-            if let Some(model) = &self.state.model_name {
-                SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
-            }
-
-            // 2. [NEW v3.3.17] Cache to session-based storage for tool loop recovery
-            if let Some(session_id) = &self.state.session_id {
-                // If FIFO strategy is enabled, use a unique index for each signature (e.g. timestamp or counter)
-                // However, our cache implementation currently keys by session_id.
-                // For FIFO, we might just rely on the fact that we are processing in order.
-                // But specifically for opencode, it might be calling tools in parallel or sequence.
-
-                SignatureCache::global().cache_session_signature(
-                    session_id,
-                    sig.clone(),
-                    self.state.message_count,
-                );
-                tracing::debug!(
-                    "[Claude-SSE] Cached signature to session {} (length: {}) [FIFO: {}]",
-                    session_id,
-                    sig.len(),
-                    use_fifo
-                );
-            }
-
-            tracing::debug!(
-                "[Claude-SSE] Captured thought_signature from thinking block (length: {})",
-                sig.len()
-            );
-        }
+        // Store signature in both caches before queuing it for `end_block`.
+        self.cache_thinking_signature(signature.clone());
 
         // 暂存签名 (for local block handling)
         // If FIFO, we strictly follow the sequence. The default logic is effectively LIFO for a single turn
@@ -851,28 +864,8 @@ impl<'a> PartProcessor<'a> {
         // [FIX #859] Mark that we have received actual content (text)
         self.state.has_content = true;
 
-        // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {
-            chunks.extend(self.state.end_block());
-            if let Some(trailing_sig) = self.state.trailing_signature.take() {
-                chunks.push(self.state.emit(
-                    "content_block_start",
-                    json!({
-                        "type": "content_block_start",
-                        "index": self.state.current_block_index(),
-                        "content_block": { "type": "thinking", "thinking": "" }
-                    }),
-                ));
-                chunks.push(
-                    self.state
-                        .emit_delta("thinking_delta", json!({ "thinking": "" })),
-                );
-                chunks.push(
-                    self.state
-                        .emit_delta("signature_delta", json!({ "signature": trailing_sig })),
-                );
-                chunks.extend(self.state.end_block());
-            }
+            chunks.extend(self.emit_trailing_signature_block());
         }
 
         // 非空 text 带签名 - 立即处理
@@ -894,73 +887,88 @@ impl<'a> PartProcessor<'a> {
 
         // Ordinary text (without signature)
 
-        // [NEW] MCP XML Bridge: Intercept and parse <mcp__...> tags
-        if text.contains("<mcp__") || self.state.in_mcp_xml {
+        // MCP XML calls can be split at arbitrary byte boundaries.  Buffer only the
+        // possible XML suffix; ordinary prefix text is emitted before its tool call.
+        const MCP_PREFIX: &str = "<mcp__";
+        if self.state.in_mcp_xml || text.contains(MCP_PREFIX) {
             self.state.in_mcp_xml = true;
             self.state.mcp_xml_buffer.push_str(text);
 
-            // Check if we have a complete tag in the buffer
-            if self.state.mcp_xml_buffer.contains("</mcp__")
-                && self.state.mcp_xml_buffer.contains('>')
-            {
+            loop {
                 let buffer = self.state.mcp_xml_buffer.clone();
-                if let Some(start_idx) = buffer.find("<mcp__") {
-                    if let Some(tag_end_idx) = buffer[start_idx..].find('>') {
-                        let actual_tag_end = start_idx + tag_end_idx;
-                        let tool_name = &buffer[start_idx + 1..actual_tag_end];
-                        let end_tag = format!("</{}>", tool_name);
+                let Some(start_idx) = buffer.find(MCP_PREFIX) else {
+                    break;
+                };
+                let Some(tag_end_relative) = buffer[start_idx..].find('>') else {
+                    break;
+                };
+                let tag_end = start_idx + tag_end_relative;
+                let tool_name = &buffer[start_idx + 1..tag_end];
+                let end_tag = format!("</{}>", tool_name);
+                let Some(close_idx) = buffer[tag_end + 1..]
+                    .find(&end_tag)
+                    .map(|offset| tag_end + 1 + offset)
+                else {
+                    break;
+                };
 
-                        if let Some(close_idx) = buffer.find(&end_tag) {
-                            let input_str = &buffer[actual_tag_end + 1..close_idx];
-                            let input_json: serde_json::Value =
-                                serde_json::from_str(input_str.trim())
-                                    .unwrap_or_else(|_| json!({ "input": input_str.trim() }));
-
-                            // 构造并发送 tool_use
-                            let fc = FunctionCall {
-                                name: tool_name.to_string(),
-                                args: Some(input_json),
-                                id: Some(format!("{}-xml", tool_name)),
-                            };
-
-                            let tool_chunks = self.process_function_call(&fc, None);
-
-                            // 清理缓冲区并重置状态
-                            self.state.mcp_xml_buffer.clear();
-                            self.state.in_mcp_xml = false;
-
-                            // 处理标签之前可能存在的非 XML 文本
-                            if start_idx > 0 {
-                                let prefix_text = &buffer[..start_idx];
-                                // 这里不能递归。直接 emit 之前的 text 块。
-                                if self.state.current_block_type() != BlockType::Text {
-                                    chunks.extend(self.state.start_block(
-                                        BlockType::Text,
-                                        json!({ "type": "text", "text": "" }),
-                                    ));
-                                }
-                                chunks.push(
-                                    self.state
-                                        .emit_delta("text_delta", json!({ "text": prefix_text })),
-                                );
-                            }
-
-                            chunks.extend(tool_chunks);
-
-                            // 处理标签之后可能存在的非 XML 文本
-                            let suffix = &buffer[close_idx + end_tag.len()..];
-                            if !suffix.is_empty() {
-                                // 递归处理后缀内容
-                                chunks.extend(self.process_text(suffix, None));
-                            }
-
-                            return chunks;
-                        }
+                // Emit the prefix while the prior text block is still current.  Tool
+                // processing may close it and advance the block index.
+                if start_idx > 0 {
+                    let prefix = &buffer[..start_idx];
+                    if self.state.current_block_type() != BlockType::Text {
+                        chunks.extend(
+                            self.state.start_block(
+                                BlockType::Text,
+                                json!({ "type": "text", "text": "" }),
+                            ),
+                        );
                     }
+                    self.state.text_delta_emitted_this_turn = true;
+                    chunks.push(
+                        self.state
+                            .emit_delta("text_delta", json!({ "text": prefix })),
+                    );
+                }
+
+                let input = &buffer[tag_end + 1..close_idx];
+                let args = serde_json::from_str(input.trim())
+                    .unwrap_or_else(|_| json!({ "input": input.trim() }));
+                let fc = FunctionCall {
+                    name: tool_name.to_string(),
+                    args: Some(args),
+                    id: None,
+                };
+                chunks.extend(self.process_function_call(&fc, None));
+
+                self.state.mcp_xml_buffer = buffer[close_idx + end_tag.len()..].to_string();
+                if !self.state.mcp_xml_buffer.contains(MCP_PREFIX) {
+                    let suffix = std::mem::take(&mut self.state.mcp_xml_buffer);
+                    self.state.in_mcp_xml = false;
+                    if !suffix.is_empty() {
+                        chunks.extend(self.process_text(&suffix, None));
+                    }
+                    return chunks;
                 }
             }
-            // While in XML, don't emit text deltas
-            return vec![];
+            return chunks;
+        }
+
+        // Preserve an opener split after `<mcp__` (for example `<mc` + `p__...`).
+        let suffix_len = (1..MCP_PREFIX.len())
+            .rev()
+            .find(|&len| text.ends_with(&MCP_PREFIX[..len]))
+            .unwrap_or(0);
+        if suffix_len > 0 {
+            let prefix = &text[..text.len() - suffix_len];
+            if !prefix.is_empty() {
+                chunks.extend(self.process_text(prefix, None));
+            }
+            self.state.in_mcp_xml = true;
+            self.state
+                .mcp_xml_buffer
+                .push_str(&text[text.len() - suffix_len..]);
+            return chunks;
         }
 
         // [FIX #3379] call:default_api:* leakage recovery bridge
@@ -997,9 +1005,7 @@ impl<'a> PartProcessor<'a> {
         }
         let rest = &trimmed[PREFIX.len()..];
         // Tool name ends at the first `{` or `(` delimiter
-        let tool_end = rest
-            .find(|c| c == '{' || c == '(')
-            .unwrap_or(rest.len());
+        let tool_end = rest.find(|c| c == '{' || c == '(').unwrap_or(rest.len());
         let tool_name = rest[..tool_end].trim().to_string();
         if tool_name.is_empty() {
             return None;
@@ -1142,7 +1148,10 @@ impl<'a> PartProcessor<'a> {
         // After the tool name and args there must be nothing else (ignore trailing whitespace)
         let after_tool_name = &trimmed_text["call:default_api:".len() + tool_name.len()..].trim();
         // after_tool_name is either empty (no args) or is the args string itself
-        if !after_tool_name.is_empty() && !after_tool_name.starts_with('{') && !after_tool_name.starts_with('(') {
+        if !after_tool_name.is_empty()
+            && !after_tool_name.starts_with('{')
+            && !after_tool_name.starts_with('(')
+        {
             // There is non-arg text after the tool name — reject
             return None;
         }
@@ -1713,15 +1722,15 @@ mod tests {
             "Expected tool_use block_start, got: {}",
             output
         );
-        assert!(output.contains(r#""name":"Read""#), "Expected tool name Read");
+        assert!(
+            output.contains(r#""name":"Read""#),
+            "Expected tool name Read"
+        );
         assert!(
             !output.contains("text_delta"),
             "Must NOT produce text_delta for recovered call"
         );
-        assert!(
-            state.used_tool,
-            "used_tool must be true after recovery"
-        );
+        assert!(state.used_tool, "used_tool must be true after recovery");
     }
 
     #[test]
@@ -1777,8 +1786,7 @@ mod tests {
     fn test_3379_negative_surrounding_prose() {
         // G5 guard: text not solely the call expression → text_delta
         let mut state = StreamingState::new();
-        let mut processor =
-            make_processor_with_tools(&mut state, vec!["Read"]);
+        let mut processor = make_processor_with_tools(&mut state, vec!["Read"]);
 
         let text = "Here is what I am doing: call:default_api:Read{\"file_path\":\"/tmp/foo.txt\"}";
         let part = GeminiPart {
@@ -1855,7 +1863,8 @@ mod tests {
     #[test]
     fn test_3379_parse_loose_json_standard() {
         // parse_loose_json_args: standard JSON passes Phase 1
-        let result = PartProcessor::parse_loose_json_args(r#"{"file_path":"/tmp/foo","limit":100}"#);
+        let result =
+            PartProcessor::parse_loose_json_args(r#"{"file_path":"/tmp/foo","limit":100}"#);
         assert!(result.is_some());
         let v = result.unwrap();
         assert_eq!(v["file_path"], "/tmp/foo");
@@ -1899,5 +1908,109 @@ mod tests {
         assert!(output.contains(r#""name":"Read""#));
         assert!(!output.contains("text_delta"));
         assert!(state.used_tool);
+    }
+
+    #[test]
+    fn signature_only_part_closes_the_open_thinking_block_with_its_signature() {
+        let mut state = StreamingState::new();
+        let thinking = GeminiPart {
+            text: Some("reasoning".to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: Some(true),
+            thought_signature: None,
+            function_response: None,
+        };
+        let signature = GeminiPart {
+            text: None,
+            function_call: None,
+
+            inline_data: None,
+            thought: None,
+            thought_signature: Some("opaque-signature".to_string()),
+            function_response: None,
+        };
+        let mut output = PartProcessor::new(&mut state).process(&thinking);
+        output.extend(PartProcessor::new(&mut state).process(&signature));
+        output.extend(state.end_block());
+        assert!(chunks_to_string(&output).contains(r#""signature":"opaque-signature""#));
+    }
+
+    #[test]
+    fn split_mcp_xml_preserves_prefix_and_generates_a_unique_tool_id() {
+        let mut state = StreamingState::new();
+        let first = GeminiPart {
+            text: Some("prefix <mc".to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let second = GeminiPart {
+            text: Some("p__server__read>{\"path\":\"a\"}</mcp__server__read>".to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let mut output = PartProcessor::new(&mut state).process(&first);
+        output.extend(PartProcessor::new(&mut state).process(&second));
+        let output = chunks_to_string(&output);
+        assert!(output.contains(r#""text":"prefix ""#));
+        assert!(output.contains(r#""name":"mcp__server__read""#));
+        assert!(!output.contains(r#""id":"mcp__server__read-xml""#));
+    }
+    #[test]
+    fn incomplete_mcp_xml_is_flushed_before_terminal_events() {
+        let mut state = StreamingState::new();
+        let part = GeminiPart {
+            text: Some("example <mcp__unfinished".to_string()),
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+            function_response: None,
+        };
+        let mut processor = PartProcessor::new(&mut state);
+        assert!(processor.process(&part).is_empty());
+        drop(processor);
+
+        state.record_terminal_metadata(Some("STOP"), None);
+        let output = state
+            .flush_incomplete_mcp_xml()
+            .into_iter()
+            .chain(state.emit_pending_finish())
+            .map(|chunk| String::from_utf8_lossy(&chunk).into_owned())
+            .collect::<String>();
+        let literal = output.find("example <mcp__unfinished").unwrap();
+        let stop = output.find("event: message_stop").unwrap();
+        assert!(literal < stop);
+        assert!(output.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+    }
+
+    #[test]
+    fn standalone_signature_is_cached_without_an_open_thinking_block() {
+        let session_id = format!("standalone-signature-cache-test-{}", uuid::Uuid::new_v4());
+        let signature_value =
+            "oK5rfpY7hRJ40CaDgYfN3/1WQEvGzPqL2deCVkX81bsXntMNKIyRaf40xyZD/HPo".to_string();
+        let mut state = StreamingState::new();
+        state.session_id = Some(session_id.clone());
+        state.model_name = Some("gemini-test".to_string());
+        let signature = GeminiPart {
+            text: None,
+            function_call: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: Some(signature_value.clone()),
+            function_response: None,
+        };
+
+        PartProcessor::new(&mut state).process(&signature);
+        assert_eq!(
+            SignatureCache::global().get_session_signature(&session_id),
+            Some(signature_value)
+        );
     }
 }

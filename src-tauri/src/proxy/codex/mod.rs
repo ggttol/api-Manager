@@ -308,6 +308,24 @@ impl CodexManager {
             id,
             unauthorized_token,
             require_enabled,
+            None,
+            |tokens| async move { auth::refresh(&client, &tokens).await },
+        )
+        .await
+    }
+
+    async fn verification_credentials(
+        &self,
+        id: &str,
+        unauthorized_token: Option<&str>,
+        policy_revision: u64,
+    ) -> Result<Record, CodexError> {
+        let client = self.client();
+        self.credentials_with(
+            id,
+            unauthorized_token,
+            false,
+            Some(policy_revision),
             |tokens| async move { auth::refresh(&client, &tokens).await },
         )
         .await
@@ -318,6 +336,7 @@ impl CodexManager {
         id: &str,
         unauthorized_token: Option<&str>,
         require_enabled: bool,
+        verification_policy: Option<u64>,
         refresh: F,
     ) -> Result<Record, CodexError>
     where
@@ -334,6 +353,8 @@ impl CodexManager {
             .ok_or_else(CodexError::not_found)?;
         let mut pending = lock.lock().await;
         let mut current = self.record(id, require_enabled).await?;
+        // Verification compares against the policy revision captured when the operation started,
+        // rather than any policy revision observed after OAuth refresh completes.
         if pending.is_none()
             && (current.tokens.needs_refresh()
                 || unauthorized_token.is_some_and(|token| token == current.tokens.access_token))
@@ -367,6 +388,9 @@ impl CodexManager {
             self.commit_accounts(&mut inner, accounts)?;
             *pending = None;
         }
+        if let Some(policy_version) = verification_policy {
+            current.policy_version = policy_version;
+        }
         // Recheck deletion/disable that may have happened while an OAuth request was in flight.
         if require_enabled {
             self.record(id, true).await?;
@@ -374,8 +398,13 @@ impl CodexManager {
         Ok(current)
     }
 
-    async fn authorized_get(&self, id: &str, url: &'static str) -> Result<Value, CodexError> {
-        let mut record = self.credentials(id, None, true).await?;
+    async fn authorized_get(
+        &self,
+        id: &str,
+        url: &'static str,
+        require_enabled: bool,
+    ) -> Result<Value, CodexError> {
+        let mut record = self.credentials(id, None, require_enabled).await?;
         let mut response =
             auth::authorized(&self.client(), reqwest::Method::GET, url, &record.tokens)
                 .timeout(Duration::from_secs(45))
@@ -386,7 +415,7 @@ impl CodexManager {
                 })?;
         if response.status() == StatusCode::UNAUTHORIZED {
             record = self
-                .credentials(id, Some(&record.tokens.access_token), true)
+                .credentials(id, Some(&record.tokens.access_token), require_enabled)
                 .await?;
             response = auth::authorized(&self.client(), reqwest::Method::GET, url, &record.tokens)
                 .timeout(Duration::from_secs(45))
@@ -437,7 +466,7 @@ impl CodexManager {
         });
         let account = if let Some(record) = existing {
             record.tokens = tokens.clone();
-            if verified && !record.verified {
+            if verified && !record.verified && record.policy_version == 0 {
                 record.account.enabled = true;
             }
             record.verified = verified;
@@ -498,6 +527,7 @@ impl CodexManager {
                 tokens,
                 verified,
                 quota_version: 0,
+                policy_version: 0,
             });
             account
         };
@@ -528,18 +558,19 @@ impl CodexManager {
                     (
                         record.account.id.clone(),
                         inner.refresh_locks[&record.account.id].clone(),
+                        record.policy_version,
                     )
                 })
         };
         let mut refresh_guard = match existing.as_ref() {
-            Some((_, lock)) => Some(lock.lock().await),
+            Some((_, lock, _)) => Some(lock.lock().await),
             None => None,
         };
-        let staged = {
+        let (staged, verification_policy) = {
             let mut inner = self.inner.lock().await;
             if existing
                 .as_ref()
-                .is_some_and(|(id, _)| !inner.refresh_locks.contains_key(id))
+                .is_some_and(|(id, _, _)| !inner.refresh_locks.contains_key(id))
             {
                 return Err(CodexError::new(
                     StatusCode::CONFLICT,
@@ -548,17 +579,36 @@ impl CodexManager {
             }
             // Save imported tokens disabled first. If a refresh rotates credentials, credentials()
             // durably saves the rotation before WHAM verification can use the new access token.
-            self.upsert_account(&mut inner, tokens, label, &Value::Null, false)?
+            let staged = self.upsert_account(&mut inner, tokens, label, &Value::Null, false)?;
+            let verification_policy = match &existing {
+                Some((_, _, policy)) => *policy,
+                None => {
+                    inner
+                        .accounts
+                        .accounts
+                        .iter()
+                        .find(|record| record.account.id == staged.id)
+                        .ok_or_else(CodexError::not_found)?
+                        .policy_version
+                }
+            };
+            (staged, verification_policy)
         };
         if let Some(guard) = refresh_guard.as_mut() {
             **guard = None;
         }
         drop(refresh_guard);
-        let mut record = self.credentials(&staged.id, None, false).await?;
+        let mut record = self
+            .verification_credentials(&staged.id, None, verification_policy)
+            .await?;
         let usage = match auth::verify(&self.client(), &record.tokens).await {
             Err(error) if error.status == StatusCode::UNAUTHORIZED => {
                 record = self
-                    .credentials(&staged.id, Some(&record.tokens.access_token), false)
+                    .verification_credentials(
+                        &staged.id,
+                        Some(&record.tokens.access_token),
+                        verification_policy,
+                    )
                     .await?;
                 auth::verify(&self.client(), &record.tokens).await
             }
@@ -591,7 +641,7 @@ impl CodexManager {
                 "Codex credentials changed during verification; refresh again",
             ));
         }
-        if !record.verified {
+        if !record.verified && record.policy_version == verified_record.policy_version {
             record.account.enabled = true;
         }
         record.verified = true;
@@ -770,6 +820,7 @@ async fn patch(
     }
     if let Some(enabled) = body.enabled {
         record.account.enabled = enabled;
+        record.policy_version += 1;
     }
     let result = record.account.clone();
     state.codex.commit_accounts(&mut inner, accounts)?;
@@ -836,7 +887,11 @@ async fn refresh(
     let before = state.codex.record(&id, false).await?;
     let record = state
         .codex
-        .credentials(&id, Some(&before.tokens.access_token), false)
+        .verification_credentials(
+            &id,
+            Some(&before.tokens.access_token),
+            before.policy_version,
+        )
         .await?;
     match auth::verify(&state.codex.client(), &record.tokens).await {
         Ok(usage) => Ok(Json(state.codex.mark_verified(&record, &usage).await?)),
@@ -851,12 +906,18 @@ async fn usage(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, CodexError> {
     Ok(Json(
-        state.codex.authorized_get(&id, auth::USAGE_URL).await?,
+        state
+            .codex
+            .authorized_get(&id, auth::USAGE_URL, false)
+            .await?,
     ))
 }
 async fn models(State(state): State<AppState>) -> Result<Json<Value>, CodexError> {
     let id = state.codex.preferred_account().await?;
-    let value = state.codex.authorized_get(&id, auth::MODELS_URL).await?;
+    let value = state
+        .codex
+        .authorized_get(&id, auth::MODELS_URL, true)
+        .await?;
     if !value.get("models").is_some_and(Value::is_array) {
         return Err(CodexError::upstream(
             "Codex returned an invalid model catalog",
@@ -1099,6 +1160,7 @@ mod tests {
             response.headers()["x-account-email"],
             fixture.first.as_str()
         );
+
         assert_eq!(
             fixture
                 .calls
@@ -1109,6 +1171,176 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first-workspace"]
         );
+    }
+    #[tokio::test]
+    async fn explicit_disable_wins_over_in_flight_verification_and_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let tokens = Tokens::from_auth_json(&json!({"tokens": {
+            "access_token":"access", "refresh_token":"refresh", "id_token":"identity",
+            "account_id":"workspace"
+        }}))
+        .unwrap();
+        let account = manager
+            .upsert_account(
+                &mut *manager.inner.lock().await,
+                tokens,
+                None,
+                &json!({}),
+                false,
+            )
+            .unwrap();
+        let verification = manager.record(&account.id, false).await.unwrap();
+        {
+            let mut inner = manager.inner.lock().await;
+            let mut accounts = inner.accounts.clone();
+            let record = accounts
+                .accounts
+                .iter_mut()
+                .find(|record| record.account.id == account.id)
+                .unwrap();
+            record.account.enabled = false;
+            record.policy_version += 1;
+            manager.commit_accounts(&mut inner, accounts).unwrap();
+        }
+        manager
+            .mark_verified(&verification, &json!({"plan_type":"plus"}))
+            .await
+            .unwrap();
+        let record = manager.record(&account.id, false).await.unwrap();
+        assert!(record.verified);
+        assert!(!record.account.enabled);
+        assert!(manager.preferred_account().await.is_err());
+        let reopened = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let record = reopened.record(&account.id, false).await.unwrap();
+        assert!(record.verified);
+        assert!(!record.account.enabled);
+        let tokens = Tokens::from_auth_json(&json!({"tokens": {
+            "access_token":"second-access", "refresh_token":"second-refresh", "id_token":"identity",
+            "account_id":"second-workspace"
+        }}))
+        .unwrap();
+        let account = manager
+            .upsert_account(
+                &mut *manager.inner.lock().await,
+                tokens,
+                None,
+                &json!({}),
+                false,
+            )
+            .unwrap();
+        let verification = manager.record(&account.id, false).await.unwrap();
+        manager
+            .mark_verified(&verification, &json!({"plan_type":"plus"}))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .record(&account.id, true)
+                .await
+                .unwrap()
+                .account
+                .enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_keeps_its_original_policy_revision_across_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(CodexManager::new(temp.path().to_path_buf(), None).unwrap());
+        let tokens = Tokens::from_auth_json(&json!({"tokens": {
+            "access_token":"access", "refresh_token":"refresh", "id_token":"identity",
+            "account_id":"workspace"
+        }}))
+        .unwrap();
+        let account = manager
+            .upsert_account(
+                &mut *manager.inner.lock().await,
+                tokens,
+                None,
+                &json!({}),
+                false,
+            )
+            .unwrap();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let manager = manager.clone();
+            let id = account.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .credentials_with(
+                        &id,
+                        Some("access"),
+                        false,
+                        Some(0),
+                        |mut tokens| async move {
+                            started.send(()).unwrap();
+                            resume_rx.await.unwrap();
+                            tokens.access_token = "rotated".into();
+                            Ok(tokens)
+                        },
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        started_rx.await.unwrap();
+        {
+            let mut inner = manager.inner.lock().await;
+            let mut accounts = inner.accounts.clone();
+            let record = accounts
+                .accounts
+                .iter_mut()
+                .find(|record| record.account.id == account.id)
+                .unwrap();
+            record.account.enabled = false;
+            record.policy_version += 1;
+            manager.commit_accounts(&mut inner, accounts).unwrap();
+        }
+        resume.send(()).unwrap();
+        let verification = task.await.unwrap();
+        manager
+            .mark_verified(&verification, &json!({"plan_type":"plus"}))
+            .await
+            .unwrap();
+        let record = manager.record(&account.id, false).await.unwrap();
+        assert!(record.verified);
+        assert!(!record.account.enabled);
+    }
+
+    #[tokio::test]
+    async fn disabled_account_credentials_are_available_for_administrative_usage_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let tokens = Tokens::from_auth_json(&json!({"tokens": {
+            "access_token":"access", "refresh_token":"refresh", "id_token":"identity",
+            "account_id":"workspace"
+        }}))
+        .unwrap();
+        let account = manager
+            .upsert_account(
+                &mut *manager.inner.lock().await,
+                tokens,
+                None,
+                &json!({}),
+                true,
+            )
+            .unwrap();
+        {
+            let mut inner = manager.inner.lock().await;
+            let mut accounts = inner.accounts.clone();
+            let record = accounts
+                .accounts
+                .iter_mut()
+                .find(|record| record.account.id == account.id)
+                .unwrap();
+            record.account.enabled = false;
+            manager.commit_accounts(&mut inner, accounts).unwrap();
+        }
+        assert!(manager.credentials(&account.id, None, false).await.is_ok());
+        assert!(manager.credentials(&account.id, None, true).await.is_err());
+        assert!(manager.preferred_account().await.is_err());
     }
 
     #[tokio::test]
@@ -1164,14 +1396,20 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 start.wait().await;
                 let record = manager
-                    .credentials_with(&id, Some("old-access"), true, |mut tokens| async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::task::yield_now().await;
-                        tokens.access_token = "rotated-access".into();
-                        tokens.refresh_token = "rotated-refresh".into();
-                        tokens.refreshed_at = now();
-                        Ok(tokens)
-                    })
+                    .credentials_with(
+                        &id,
+                        Some("old-access"),
+                        true,
+                        None,
+                        |mut tokens| async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            tokens.access_token = "rotated-access".into();
+                            tokens.refresh_token = "rotated-refresh".into();
+                            tokens.refreshed_at = now();
+                            Ok(tokens)
+                        },
+                    )
                     .await
                     .unwrap();
                 record.tokens.refresh_token

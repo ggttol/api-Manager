@@ -1,5 +1,7 @@
 // Middleware 模块 - Axum 中间件
 
+pub(crate) mod client_ip;
+
 pub mod auth;
 pub mod cors;
 pub mod ip_filter;

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Save, User, RefreshCw, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -19,12 +19,15 @@ import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 import { PageHeader } from '../components/common/ConsolePage';
 
 
+const formatArguments = (args?: string[] | null) => (args ?? []).map(arg => JSON.stringify(arg)).join(' ');
+
+
 function Settings() {
     const { t, i18n } = useTranslation();
-    const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
+    const { config, loading, error: configError, loadConfig, saveConfig, updateConfig } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug'>('general');
-    const [formData, setFormData] = useState<AppConfig>({
+    const [formData, setFormDataState] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
         auto_refresh: false,
@@ -80,6 +83,75 @@ function Settings() {
         hidden_menu_items: [],  // 菜单显示设置：默认不隐藏任何菜单项
 
     });
+    const [hydrated, setHydrated] = useState(false);
+    const [rawAntigravityArgs, setRawAntigravityArgs] = useState('');
+    const dirtyRef = useRef(false);
+    const draftBaselineRef = useRef<AppConfig | null>(null);
+
+    const mergeDirtyFields = (latest: AppConfig, draft: AppConfig, baseline: AppConfig): AppConfig => {
+        const merge = (current: unknown, candidate: unknown, original: unknown): unknown => {
+            if (Object.is(candidate, original)) return current;
+            if (Array.isArray(candidate) || candidate === null || typeof candidate !== 'object') return candidate;
+            if (current === null || typeof current !== 'object' || Array.isArray(current)
+                || original === null || typeof original !== 'object' || Array.isArray(original)) return candidate;
+            const result: Record<string, unknown> = { ...(current as Record<string, unknown>) };
+            for (const key of Object.keys(candidate as Record<string, unknown>)) {
+                result[key] = merge(
+                    (current as Record<string, unknown>)[key],
+                    (candidate as Record<string, unknown>)[key],
+                    (original as Record<string, unknown>)[key],
+                );
+            }
+            return result;
+        };
+        return merge(latest, draft, baseline) as AppConfig;
+    };
+
+    const updateDraft = (update: AppConfig | ((current: AppConfig) => AppConfig)) => {
+        if (!hydrated) return;
+        dirtyRef.current = true;
+        setFormDataState(current => typeof update === 'function' ? update(current) : update);
+    };
+
+    const setFormData = updateDraft;
+
+
+    const parseArguments = (input: string): string[] => {
+        const args: string[] = [];
+        let index = 0;
+        while (index < input.length) {
+            while (/\s/.test(input[index] ?? '')) index += 1;
+            if (index >= input.length) break;
+            if (input[index] === '"') {
+                let end = index + 1;
+                let escaped = false;
+                while (end < input.length) {
+                    const character = input[end++];
+                    if (!escaped && character === '"') break;
+                    escaped = !escaped && character === '\\';
+                    if (character !== '\\') escaped = false;
+                }
+                const quoted = input.slice(index, end);
+                try {
+                    args.push(JSON.parse(quoted));
+                    index = end;
+                    continue;
+                } catch {
+                    // Treat malformed quoted input as a single literal token.
+                }
+            }
+            const start = index;
+            while (index < input.length && !/\s/.test(input[index])) index += 1;
+            args.push(input.slice(start, index));
+        }
+        return args;
+    };
+
+    const commitArguments = () => {
+        if (!hydrated) return;
+        const args = parseArguments(rawAntigravityArgs);
+        updateDraft(current => ({ ...current, antigravity_args: args }));
+    };
 
     // Dialog state
     // Dialog state
@@ -94,47 +166,51 @@ function Settings() {
 
     useEffect(() => {
         loadConfig();
-
-        // 获取真实数据目录路径
         invoke<string>('get_data_dir_path')
             .then(path => setDataDirPath(path))
             .catch(err => console.error('Failed to get data dir:', err));
-
         if (isTauri()) {
             invoke<boolean>('is_auto_launch_enabled')
-                .then(enabled => {
-                    setFormData(prev => ({ ...prev, auto_launch: enabled }));
-                })
+                .then(enabled => setFormDataState(prev => ({ ...prev, auto_launch: enabled })))
                 .catch(err => console.error('Failed to get auto launch status:', err));
         }
-
     }, [loadConfig]);
 
     useEffect(() => {
-        if (config) {
-            setFormData(config);
+        if (!config) return;
+        if (!hydrated) {
+            draftBaselineRef.current = config;
+            setFormDataState(config);
+            setRawAntigravityArgs(formatArguments(config.antigravity_args));
+            setHydrated(true);
+            return;
         }
-    }, [config]);
-
-    // 删除自动启用调试控制台的逻辑 - 改为用户手动控制
+        if (dirtyRef.current && draftBaselineRef.current) {
+            setFormDataState(current => mergeDirtyFields(config, current, draftBaselineRef.current!));
+        } else {
+            draftBaselineRef.current = config;
+            setFormDataState(config);
+            setRawAntigravityArgs(formatArguments(config.antigravity_args));
+        }
+    }, [config, hydrated]);
 
     const handleSave = async () => {
+        if (!hydrated || !draftBaselineRef.current) return;
+        const draft = { ...formData, antigravity_args: parseArguments(rawAntigravityArgs) };
+        const savedFormData = mergeDirtyFields(config ?? formData, draft, draftBaselineRef.current);
+        const proxyEnabled = savedFormData.proxy?.upstream_proxy?.enabled;
+        const proxyUrl = savedFormData.proxy?.upstream_proxy?.url?.trim();
+        if (proxyEnabled && !proxyUrl) {
+            showToast(t('proxy.config.upstream_proxy.validation_error'), 'error');
+            return;
+        }
         try {
-            // 校验：如果启用了上游代理但没有填写地址，给出提示
-            const proxyEnabled = formData.proxy?.upstream_proxy?.enabled;
-            const proxyUrl = formData.proxy?.upstream_proxy?.url?.trim();
-            if (proxyEnabled && !proxyUrl) {
-                showToast(t('proxy.config.upstream_proxy.validation_error'), 'error');
-                return;
-            }
-
-            await saveConfig(formData);
+            await updateConfig(latest => mergeDirtyFields(latest, draft, draftBaselineRef.current!));
+            dirtyRef.current = false;
+            draftBaselineRef.current = savedFormData;
+            setFormDataState(savedFormData);
             showToast(t('common.saved'), 'success');
-
-            // 如果修改了代理配置，提示用户需要重启
-            if (proxyEnabled && proxyUrl) {
-                showToast(t('proxy.config.upstream_proxy.restart_hint'), 'info');
-            }
+            if (proxyEnabled && proxyUrl) showToast(t('proxy.config.upstream_proxy.restart_hint'), 'info');
         } catch (error) {
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
@@ -308,10 +384,16 @@ function Settings() {
         <div className="console-page console-page-scroll h-full">
             <div className="space-y-5">
                 <PageHeader
+                    actions={<button type="button" className="console-button console-button-primary" onClick={handleSave} disabled={!hydrated || loading}><Save size={16} />{t('settings.save')}</button>}
                     title={t('nav.settings')}
                     description={t('console.settings_description', { defaultValue: i18n.language.startsWith('zh') ? '管理控制台偏好、账号策略与服务设置。' : 'Manage console preferences, account policies, and service settings.' })}
-                    actions={<button type="button" className="console-button console-button-primary" onClick={handleSave}><Save size={16} />{t('settings.save')}</button>}
                 />
+                {configError && (
+                    <div role="alert" className="console-panel text-error flex items-center justify-between gap-3">
+                        <span>{configError}</span>
+                        <button type="button" className="console-button" onClick={loadConfig}>{t('common.refresh')}</button>
+                    </div>
+                )}
                 <nav className="console-tabs flex flex-wrap gap-1" aria-label={t('nav.settings')}>
                     {(['general', 'account', 'proxy', 'advanced', 'debug'] as const).map(tab => (
                         <button
@@ -337,14 +419,15 @@ function Settings() {
                             <div>
                                 <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.language')}</label>
                                 <select
-                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
                                     value={formData.language}
                                     onChange={(e) => {
+                                        if (!hydrated) return;
                                         const newLang = e.target.value;
-                                        setFormData({ ...formData, language: newLang });
+                                        updateDraft(current => ({ ...current, language: newLang }));
                                         i18n.changeLanguage(newLang);
-                                        updateLanguage(newLang);
+                                        updateConfig(current => ({ ...current, language: newLang }), true).catch(error => showToast(`${t('common.error')}: ${error}`, 'error'));
                                     }}
+                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
                                 >
                                     <option value="zh">简体中文</option>
                                     <option value="zh-TW">繁體中文</option>
@@ -363,13 +446,14 @@ function Settings() {
                             <div>
                                 <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-2">{t('settings.general.theme')}</label>
                                 <select
-                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
                                     value={formData.theme}
                                     onChange={(e) => {
+                                        if (!hydrated) return;
                                         const newTheme = e.target.value;
-                                        setFormData({ ...formData, theme: newTheme });
-                                        updateTheme(newTheme);
+                                        updateDraft(current => ({ ...current, theme: newTheme }));
+                                        updateConfig(current => ({ ...current, theme: newTheme }), true).catch(error => showToast(`${t('common.error')}: ${error}`, 'error'));
                                     }}
+                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
                                 >
                                     <option value="light">{t('settings.general.theme_light')}</option>
                                     <option value="dark">{t('settings.general.theme_dark')}</option>
@@ -868,19 +952,21 @@ function Settings() {
                                         <input
                                             type="text"
                                             className="min-w-0 flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
-                                            value={formData.antigravity_args ? formData.antigravity_args.join(' ') : ''}
-                                            placeholder={t('settings.advanced.antigravity_args_placeholder')}
+                                            value={rawAntigravityArgs}
                                             onChange={(e) => {
-                                                const args = e.target.value.trim() === '' ? [] : e.target.value.split(' ').map(arg => arg.trim()).filter(arg => arg !== '');
-                                                setFormData({ ...formData, antigravity_args: args });
+                                                if (!hydrated) return;
+                                                setRawAntigravityArgs(e.target.value);
+                                                dirtyRef.current = true;
                                             }}
+                                            onBlur={commitArguments}
                                         />
                                         <button
                                             className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"
                                             onClick={async () => {
                                                 try {
                                                     const args = await invoke<string[]>('get_antigravity_args');
-                                                    setFormData({ ...formData, antigravity_args: args });
+                                                    setRawAntigravityArgs(formatArguments(args));
+                                                    updateDraft(current => ({ ...current, antigravity_args: args }));
                                                     showToast(t('settings.advanced.antigravity_args_detected'), 'success');
                                                 } catch (error) {
                                                     showToast(`${t('settings.advanced.antigravity_args_detect_error')}: ${error}`, 'error');
@@ -1069,31 +1155,58 @@ function Settings() {
                                     proxies: [],
                                     health_check_interval: 300,
                                     auto_failover: true,
-                                    strategy: 'priority'
+                                    strategy: 'priority',
                                 }}
-                                onChange={(newConfig, silent = false) => {
-                                    const updatedFormData = {
-                                        ...formData,
-                                        proxy: {
-                                            ...formData.proxy,
-                                            proxy_pool: newConfig
-                                        }
+                                onChange={async (newConfig, silent = false) => {
+                                    const applyPool = (current: AppConfig) => {
+                                        const currentPool = current.proxy.proxy_pool;
+                                        const proxyPool = silent && currentPool
+                                            ? {
+                                                ...currentPool,
+                                                proxies: currentPool.proxies.map(proxy => {
+                                                    const health = newConfig.proxies.find(candidate => candidate.id === proxy.id);
+                                                    return health ? { ...proxy, is_healthy: health.is_healthy, latency: health.latency, last_check_time: health.last_check_time } : proxy;
+                                                }),
+                                            }
+                                            : newConfig;
+                                        return { ...current, proxy: { ...current.proxy, proxy_pool: proxyPool } };
                                     };
-                                    setFormData(updatedFormData);
-
-                                    // [FIX] Silent updates (like health polling) should NOT trigger saveConfig
-                                    // to prevent race conditions where old memory state rolls back new manual changes
-                                    if (silent) {
-                                        console.log('Proxy status sync (silent)');
-                                        return;
-                                    }
-
-                                    // Hot reload: save immediately for manual changes
-                                    saveConfig({ ...updatedFormData, auto_refresh: true })
-                                        .then(() => {
-                                            console.log('Proxy config saved');
-                                        })
-                                        .catch(err => console.error('Save failed:', err));
+                                    updateDraft(applyPool);
+                                    if (!silent) await updateConfig(applyPool);
+                                }}
+                                onBindingsChange={async (accountBindings) => {
+                                    setFormData(current => ({
+                                        ...current,
+                                        proxy: {
+                                            ...current.proxy,
+                                            proxy_pool: {
+                                                ...(current.proxy.proxy_pool || {
+                                                    enabled: false,
+                                                    proxies: [],
+                                                    health_check_interval: 300,
+                                                    auto_failover: true,
+                                                    strategy: 'priority' as const,
+                                                }),
+                                                account_bindings: accountBindings,
+                                            },
+                                        },
+                                    }));
+                                    await updateConfig(current => ({
+                                        ...current,
+                                        proxy: {
+                                            ...current.proxy,
+                                            proxy_pool: {
+                                                ...(current.proxy.proxy_pool || {
+                                                    enabled: false,
+                                                    proxies: [],
+                                                    health_check_interval: 300,
+                                                    auto_failover: true,
+                                                    strategy: 'priority' as const,
+                                                }),
+                                                account_bindings: accountBindings,
+                                            },
+                                        },
+                                    }), true);
                                 }}
                             />
 

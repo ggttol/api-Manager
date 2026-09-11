@@ -1209,6 +1209,8 @@ mod tests {
             messages: vec![],
             system: None,
             tools: None,
+            tool_choice: None,
+            stop_sequences: None,
             stream: false,
             max_tokens: None,
             temperature: None,
@@ -1343,7 +1345,10 @@ mod tests {
                 role: "assistant".into(),
                 refusal: None,
                 content: Some(OpenAIContent::String("read file".into())),
-                reasoning_content: Some("a very very long chain of reasoning thoughts that exceeds 10 characters".into()),
+                reasoning_content: Some(
+                    "a very very long chain of reasoning thoughts that exceeds 10 characters"
+                        .into(),
+                ),
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
                     r#type: "function".into(),
@@ -1370,7 +1375,8 @@ mod tests {
         ];
 
         // protected_last_n = 1 (protects the last user message, leaves index 0 eligible)
-        let modified = ContextManager::compress_openai_thinking_preserve_signature(&mut messages, 1);
+        let modified =
+            ContextManager::compress_openai_thinking_preserve_signature(&mut messages, 1);
         assert!(modified);
         assert_eq!(messages[0].reasoning_content.as_deref(), Some("..."));
         assert!(messages[0].tool_calls.is_some());

@@ -5,7 +5,7 @@
 // 用户令牌存储，部分接口留作后续扩展
 
 use chrono::{FixedOffset, Local, Timelike, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -62,10 +62,12 @@ pub fn get_db_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// 连接数据库
+/// Connect to the token database with declared foreign-key invariants enabled.
 pub fn connect_db() -> Result<Connection, String> {
     let path = get_db_path()?;
     let conn = Connection::open(&path).map_err(|e| format!("Failed to open database: {}", e))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+        .map_err(|e| format!("Failed to configure database connection: {}", e))?;
     Ok(conn)
 }
 
@@ -182,6 +184,37 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
+fn expiry_for_type(
+    expires_type: &str,
+    custom_expires_at: Option<i64>,
+) -> Result<Option<i64>, String> {
+    let now = Utc::now();
+    match expires_type {
+        "day" => Ok(Some(
+            now.checked_add_signed(chrono::Duration::days(1))
+                .ok_or("Token expiry overflow")?
+                .timestamp(),
+        )),
+        "week" => Ok(Some(
+            now.checked_add_signed(chrono::Duration::weeks(1))
+                .ok_or("Token expiry overflow")?
+                .timestamp(),
+        )),
+        "month" => Ok(Some(
+            now.checked_add_signed(chrono::Duration::days(30))
+                .ok_or("Token expiry overflow")?
+                .timestamp(),
+        )),
+        "never" => Ok(None),
+        "custom" => match custom_expires_at {
+            Some(expires_at) if expires_at > now.timestamp() => Ok(Some(expires_at)),
+            Some(_) => Err("Custom token expiry must be in the future".to_string()),
+            None => Err("Custom token expiry is required".to_string()),
+        },
+        _ => Err("Unsupported token expiry type".to_string()),
+    }
+}
+
 /// 创建新令牌
 pub fn create_token(
     username: String,
@@ -197,28 +230,7 @@ pub fn create_token(
     let token = format!("sk-{}", Uuid::new_v4().to_string().replace("-", ""));
     let now = Utc::now().timestamp();
 
-    let expires_at = match expires_type.as_str() {
-        "day" => Some(
-            Utc::now()
-                .checked_add_signed(chrono::Duration::days(1))
-                .unwrap()
-                .timestamp(),
-        ),
-        "week" => Some(
-            Utc::now()
-                .checked_add_signed(chrono::Duration::weeks(1))
-                .unwrap()
-                .timestamp(),
-        ),
-        "month" => Some(
-            Utc::now()
-                .checked_add_signed(chrono::Duration::days(30))
-                .unwrap()
-                .timestamp(),
-        ),
-        "custom" => custom_expires_at, // 使用自定义时间戳
-        _ => None,                     // "never" or other
-    };
+    let expires_at = expiry_for_type(&expires_type, custom_expires_at)?;
 
     let user_token = UserToken {
         id: id.clone(),
@@ -320,7 +332,6 @@ pub fn get_today_request_count() -> Result<i64, String> {
     .map_err(|e| format!("Failed to query today's token requests: {}", e))
 }
 
-
 /// 获取单个令牌信息
 pub fn get_token_by_id(id: &str) -> Result<Option<UserToken>, String> {
     let conn = connect_db()?;
@@ -398,6 +409,28 @@ pub fn update_token(
     curfew_end: Option<Option<String>>,
 ) -> Result<(), String> {
     let conn = connect_db()?;
+    update_token_with_connection(
+        &conn,
+        id,
+        username,
+        description,
+        enabled,
+        max_ips,
+        curfew_start,
+        curfew_end,
+    )
+}
+
+fn update_token_with_connection(
+    conn: &Connection,
+    id: &str,
+    username: Option<String>,
+    description: Option<String>,
+    enabled: Option<bool>,
+    max_ips: Option<i32>,
+    curfew_start: Option<Option<String>>,
+    curfew_end: Option<Option<String>>,
+) -> Result<(), String> {
     let now = Utc::now().timestamp();
 
     let mut query = "UPDATE user_tokens SET updated_at = ?1".to_string();
@@ -452,46 +485,43 @@ pub fn update_token(
     Ok(())
 }
 
-/// 续期令牌
+/// Delete a token and all data that depends on it.
+///
+/// The foreign-key constraints declared by `init_db` cascade bindings and usage
+/// logs; using an immediate transaction keeps the parent removal and those
+/// cascades indivisible from concurrent admission/accounting work.
+pub fn delete_token(id: &str) -> Result<(), String> {
+    let mut conn = connect_db()?;
+    delete_token_with_connection(&mut conn, id)
+}
+
+fn delete_token_with_connection(conn: &mut Connection, id: &str) -> Result<(), String> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("Failed to begin token deletion transaction: {}", e))?;
+    let deleted = tx
+        .execute("DELETE FROM user_tokens WHERE id = ?1", params![id])
+        .map_err(|e| format!("Failed to delete user token: {}", e))?;
+    if deleted == 0 {
+        return Err("User token not found".to_string());
+    }
+    tx.commit()
+        .map_err(|e| format!("Failed to commit token deletion: {}", e))
+}
+
+/// Renew a token using an explicit supported duration. Custom expirations must be
+/// created with a supplied finite timestamp and cannot be inferred at renewal time.
 pub fn renew_token(id: &str, expires_type: &str) -> Result<(), String> {
     let conn = connect_db()?;
     let now = Utc::now().timestamp();
-
-    let expires_at = match expires_type {
-        "day" => Some(
-            Utc::now()
-                .checked_add_signed(chrono::Duration::days(1))
-                .unwrap()
-                .timestamp(),
-        ),
-        "week" => Some(
-            Utc::now()
-                .checked_add_signed(chrono::Duration::weeks(1))
-                .unwrap()
-                .timestamp(),
-        ),
-        "month" => Some(
-            Utc::now()
-                .checked_add_signed(chrono::Duration::days(30))
-                .unwrap()
-                .timestamp(),
-        ),
-        _ => None, // "never" or other
-    };
+    let expires_at = expiry_for_type(expires_type, None)?;
 
     conn.execute(
         "UPDATE user_tokens SET expires_type = ?1, expires_at = ?2, updated_at = ?3, enabled = 1 WHERE id = ?4",
         params![expires_type, expires_at, now, id],
-    ).map_err(|e| format!("Failed to renew token: {}", e))?;
+    )
+    .map_err(|e| format!("Failed to renew token: {}", e))?;
 
-    Ok(())
-}
-
-/// 删除令牌
-pub fn delete_token(id: &str) -> Result<(), String> {
-    let conn = connect_db()?;
-    conn.execute("DELETE FROM user_tokens WHERE id = ?1", params![id])
-        .map_err(|e| format!("Failed to delete token: {}", e))?;
     Ok(())
 }
 
@@ -604,87 +634,135 @@ pub fn record_token_usage_and_ip(
     Ok(())
 }
 
-/// 检查 Token 是否有效 (包含过期时间检查和 IP 限制检查)
-/// 返回: (是否有效, 拒绝原因)
+/// Check token admission and atomically reserve a limited token's IP slot.
+///
+/// Reservations deliberately have `request_count = 0`; request/accounting metrics
+/// are updated only after the response by `record_token_usage_and_ip`.
 pub fn validate_token(token_str: &str, ip: &str) -> Result<(bool, Option<String>), String> {
-    let token_opt = get_token_by_value(token_str)?;
+    let mut conn = connect_db()?;
+    validate_token_with_connection(&mut conn, token_str, ip)
+}
 
-    if let Some(token) = token_opt {
-        // 1. 检查过期时间
-        if token.expires_type != "never" {
-            if let Some(expires_at) = token.expires_at {
-                if expires_at < Utc::now().timestamp() {
-                    return Ok((
-                        false,
-                        Some(
-                            "Your token has expired. Please contact the administrator to renew it."
-                                .to_string(),
-                        ),
-                    ));
-                }
-            }
-        }
+fn validate_token_with_connection(
+    conn: &mut Connection,
+    token_str: &str,
+    ip: &str,
+) -> Result<(bool, Option<String>), String> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("Failed to begin token admission transaction: {}", e))?;
+    let token = tx
+        .query_row(
+            "SELECT id, enabled, expires_type, expires_at, max_ips, curfew_start, curfew_end
+             FROM user_tokens WHERE token = ?1",
+            params![token_str],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i32>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to query token for admission: {}", e))?;
 
-        // 2. 检查 IP 限制
-        if token.max_ips > 0 {
-            let conn = connect_db()?;
-
-            // 检查当前 IP 是否已绑定
-            let is_bound: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM token_ip_bindings WHERE token_id = ?1 AND ip_address = ?2)",
-                params![token.id, ip],
-                |row| row.get(0)
-            ).unwrap_or(false);
-
-            if !is_bound {
-                // 如果未绑定，检查是否达到上限
-                let current_ip_count: i32 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM token_ip_bindings WHERE token_id = ?1",
-                        params![token.id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                if current_ip_count >= token.max_ips {
-                    return Ok((false, Some(format!("IP limit reached ({}/{}). Please contact the administrator to increase the limit.", current_ip_count, token.max_ips))));
-                }
-            }
-        }
-
-        // 3. 检查宵禁时间 (Curfew)
-        // 逻辑：如果当前北京时间在 start 和 end 之间，则拒绝
-        // 格式：HH:MM
-        // 使用固定 UTC+8 (北京时间)，不依赖服务器本地时区
-        if let (Some(start_str), Some(end_str)) = (&token.curfew_start, &token.curfew_end) {
-            if !start_str.is_empty() && !end_str.is_empty() {
-                let beijing_offset = FixedOffset::east_opt(8 * 3600).unwrap();
-                let now_beijing = Utc::now().with_timezone(&beijing_offset);
-                let current_time_str =
-                    format!("{:02}:{:02}", now_beijing.hour(), now_beijing.minute());
-
-                // 跨午夜处理: start > end (e.g. 23:00 to 06:00)
-                // 正常: start < end (e.g. 09:00 to 18:00)
-                let is_curfew = if start_str > end_str {
-                    current_time_str >= *start_str || current_time_str < *end_str
-                } else {
-                    current_time_str >= *start_str && current_time_str < *end_str
-                };
-
-                if is_curfew {
-                    return Ok((false, Some(format!("Service is not available between {} and {} Beijing Time (Curfew enabled). Current Beijing time: {}", start_str, end_str, current_time_str))));
-                }
-            }
-        }
-
-        // 一切正常，Token 有效
-        Ok((true, None))
-    } else {
-        Ok((
+    let Some((token_id, enabled, expires_type, expires_at, max_ips, curfew_start, curfew_end)) =
+        token
+    else {
+        return Ok((
             false,
             Some("Invalid token. Please check your API key.".to_string()),
-        ))
+        ));
+    };
+
+    if !enabled {
+        return Ok((
+            false,
+            Some("This token has been disabled. Please contact the administrator.".to_string()),
+        ));
     }
+
+    if expires_type != "never"
+        && expires_at.is_some_and(|expires_at| expires_at < Utc::now().timestamp())
+    {
+        return Ok((
+            false,
+            Some(
+                "Your token has expired. Please contact the administrator to renew it.".to_string(),
+            ),
+        ));
+    }
+
+    if let (Some(start_str), Some(end_str)) = (&curfew_start, &curfew_end) {
+        if !start_str.is_empty() && !end_str.is_empty() {
+            let beijing_offset = FixedOffset::east_opt(8 * 3600).expect("UTC+8 is valid");
+            let now_beijing = Utc::now().with_timezone(&beijing_offset);
+            let current_time_str = format!("{:02}:{:02}", now_beijing.hour(), now_beijing.minute());
+            let is_curfew = if start_str > end_str {
+                current_time_str >= *start_str || current_time_str < *end_str
+            } else {
+                current_time_str >= *start_str && current_time_str < *end_str
+            };
+            if is_curfew {
+                return Ok((
+                    false,
+                    Some(format!(
+                        "Service is not available between {} and {} Beijing Time (Curfew enabled). Current Beijing time: {}",
+                        start_str, end_str, current_time_str
+                    )),
+                ));
+            }
+        }
+    }
+
+    if max_ips > 0 {
+        let is_bound: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM token_ip_bindings WHERE token_id = ?1 AND ip_address = ?2)",
+                params![token_id, ip],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to query token IP binding: {}", e))?;
+        if !is_bound {
+            let current_ip_count: i32 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM token_ip_bindings WHERE token_id = ?1",
+                    params![token_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to count token IP bindings: {}", e))?;
+            if current_ip_count >= max_ips {
+                return Ok((
+                    false,
+                    Some(format!(
+                        "IP limit reached ({}/{}). Please contact the administrator to increase the limit.",
+                        current_ip_count, max_ips
+                    )),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO token_ip_bindings (
+                    id, token_id, ip_address, first_seen_at, last_seen_at, request_count, user_agent
+                ) VALUES (?1, ?2, ?3, ?4, ?4, 0, NULL)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    token_id,
+                    ip,
+                    Utc::now().timestamp()
+                ],
+            )
+            .map_err(|e| format!("Failed to reserve token IP binding: {}", e))?;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit token admission: {}", e))?;
+    Ok((true, None))
 }
 
 /// 获取 IP 关联的用户名 (用于 IP 管理页面)
@@ -712,53 +790,174 @@ pub fn get_username_for_ip(ip: &str) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_create_and_query_token() {
-        let _ = init_db(); // Ensure DB is initialized
+    fn test_connection() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE user_tokens (
+                id TEXT PRIMARY KEY, token TEXT UNIQUE NOT NULL, username TEXT NOT NULL,
+                description TEXT, enabled BOOLEAN NOT NULL, expires_type TEXT NOT NULL,
+                expires_at INTEGER, max_ips INTEGER NOT NULL, curfew_start TEXT, curfew_end TEXT,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER,
+                total_requests INTEGER NOT NULL DEFAULT 0, total_tokens_used INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE token_ip_bindings (
+                id TEXT PRIMARY KEY, token_id TEXT NOT NULL, ip_address TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0, user_agent TEXT,
+                FOREIGN KEY(token_id) REFERENCES user_tokens(id) ON DELETE CASCADE,
+                UNIQUE(token_id, ip_address)
+             );
+             CREATE TABLE token_usage_logs (
+                id TEXT PRIMARY KEY, token_id TEXT NOT NULL, ip_address TEXT,
+                model TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                request_time INTEGER NOT NULL, status INTEGER,
+                FOREIGN KEY(token_id) REFERENCES user_tokens(id) ON DELETE CASCADE
+             );",
+        )
+        .expect("test schema");
+        conn
+    }
 
-        // Use a random username to avoid collisions in existing DB runs during dev
-        let username = format!("TestUser_{}", Uuid::new_v4());
-        let token_res = create_token(
-            username.clone(),
-            "day".to_string(),
-            Some("Test token".to_string()),
-            0,
-            None,
-            None,
-            None,
-        );
-        assert!(token_res.is_ok());
-
-        let token = token_res.unwrap();
-        assert_eq!(token.username, username);
-        assert!(token.token.starts_with("sk-"));
-
-        let fetched = get_token_by_id(&token.id);
-        assert!(fetched.is_ok());
-        assert_eq!(fetched.unwrap().unwrap().username, username);
+    fn insert_token(conn: &Connection, id: &str, token: &str, enabled: bool, max_ips: i32) {
+        conn.execute(
+            "INSERT INTO user_tokens (
+                id, token, username, enabled, expires_type, expires_at, max_ips,
+                curfew_start, curfew_end, created_at, updated_at, total_requests, total_tokens_used
+             ) VALUES (?1, ?2, 'test', ?3, 'never', NULL, ?4, NULL, NULL, 0, 0, 0, 0)",
+            params![id, token, enabled, max_ips],
+        )
+        .expect("insert token");
     }
 
     #[test]
-    fn test_never_expire_token_validation() {
-        let _ = init_db();
-        let username = format!("NeverExpireUser_{}", Uuid::new_v4());
-        let token_res = create_token(
-            username.clone(),
-            "never".to_string(),
-            Some("Never expire test token".to_string()),
-            0,
-            None,
-            None,
-            None,
-        );
-        assert!(token_res.is_ok());
-        let token = token_res.unwrap();
+    fn disabled_token_is_rejected_before_admission() {
+        let mut conn = test_connection();
+        insert_token(&conn, "disabled", "sk-disabled", false, 1);
+
         let (valid, reason) =
-            validate_token(&token.token, "127.0.0.1").expect("validation must succeed");
+            validate_token_with_connection(&mut conn, "sk-disabled", "198.51.100.1")
+                .expect("admission query");
+
+        assert!(!valid);
+        assert!(reason.expect("rejection reason").contains("disabled"));
+        let reservations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_ip_bindings", [], |row| {
+                row.get(0)
+            })
+            .expect("reservation count");
+        assert_eq!(reservations, 0);
+    }
+
+    #[test]
+    fn admission_reserves_limited_ip_without_counting_a_response() {
+        let mut conn = test_connection();
+        insert_token(&conn, "limited", "sk-limited", true, 1);
+
         assert!(
-            valid,
-            "Token with expires_type never must be valid, reason: {:?}",
-            reason
+            validate_token_with_connection(&mut conn, "sk-limited", "198.51.100.1")
+                .expect("first admission")
+                .0
         );
+        let second = validate_token_with_connection(&mut conn, "sk-limited", "198.51.100.2")
+            .expect("second admission");
+
+        assert!(!second.0);
+        let (reservations, request_count, total_requests): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM token_ip_bindings),
+                    (SELECT request_count FROM token_ip_bindings WHERE ip_address = '198.51.100.1'),
+                    (SELECT total_requests FROM user_tokens WHERE id = 'limited')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("admission state");
+        assert_eq!((reservations, request_count, total_requests), (1, 0, 0));
+    }
+
+    #[test]
+    fn deleting_token_cascades_bindings_and_usage_logs() {
+        let mut conn = test_connection();
+        insert_token(&conn, "deleted", "sk-deleted", true, 0);
+        conn.execute(
+            "INSERT INTO token_ip_bindings (
+                id, token_id, ip_address, first_seen_at, last_seen_at, request_count
+             ) VALUES ('binding', 'deleted', '198.51.100.1', 0, 0, 0)",
+            [],
+        )
+        .expect("seed binding");
+        conn.execute(
+            "INSERT INTO token_usage_logs (
+                id, token_id, request_time
+             ) VALUES ('usage', 'deleted', 0)",
+            [],
+        )
+        .expect("seed usage log");
+
+        delete_token_with_connection(&mut conn, "deleted").expect("delete token");
+
+        let dependents: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM token_ip_bindings),
+                    (SELECT COUNT(*) FROM token_usage_logs)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("dependent counts");
+        assert_eq!(dependents, (0, 0));
+    }
+
+    #[test]
+    fn update_distinguishes_curfew_clear_from_omission() {
+        let conn = test_connection();
+        insert_token(&conn, "curfew", "sk-curfew", true, 0);
+        conn.execute(
+            "UPDATE user_tokens SET curfew_start = '22:00', curfew_end = '23:00' WHERE id = 'curfew'",
+            [],
+        )
+        .expect("seed curfew");
+
+        update_token_with_connection(&conn, "curfew", None, None, None, None, None, None)
+            .expect("omitted curfew is a no-op");
+        let retained: Option<String> = conn
+            .query_row(
+                "SELECT curfew_start FROM user_tokens WHERE id = 'curfew'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retained curfew");
+        assert_eq!(retained.as_deref(), Some("22:00"));
+
+        update_token_with_connection(
+            &conn,
+            "curfew",
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+            Some(None),
+        )
+        .expect("clear curfew");
+        let cleared: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT curfew_start, curfew_end FROM user_tokens WHERE id = 'curfew'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cleared curfew");
+        assert_eq!(cleared, (None, None));
+    }
+
+    #[test]
+    fn custom_expiry_must_be_explicit_and_future() {
+        assert!(expiry_for_type("custom", None).is_err());
+        assert!(expiry_for_type("custom", Some(Utc::now().timestamp())).is_err());
+        assert!(expiry_for_type("unexpected", None).is_err());
+        assert!(expiry_for_type("never", None)
+            .expect("explicit never")
+            .is_none());
     }
 }

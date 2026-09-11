@@ -25,14 +25,20 @@ impl AccountService {
             modules::oauth::get_user_info(&token_res.access_token, Some(&temp_account_id)).await?;
 
         // 3. 获取项目 ID (尝试)
-        let project_id = crate::proxy::project_resolver::fetch_project_id(&token_res.access_token)
-            .await
-            .ok();
+        let project_id = crate::proxy::project_resolver::fetch_project_id_for_account(
+            &token_res.access_token,
+            Some(&temp_account_id),
+        )
+        .await
+        .ok();
 
         // 4. 构造 TokenData
         let token = TokenData::new(
             token_res.access_token.clone(),
-            refresh_token.to_string(),
+            token_res
+                .refresh_token
+                .filter(|token| !token.trim().is_empty())
+                .unwrap_or_else(|| refresh_token.to_string()),
             token_res.expires_in,
             Some(user_info.email.clone()),
             project_id,
@@ -51,12 +57,19 @@ impl AccountService {
         let access_token = token_res.access_token.clone();
         match modules::quota::fetch_quota(&access_token, &email_for_log, Some(&account.id)).await {
             Ok((quota_data, new_project_id)) => {
-                account.quota = Some(quota_data);
-                if let Some(pid) = new_project_id {
+                account.quota = Some(quota_data.clone());
+                if let Some(pid) = new_project_id.clone() {
                     account.token.project_id = Some(pid);
                 }
-                // 保存更新后的账号信息
-                if let Err(e) = modules::account::save_account(&account) {
+                // Merge only fields produced after the quota await into the
+                // latest account, and do not recreate one removed meanwhile.
+                let account_id = account.id.clone();
+                if let Err(e) = modules::account::update_existing_account(&account_id, |latest| {
+                    latest.quota = Some(quota_data);
+                    if let Some(pid) = new_project_id {
+                        latest.token.project_id = Some(pid);
+                    }
+                }) {
                     modules::logger::log_warn(&format!(
                         "[Service] Failed to save quota for {}: {}",
                         email_for_log, e
@@ -168,9 +181,12 @@ impl AccountService {
 
         let user_info =
             modules::oauth::get_user_info(&token_res.access_token, Some(&temp_account_id)).await?;
-        let project_id = crate::proxy::project_resolver::fetch_project_id(&token_res.access_token)
-            .await
-            .ok();
+        let project_id = crate::proxy::project_resolver::fetch_project_id_for_account(
+            &token_res.access_token,
+            Some(&temp_account_id),
+        )
+        .await
+        .ok();
 
         let token_data = crate::models::TokenData::new(
             token_res.access_token,

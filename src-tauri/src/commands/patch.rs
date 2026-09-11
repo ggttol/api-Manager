@@ -30,31 +30,25 @@ pub async fn patch_agy_binary(file_path: String) -> Result<String, String> {
     //          leaq rip_off, rax -> 48 8d 05 XX XX XX XX
     //          mov $0x18, %ebx   -> bb 18 00 00 00
     let pe_pattern = [0x41, 0x80, 0x3c, 0x24, 0x00, 0x0f, 0x85];
-    let mut i = 0;
-    while i < n - 25 {
-        if data[i..i + 7] == pe_pattern {
-            // Validate the rest of the pattern
-            // leaq opcode starts after jne (which is 6 bytes: 0f 85 XX XX XX XX)
-            let leaq_idx = i + 5 + 6;
-            if data[leaq_idx..leaq_idx + 3] == [0x48, 0x8d, 0x05] {
-                // mov $0x18, %ebx starts after leaq (which is 7 bytes: 48 8d 05 XX XX XX XX)
+    for (i, window) in data.windows(25).enumerate() {
+        if window[..7] == pe_pattern {
+            // leaq follows the six-byte jne instruction.
+            let leaq_idx = 11;
+            if window[leaq_idx..leaq_idx + 3] == [0x48, 0x8d, 0x05] {
                 let mov_idx = leaq_idx + 7;
-                if data[mov_idx..mov_idx + 2] == [0xbb, 0x18] {
-                    // Found the gate!
-                    patch_offset = Some(i + 5); // Points to the jne instruction: 0f 85 ...
-                                                // Rewrite jne to 6 NOP bytes (0x90) so it falls through unconditionally
+                if window[mov_idx..mov_idx + 2] == [0xbb, 0x18] {
+                    patch_offset = Some(i + 5);
                     new_inst_bytes = Some(vec![0x90; 6]);
                     is_pe_x64 = true;
                     break;
                 }
             }
         }
-        i += 1;
     }
 
     // 2. Scan for ARM64 eligibility gate pattern if not PE x86_64
     if patch_offset.is_none() {
-        for j in (0..n - 20).step_by(4) {
+        for j in (0..data.len().saturating_sub(19)).step_by(4) {
             let inst1 = u32::from_le_bytes(data[j..j + 4].try_into().unwrap());
             let inst2 = u32::from_le_bytes(data[j + 4..j + 8].try_into().unwrap());
             let inst4 = u32::from_le_bytes(data[j + 12..j + 16].try_into().unwrap());
@@ -101,24 +95,20 @@ pub async fn patch_agy_binary(file_path: String) -> Result<String, String> {
 
     if patch_offset.is_none() {
         // Check if already patched for x86_64 PE
-        let mut check_idx = 0;
-        while check_idx < n - 25 {
-            if data[check_idx..check_idx + 7] == pe_pattern {
-                let leaq_idx = check_idx + 5 + 6;
-                if data[leaq_idx..leaq_idx + 3] == [0x48, 0x8d, 0x05] {
-                    let mov_idx = leaq_idx + 7;
-                    if data[mov_idx..mov_idx + 2] == [0xbb, 0x18] {
-                        if data[check_idx + 5..check_idx + 11] == [0x90; 6] {
-                            return Ok("Binary is already patched.".into());
-                        }
-                    }
-                }
+        // The patched instruction no longer contains `0f 85`; match the
+        // unchanged prefix plus the six replacement NOPs instead.
+        for (check_idx, window) in data.windows(25).enumerate() {
+            if window[..5] == pe_pattern[..5]
+                && window[5..11] == [0x90; 6]
+                && window[11..14] == [0x48, 0x8d, 0x05]
+                && window[18..20] == [0xbb, 0x18]
+            {
+                return Ok("Binary is already patched.".into());
             }
-            check_idx += 1;
         }
 
         // Check if already patched for ARM64
-        for j in (0..n - 20).step_by(4) {
+        for j in (0..data.len().saturating_sub(19)).step_by(4) {
             let inst1 = u32::from_le_bytes(data[j..j + 4].try_into().unwrap());
             let inst2 = u32::from_le_bytes(data[j + 4..j + 8].try_into().unwrap());
             let inst4 = u32::from_le_bytes(data[j + 12..j + 16].try_into().unwrap());
@@ -190,4 +180,44 @@ pub async fn patch_agy_binary(file_path: String) -> Result<String, String> {
     }
 
     Ok("Patch applied successfully!".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patch_agy_binary;
+
+    #[tokio::test]
+    async fn short_binaries_return_a_normal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for length in 0..=25 {
+            let path = dir.path().join(format!("short-{length}"));
+            std::fs::write(&path, vec![0_u8; length]).unwrap();
+            assert!(patch_agy_binary(path.to_string_lossy().into_owned())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn x86_patch_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture");
+        let mut bytes = vec![0_u8; 32];
+        bytes[..7].copy_from_slice(&[0x41, 0x80, 0x3c, 0x24, 0x00, 0x0f, 0x85]);
+        bytes[11..14].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        bytes[18..20].copy_from_slice(&[0xbb, 0x18]);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(patch_agy_binary(path.to_string_lossy().into_owned())
+            .await
+            .is_ok());
+        let patched = std::fs::read(&path).unwrap();
+        assert_eq!(&patched[5..11], &[0x90; 6]);
+        assert_eq!(
+            patch_agy_binary(path.to_string_lossy().into_owned())
+                .await
+                .unwrap(),
+            "Binary is already patched."
+        );
+    }
 }

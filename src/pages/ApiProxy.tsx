@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../utils/request';
-import { isTauri } from '../utils/env';
+import { getProxyBaseUrl, isTauri } from '../utils/env';
 import { copyToClipboard } from '../utils/clipboard';
 import {
     Power,
@@ -40,6 +40,7 @@ import { CircuitBreakerConfig } from '../types/config';
 import { PageHeader } from '../components/common/ConsolePage';
 import { SecretInput, useSecretVisibility } from '../components/proxy/SecretInput';
 import { Link } from 'react-router-dom';
+import { useConfigStore } from '../stores/useConfigStore';
 
 interface ProxyStatus {
     running: boolean;
@@ -151,6 +152,7 @@ function CollapsibleCard({
 }
 
 export default function ApiProxy() {
+    const { config: sharedConfig, updateConfig } = useConfigStore();
     const { t, i18n } = useTranslation();
     const [activeSection, setActiveSection] = useState('service');
     const sections = [
@@ -256,6 +258,9 @@ export default function ApiProxy() {
         };
     }, []);
 
+    useEffect(() => {
+        if (sharedConfig) setAppConfig(sharedConfig);
+    }, [sharedConfig]);
 
 
     // [FIX #820] Load available accounts for fixed account mode
@@ -462,30 +467,27 @@ export default function ApiProxy() {
 
 
     const saveConfig = async (newConfig: AppConfig) => {
-        // 1. 立即更新 UI 状态，确保流畅
         setAppConfig(newConfig);
         try {
-            await invoke('save_config', { config: newConfig });
+            await updateConfig(() => newConfig);
         } catch (error) {
             console.error('保存配置失败:', error);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
 
-    // 专门处理模型映射的热更新 (全量)
+    // Mapping changes are persisted through the shared transaction so they merge
+    // with configuration edits that complete while this interaction is pending.
     const handleMappingUpdate = async (type: 'custom', key: string, value: string) => {
-        if (!appConfig) return;
-
-        console.log('[DEBUG] handleMappingUpdate called:', { type, key, value });
-
-        const newConfig = { ...appConfig.proxy };
-        newConfig.custom_mapping = { ...(newConfig.custom_mapping || {}), [key]: value };
-
+        if (type !== 'custom') return;
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
-            console.log('[DEBUG] Mapping updated successfully');
-            showToast(t('common.saved'), 'success');
+            await updateConfig(current => ({
+                ...current,
+                proxy: {
+                    ...current.proxy,
+                    custom_mapping: { ...current.proxy.custom_mapping, [key]: value },
+                },
+            }), true);
         } catch (error) {
             console.error('Failed to update mapping:', error);
             showToast(`${t('common.error')}: ${error}`, 'error');
@@ -498,18 +500,12 @@ export default function ApiProxy() {
     };
 
     const executeResetMapping = async () => {
-        if (!appConfig) return;
         setIsResetConfirmOpen(false);
-
-        // 恢复到默认映射值 (空映射)
-        const newConfig = {
-            ...appConfig.proxy,
-            custom_mapping: {}
-        };
-
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateConfig(current => ({
+                ...current,
+                proxy: { ...current.proxy, custom_mapping: {} },
+            }), true);
             showToast(t('common.success'), 'success');
         } catch (error) {
             console.error('Failed to reset mapping:', error);
@@ -519,7 +515,7 @@ export default function ApiProxy() {
 
 
     // 定义多个预设方案
-    const defaultPresets = useMemo(() => [
+    const defaultPresets = useMemo((): CustomPreset[] => [
         {
             id: 'default',
             name: t('proxy.router.preset_default'),
@@ -653,50 +649,40 @@ export default function ApiProxy() {
 
     // 应用预设映射 (通配符)
     const handleApplyPresets = async () => {
-        if (!appConfig) return;
-
         const selectedPresetData = presetOptions.find(p => p.id === selectedPreset);
         if (!selectedPresetData) return;
 
-        // 构造新配置
-        const newConfig = {
-            ...appConfig.proxy,
-            // 策略:覆盖同名 key,保留其他自定义 key
-            // [FIX #1738] Type assertion to ensure Record<string, string> compatibility
-            custom_mapping: { ...appConfig.proxy.custom_mapping, ...selectedPresetData.mappings } as Record<string, string>
-        };
-
-        // 备份旧配置用于回滚
-        const oldConfig = { ...appConfig };
-
         try {
-            // 1. 乐观更新：立即更新 UI
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateConfig(current => ({
+                ...current,
+                proxy: {
+                    ...current.proxy,
+                    custom_mapping: {
+                        ...current.proxy.custom_mapping,
+                        ...selectedPresetData.mappings,
+                    },
+                },
+            }));
             showToast(t('proxy.router.presets_applied') + ` (${selectedPresetData.name})`, 'success');
-
-            // 2. 后台异步保存
-            await invoke('update_model_mapping', { config: newConfig });
-
-            // 3. 重新加载配置以确保一致性
-            await loadConfig();
         } catch (error) {
             console.error('Failed to apply presets:', error);
-            // 3. 失败回滚
-            setAppConfig(oldConfig);
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
 
     const handleRemoveCustomMapping = async (key: string) => {
-        if (!appConfig || !appConfig.proxy.custom_mapping) return;
-        const newCustom = { ...appConfig.proxy.custom_mapping };
-        delete newCustom[key];
-        const newConfig = { ...appConfig.proxy, custom_mapping: newCustom };
         try {
-            await invoke('update_model_mapping', { config: newConfig });
-            setAppConfig({ ...appConfig, proxy: newConfig });
+            await updateConfig(current => {
+                const customMapping = { ...current.proxy.custom_mapping };
+                delete customMapping[key];
+                return {
+                    ...current,
+                    proxy: { ...current.proxy, custom_mapping: customMapping },
+                };
+            }, true);
         } catch (error) {
             console.error('Failed to remove custom mapping:', error);
+            showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
 
@@ -966,17 +952,14 @@ export default function ApiProxy() {
 
     const getPythonExample = (modelId: string, includeSecret = false) => {
         const port = status.running ? status.port : (appConfig?.proxy.port || 8045);
-        // 推荐使用 127.0.0.1 以避免部分环境 IPv6 解析延迟问题
-        const baseUrl = `http://127.0.0.1:${port}/v1`;
+        const baseUrl = `${getProxyBaseUrl(port)}/v1`;
         const apiKey = includeSecret ? (appConfig?.proxy.api_key || 'YOUR_API_KEY') : 'YOUR_API_KEY';
 
-        // 1. Anthropic Protocol
         if (selectedProtocol === 'anthropic') {
             return `from anthropic import Anthropic
 
 client = Anthropic(
-    # Recommended: use 127.0.0.1
-    base_url="${`http://127.0.0.1:${port}`}",
+    base_url="${getProxyBaseUrl(port)}",
     api_key="${apiKey}"
 )
 
@@ -990,13 +973,12 @@ response = client.messages.create(
 print(response.content[0].text)`;
         }
 
-        // 2. Gemini Protocol (Native)
         if (selectedProtocol === 'gemini') {
-            const rawBaseUrl = `http://127.0.0.1:${port}`;
+            const rawBaseUrl = getProxyBaseUrl(port);
             return `# Requires: pip install google-generativeai
 import google.generativeai as genai
 
-# Use the Antigravity proxy address (recommended: 127.0.0.1)
+# Use the Antigravity proxy address
 genai.configure(
     api_key="${apiKey}",
     transport='rest',
@@ -1562,7 +1544,7 @@ print(response.choices[0].message.content)`;
                                 defaultExpanded={true}
                             >
                                 <CliSyncCard
-                                    proxyUrl={status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`}
+                                    proxyUrl={getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045))}
                                     apiKey={appConfig.proxy.api_key}
                                 />
                             </CollapsibleCard>
@@ -1861,20 +1843,18 @@ print(response.choices[0].message.content)`;
                                                 <div className="flex items-center justify-between mb-2">
                                                     <label className="text-xs font-medium text-gray-700 dark:text-gray-300 inline-flex items-center gap-1">
                                                         {t('proxy.config.scheduling.max_wait')}
-                                                        <HelpTooltip text={t('proxy.config.scheduling.max_wait_tooltip')} />
                                                     </label>
                                                     <span className="text-xs font-mono text-indigo-600 font-bold">
-                                                        {appConfig.proxy.scheduling?.max_wait_seconds || 60}s
+                                                        {appConfig.proxy.scheduling?.max_wait_seconds ?? 60}s
                                                     </span>
                                                 </div>
                                                 <input
                                                     type="range"
                                                     min="0"
                                                     max="300"
-                                                    step="10"
+                                                    value={appConfig.proxy.scheduling?.max_wait_seconds ?? 60}
                                                     disabled={(appConfig.proxy.scheduling?.mode || 'Balance') !== 'CacheFirst'}
                                                     className="range range-indigo range-xs"
-                                                    value={appConfig.proxy.scheduling?.max_wait_seconds || 60}
                                                     onChange={(e) => updateSchedulingConfig({ max_wait_seconds: parseInt(e.target.value) })}
                                                 />
                                                 <div className="flex justify-between px-1 mt-1 text-[10px] text-gray-400 font-mono">
@@ -2418,18 +2398,16 @@ print(response.choices[0].message.content)`;
                                             </div>
 
                                             <div className="flex items-center gap-2 w-full sm:w-auto min-w-[200px] max-w-sm">
-                                                <div className="relative flex-1">
-                                                    <GroupedSelect
-                                                        value={appConfig.proxy.custom_mapping?.['internal-background-task'] || ''}
-                                                        onChange={(val) => handleMappingUpdate('custom', 'internal-background-task', val)}
-                                                        options={[
-                                                            { value: '', label: 'Default (gemini-2.5-flash)', group: 'System' },
-                                                            ...customMappingOptions
-                                                        ]}
-                                                        placeholder="Default (gemini-2.5-flash)"
-                                                        className="font-mono text-[11px] h-8 dark:bg-base-200 w-full"
-                                                    />
-                                                </div>
+                                                <GroupedSelect
+                                                    value={appConfig.proxy.custom_mapping?.['internal-background-task'] || ''}
+                                                    onChange={(val) => val ? handleMappingUpdate('custom', 'internal-background-task', val) : handleRemoveCustomMapping('internal-background-task')}
+                                                    options={[
+                                                        { value: '', label: 'Default (gemini-2.5-flash)', group: 'System' },
+                                                        ...customMappingOptions
+                                                    ]}
+                                                    placeholder="Default (gemini-2.5-flash)"
+                                                    className="font-mono text-[11px] h-8 dark:bg-base-200 w-full"
+                                                />
 
                                                 {appConfig.proxy.custom_mapping && appConfig.proxy.custom_mapping['internal-background-task'] && (
                                                     <button
@@ -2622,7 +2600,7 @@ print(response.choices[0].message.content)`;
                                             <span className="text-xs font-bold text-blue-600">{t('proxy.multi_protocol.openai_label')}</span>
                                             <button onClick={(e) => {
                                                 e.stopPropagation();
-                                                const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                                const baseUrl = getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045));
                                                 copyToClipboardHandler(`${baseUrl}/v1`, 'openai');
                                             }} className="btn btn-ghost btn-xs">
                                                 {copied === 'openai' ? <CheckCircle size={14} /> : <div className="flex items-center gap-1 text-[10px] uppercase font-bold tracking-tighter"><Copy size={12} /> {t('proxy.multi_protocol.copy_base', { defaultValue: 'Base' })}</div>}
@@ -2633,7 +2611,7 @@ print(response.choices[0].message.content)`;
                                                 <code className="text-[10px] opacity-70">/v1/chat/completions</code>
                                                 <button onClick={(e) => {
                                                     e.stopPropagation();
-                                                    const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                                    const baseUrl = getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045));
                                                     copyToClipboardHandler(`${baseUrl}/v1/chat/completions`, 'openai-chat');
                                                 }} className="opacity-0 group-hover:opacity-100 transition-opacity">
                                                     {copied === 'openai-chat' ? <CheckCircle size={10} className="text-green-500" /> : <Copy size={10} />}
@@ -2643,7 +2621,7 @@ print(response.choices[0].message.content)`;
                                                 <code className="text-[10px] opacity-70">/v1/completions</code>
                                                 <button onClick={(e) => {
                                                     e.stopPropagation();
-                                                    const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                                    const baseUrl = getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045));
                                                     copyToClipboardHandler(`${baseUrl}/v1/completions`, 'openai-compl');
                                                 }} className="opacity-0 group-hover:opacity-100 transition-opacity">
                                                     {copied === 'openai-compl' ? <CheckCircle size={10} className="text-green-500" /> : <Copy size={10} />}
@@ -2653,7 +2631,7 @@ print(response.choices[0].message.content)`;
                                                 <code className="text-[10px] opacity-70 font-bold text-blue-500">/v1/responses (Codex)</code>
                                                 <button onClick={(e) => {
                                                     e.stopPropagation();
-                                                    const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                                    const baseUrl = getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045));
                                                     copyToClipboardHandler(`${baseUrl}/v1/responses`, 'openai-resp');
                                                 }} className="opacity-0 group-hover:opacity-100 transition-opacity">
                                                     {copied === 'openai-resp' ? <CheckCircle size={10} className="text-green-500" /> : <Copy size={10} />}
@@ -2671,7 +2649,7 @@ print(response.choices[0].message.content)`;
                                             <span className="text-xs font-bold text-purple-600">{t('proxy.multi_protocol.anthropic_label')}</span>
                                             <button onClick={(e) => {
                                                 e.stopPropagation();
-                                                const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                                const baseUrl = getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045));
                                                 copyToClipboardHandler(`${baseUrl}/v1/messages`, 'anthropic');
                                             }} className="btn btn-ghost btn-xs">
                                                 {copied === 'anthropic' ? <CheckCircle size={14} /> : <Copy size={14} />}
@@ -2689,7 +2667,7 @@ print(response.choices[0].message.content)`;
                                             <span className="text-xs font-bold text-green-600">{t('proxy.multi_protocol.gemini_label')}</span>
                                             <button onClick={(e) => {
                                                 e.stopPropagation();
-                                                const baseUrl = status.running ? status.base_url : `http://127.0.0.1:${appConfig.proxy.port || 8045}`;
+                                                const baseUrl = getProxyBaseUrl(status.running ? status.port : (appConfig.proxy.port || 8045));
                                                 copyToClipboardHandler(`${baseUrl}/v1beta/models`, 'gemini');
                                             }} className="btn btn-ghost btn-xs">
                                                 {copied === 'gemini' ? <CheckCircle size={14} /> : <Copy size={14} />}

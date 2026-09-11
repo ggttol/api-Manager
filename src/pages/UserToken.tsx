@@ -166,7 +166,7 @@ const UserToken: React.FC = () => {
                 id: editingToken.id,
                 request: {
                     username: editUsername,
-                    description: editDesc || undefined,
+                    description: editDesc,
                     max_ips: editMaxIps,
                     // 使用双层包装: undefined = 不更新, null = 清空, string = 设置值
                     curfew_start: editCurfewStart === '' ? null : editCurfewStart,
@@ -354,7 +354,7 @@ const UserToken: React.FC = () => {
                                             <span className="text-xs px-1.5 py-0.5 bg-gray-100 dark:bg-base-200 text-gray-600 dark:text-gray-300 rounded">
                                                 {getExpiresLabel(token.expires_type)}
                                             </span>
-                                            {token.expires_at && token.expires_at < Date.now() / 1000 && (
+                                            {token.expires_type !== 'custom' && token.expires_at && token.expires_at < Date.now() / 1000 && (
                                                 <button
                                                     onClick={() => handleRenew(token.id, token.expires_type)}
                                                     className="text-xs text-blue-500 hover:underline font-medium"

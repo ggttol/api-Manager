@@ -4,6 +4,9 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// IP 访问日志
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +69,15 @@ pub struct IpRanking {
 
 /// 获取安全数据库路径
 pub fn get_security_db_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(path) = test_db_path()
+        .lock()
+        .map_err(|_| "security test database path lock poisoned".to_string())?
+        .clone()
+    {
+        return Ok(path);
+    }
+
     let data_dir = crate::modules::account::get_data_dir()?;
     Ok(data_dir.join("security.db"))
 }
@@ -75,18 +87,65 @@ fn connect_db() -> Result<Connection, String> {
     let db_path = get_security_db_path()?;
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
 
-    // Enable WAL mode for better concurrency
+    // Configure waiting before changing journal mode, because the latter can contend when
+    // independent request threads open their own connections.
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
-
-    // Set busy timeout
-    conn.pragma_update(None, "busy_timeout", 5000)
-        .map_err(|e| e.to_string())?;
-
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
 
     Ok(conn)
+}
+
+#[cfg(test)]
+static TEST_DB_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+static TEST_DB_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn test_db_path() -> &'static Mutex<Option<PathBuf>> {
+    &TEST_DB_PATH
+}
+
+/// Serializes security database tests and routes their connections to a temporary database.
+///
+/// The guard deliberately changes neither the process environment nor the user's data directory.
+#[cfg(test)]
+pub struct TestDbGuard {
+    _lock: MutexGuard<'static, ()>,
+    directory: PathBuf,
+}
+
+#[cfg(test)]
+pub fn test_db_guard() -> Result<TestDbGuard, String> {
+    let lock = TEST_DB_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory =
+        std::env::temp_dir().join(format!("api-manager-security-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let guard = TestDbGuard {
+        _lock: lock,
+        directory,
+    };
+    *test_db_path()
+        .lock()
+        .map_err(|_| "security test database path lock poisoned".to_string())? =
+        Some(guard.directory.join("security.db"));
+    init_db()?;
+    Ok(guard)
+}
+
+#[cfg(test)]
+impl Drop for TestDbGuard {
+    fn drop(&mut self) {
+        if let Ok(mut path) = test_db_path().lock() {
+            *path = None;
+        }
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
 }
 
 /// 初始化安全数据库
@@ -209,65 +268,37 @@ pub fn get_ip_access_logs(
     blocked_only: bool,
 ) -> Result<Vec<IpAccessLog>, String> {
     let conn = connect_db()?;
-
-    let sql = if blocked_only {
-        if let Some(ip) = ip_filter {
-            format!(
-                "SELECT id, client_ip, timestamp, method, path, user_agent, status, duration, api_key_hash, blocked, block_reason, username
-                 FROM ip_access_logs
-                 WHERE blocked = 1 AND client_ip LIKE '%{}%'
-                 ORDER BY timestamp DESC
-                 LIMIT {} OFFSET {}",
-                ip, limit, offset
-            )
-        } else {
-            format!(
-                "SELECT id, client_ip, timestamp, method, path, user_agent, status, duration, api_key_hash, blocked, block_reason, username
-                 FROM ip_access_logs
-                 WHERE blocked = 1
-                 ORDER BY timestamp DESC
-                 LIMIT {} OFFSET {}",
-                limit, offset
-            )
-        }
-    } else if let Some(ip) = ip_filter {
-        format!(
+    let mut stmt = conn
+        .prepare(
             "SELECT id, client_ip, timestamp, method, path, user_agent, status, duration, api_key_hash, blocked, block_reason, username
              FROM ip_access_logs
-             WHERE client_ip LIKE '%{}%'
+             WHERE (?1 = 0 OR blocked = 1)
+               AND (?2 IS NULL OR client_ip LIKE '%' || ?2 || '%')
              ORDER BY timestamp DESC
-             LIMIT {} OFFSET {}",
-            ip, limit, offset
+             LIMIT ?3 OFFSET ?4",
         )
-    } else {
-        format!(
-            "SELECT id, client_ip, timestamp, method, path, user_agent, status, duration, api_key_hash, blocked, block_reason, username
-             FROM ip_access_logs
-             ORDER BY timestamp DESC
-             LIMIT {} OFFSET {}",
-            limit, offset
-        )
-    };
-
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
 
     let logs_iter = stmt
-        .query_map([], |row| {
-            Ok(IpAccessLog {
-                id: row.get(0)?,
-                client_ip: row.get(1)?,
-                timestamp: row.get(2)?,
-                method: row.get(3)?,
-                path: row.get(4)?,
-                user_agent: row.get(5)?,
-                status: row.get(6)?,
-                duration: row.get(7)?,
-                api_key_hash: row.get(8)?,
-                blocked: row.get::<_, i32>(9)? != 0,
-                block_reason: row.get(10)?,
-                username: row.get(11).unwrap_or(None),
-            })
-        })
+        .query_map(
+            params![blocked_only as i64, ip_filter, limit as i64, offset as i64],
+            |row| {
+                Ok(IpAccessLog {
+                    id: row.get(0)?,
+                    client_ip: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    method: row.get(3)?,
+                    path: row.get(4)?,
+                    user_agent: row.get(5)?,
+                    status: row.get(6)?,
+                    duration: row.get(7)?,
+                    api_key_hash: row.get(8)?,
+                    blocked: row.get::<_, i32>(9)? != 0,
+                    block_reason: row.get(10)?,
+                    username: row.get(11).unwrap_or(None),
+                })
+            },
+        )
         .map_err(|e| e.to_string())?;
 
     let mut logs = Vec::new();
@@ -293,8 +324,8 @@ pub fn get_ip_stats() -> Result<IpStats, String> {
             "SELECT
                 COUNT(*) as total,
                 COUNT(DISTINCT client_ip) as unique_ips,
-                SUM(CASE WHEN blocked = 1 THEN 1 ELSE 0 END) as blocked,
-                SUM(CASE WHEN timestamp >= ?1 THEN 1 ELSE 0 END) as today
+                COALESCE(SUM(CASE WHEN blocked = 1 THEN 1 ELSE 0 END), 0) as blocked,
+                COALESCE(SUM(CASE WHEN timestamp >= ?1 THEN 1 ELSE 0 END), 0) as today
              FROM ip_access_logs",
             [today_start],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -382,12 +413,33 @@ pub fn cleanup_old_ip_logs(days: i64) -> Result<usize, String> {
 // ============================================================================
 
 /// 添加 IP 到黑名单
+fn validate_ip_pattern(ip_pattern: &str) -> Result<(), String> {
+    let (address, prefix) = match ip_pattern.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (ip_pattern, None),
+    };
+    let address: std::net::Ipv4Addr = address
+        .parse()
+        .map_err(|_| "IP pattern must be an IPv4 address or CIDR".to_string())?;
+    if let Some(prefix) = prefix {
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| "CIDR prefix must be between 0 and 32".to_string())?;
+        if prefix > 32 {
+            return Err("CIDR prefix must be between 0 and 32".to_string());
+        }
+    }
+    let _ = address;
+    Ok(())
+}
+
 pub fn add_to_blacklist(
     ip_pattern: &str,
     reason: Option<&str>,
     expires_at: Option<i64>,
     created_by: &str,
 ) -> Result<IpBlacklistEntry, String> {
+    validate_ip_pattern(ip_pattern)?;
     let conn = connect_db()?;
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -466,15 +518,16 @@ pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, 
 
     // 清理过期的黑名单条目
     let _ = conn.execute(
-        "DELETE FROM ip_blacklist WHERE expires_at IS NOT NULL AND expires_at < ?1",
+        "DELETE FROM ip_blacklist WHERE expires_at IS NOT NULL AND expires_at <= ?1",
         [now],
     );
 
     // 精确匹配
     let entry_result = conn.query_row(
         "SELECT id, ip_pattern, reason, created_at, expires_at, created_by, hit_count
-         FROM ip_blacklist WHERE ip_pattern = ?1",
-        [ip],
+         FROM ip_blacklist
+         WHERE ip_pattern = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+        params![ip, now],
         |row| {
             Ok(IpBlacklistEntry {
                 id: row.get(0)?,
@@ -488,27 +541,30 @@ pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, 
         },
     );
 
-    if let Ok(entry) = entry_result {
-        // 增加命中计数
-        let _ = conn.execute(
-            "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE ip_pattern = ?1",
-            [ip],
-        );
+    if let Ok(mut entry) = entry_result {
+        conn.execute(
+            "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
+            [&entry.id],
+        )
+        .map_err(|e| e.to_string())?;
+        entry.hit_count += 1;
         return Ok(Some(entry));
     }
 
     // CIDR 匹配
     let entries = get_blacklist()?;
-    for entry in entries {
-        if entry.ip_pattern.contains('/') {
-            if cidr_match(ip, &entry.ip_pattern) {
-                // 增加命中计数
-                let _ = conn.execute(
-                    "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
-                    [&entry.id],
-                );
-                return Ok(Some(entry));
-            }
+    for mut entry in entries {
+        if entry.expires_at.map_or(true, |expires_at| expires_at > now)
+            && entry.ip_pattern.contains('/')
+            && cidr_match(ip, &entry.ip_pattern)
+        {
+            conn.execute(
+                "UPDATE ip_blacklist SET hit_count = hit_count + 1 WHERE id = ?1",
+                [&entry.id],
+            )
+            .map_err(|e| e.to_string())?;
+            entry.hit_count += 1;
+            return Ok(Some(entry));
         }
     }
 
@@ -517,34 +573,27 @@ pub fn get_blacklist_entry_for_ip(ip: &str) -> Result<Option<IpBlacklistEntry>, 
 
 /// 简单的 CIDR 匹配
 fn cidr_match(ip: &str, cidr: &str) -> bool {
-    let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 {
+    let Some((network, prefix)) = cidr.split_once('/') else {
         return false;
-    }
-
-    let network = parts[0];
-    let prefix_len: u8 = match parts[1].parse() {
-        Ok(p) => p,
-        Err(_) => return false,
     };
-
-    let ip_parts: Vec<u8> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
-    let net_parts: Vec<u8> = network.split('.').filter_map(|s| s.parse().ok()).collect();
-
-    if ip_parts.len() != 4 || net_parts.len() != 4 {
+    let Ok(prefix_len) = prefix.parse::<u8>() else {
+        return false;
+    };
+    if prefix_len > 32 {
         return false;
     }
-
-    let ip_u32 = u32::from_be_bytes([ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]]);
-    let net_u32 = u32::from_be_bytes([net_parts[0], net_parts[1], net_parts[2], net_parts[3]]);
-
+    let (Ok(ip), Ok(network)) = (
+        ip.parse::<std::net::Ipv4Addr>(),
+        network.parse::<std::net::Ipv4Addr>(),
+    ) else {
+        return false;
+    };
     let mask = if prefix_len == 0 {
         0
     } else {
         !0u32 << (32 - prefix_len)
     };
-
-    (ip_u32 & mask) == (net_u32 & mask)
+    (u32::from(ip) & mask) == (u32::from(network) & mask)
 }
 
 // ============================================================================
@@ -556,6 +605,7 @@ pub fn add_to_whitelist(
     ip_pattern: &str,
     description: Option<&str>,
 ) -> Result<IpWhitelistEntry, String> {
+    validate_ip_pattern(ip_pattern)?;
     let conn = connect_db()?;
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -660,28 +710,23 @@ pub fn get_ip_access_logs_count(
     blocked_only: bool,
 ) -> Result<u64, String> {
     let conn = connect_db()?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM ip_access_logs
+         WHERE (?1 = 0 OR blocked = 1)
+           AND (?2 IS NULL OR client_ip LIKE '%' || ?2 || '%')",
+        params![blocked_only as i64, ip_filter],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
 
-    let sql = if blocked_only {
-        if let Some(ip) = ip_filter {
-            format!(
-                "SELECT COUNT(*) FROM ip_access_logs WHERE blocked = 1 AND client_ip LIKE '%{}%'",
-                ip
-            )
-        } else {
-            "SELECT COUNT(*) FROM ip_access_logs WHERE blocked = 1".to_string()
-        }
-    } else if let Some(ip) = ip_filter {
-        format!(
-            "SELECT COUNT(*) FROM ip_access_logs WHERE client_ip LIKE '%{}%'",
-            ip
-        )
-    } else {
-        "SELECT COUNT(*) FROM ip_access_logs".to_string()
-    };
+#[cfg(test)]
+mod tests {
+    use super::{cidr_match, validate_ip_pattern};
 
-    let count: u64 = conn
-        .query_row(&sql, [], |row| row.get(0))
-        .map_err(|e| e.to_string())?;
-
-    Ok(count)
+    #[test]
+    fn invalid_cidr_is_rejected_and_never_matches() {
+        assert!(validate_ip_pattern("192.0.2.0/33").is_err());
+        assert!(!cidr_match("192.0.2.1", "192.0.2.0/33"));
+    }
 }

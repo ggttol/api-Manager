@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 interface DebouncedSliderProps {
     value: number;
@@ -12,16 +12,27 @@ interface DebouncedSliderProps {
 export default function DebouncedSlider({ value, onChange, min, max, step, className }: DebouncedSliderProps) {
     const [localValue, setLocalValue] = useState(value);
     const [isDragging, setIsDragging] = useState(false);
+    const lastCommitted = useRef(value);
 
     // Sync local value with prop value when not dragging (for external updates)
     useEffect(() => {
         if (!isDragging) {
             setLocalValue(value);
+            lastCommitted.current = value;
         }
     }, [value, isDragging]);
 
+    const commit = (nextValue: number) => {
+        if (lastCommitted.current === nextValue) return;
+        lastCommitted.current = nextValue;
+        onChange(nextValue);
+    };
+
     const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        setLocalValue(parseFloat(e.target.value));
+        const nextValue = parseFloat(e.target.value);
+        setLocalValue(nextValue);
+        // Pointer interactions commit on release; keyboard changes have no pointer lifecycle.
+        if (!isDragging) commit(nextValue);
     };
 
     const handlePointerDown = () => {
@@ -30,8 +41,11 @@ export default function DebouncedSlider({ value, onChange, min, max, step, class
 
     const handlePointerUp = (e: React.PointerEvent<HTMLInputElement>) => {
         setIsDragging(false);
-        const newValue = parseFloat((e.target as HTMLInputElement).value);
-        onChange(newValue);
+        commit(parseFloat((e.target as HTMLInputElement).value));
+    };
+
+    const handleBlur = () => {
+        commit(localValue);
     };
 
     // Also handle onMouseUp/onTouchEnd as backup if Pointer events behave oddly in some envs, 
@@ -48,6 +62,7 @@ export default function DebouncedSlider({ value, onChange, min, max, step, class
                 className={className}
                 value={localValue}
                 onChange={handleChange}
+                onBlur={handleBlur}
                 onPointerDown={handlePointerDown}
                 onPointerUp={handlePointerUp}
             />

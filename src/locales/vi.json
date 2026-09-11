@@ -1033,8 +1033,8 @@
     "placeholder": "Nhập mật khẩu quản trị hoặc API Key",
     "btn_login": "Xác minh và Vào",
     "note": "Lưu ý: Nếu đã thiết lập mật khẩu quản trị riêng, vui lòng nhập mật khẩu đó; nếu không, hãy nhập API_KEY.",
-    "lookup_hint": "Nếu quên, hãy chạy lệnh docker logs antigravity-manager để tìm API Key hiện tại hoặc Mật khẩu Web UI.",
-    "config_hint": "Hoặc chạy lệnh grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json để xem."
+    "lookup_hint": "Nếu quên, hãy kiểm tra WEB_PASSWORD hoặc API_KEY (kể cả biến có tiền tố ABV_) trong cấu hình triển khai. Nhật ký khởi động không hiển thị thông tin xác thực.",
+    "config_hint": "Nếu không bị biến môi trường ghi đè, hãy kiểm tra proxy.admin_password hoặc proxy.api_key trong gui_config.json ở thư mục dữ liệu. Không chia sẻ tệp này."
   },
   "token_stats": {
     "title": "Thống kê Token",

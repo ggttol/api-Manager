@@ -303,12 +303,21 @@ pub fn run() {
                         config.proxy.allow_lan_access = true;
                     }
 
-                    // [FIX] Force auth mode to AllExceptHealth in headless mode if it's Off or Auto
-                    // This ensures Web UI login validation works properly
-                    if matches!(config.proxy.auth_mode, crate::proxy::ProxyAuthMode::Off | crate::proxy::ProxyAuthMode::Auto) {
-                        info!("Headless mode: Forcing auth_mode to AllExceptHealth for Web UI security");
-                        config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
-                        modified = true;
+                    if let Ok(port) = std::env::var("PORT") {
+                        config.proxy.port = port
+                            .parse::<u16>()
+                            .map_err(|_| {
+                                format!("PORT must be an integer between 1 and 65535, got {port:?}")
+                            })
+                            .and_then(|port| {
+                                (port != 0)
+                                    .then_some(port)
+                                    .ok_or_else(|| "PORT must be between 1 and 65535".to_string())
+                            })
+                            .unwrap_or_else(|error| {
+                                error!("{error}");
+                                std::process::exit(1);
+                            });
                     }
 
                     // [NEW] 支持通过环境变量注入 API Key
@@ -349,7 +358,9 @@ pub fn run() {
                         let mode = match mode_str.to_lowercase().as_str() {
                             "off" => Some(crate::proxy::ProxyAuthMode::Off),
                             "strict" => Some(crate::proxy::ProxyAuthMode::Strict),
-                            "all_except_health" => Some(crate::proxy::ProxyAuthMode::AllExceptHealth),
+                            "all_except_health" => {
+                                Some(crate::proxy::ProxyAuthMode::AllExceptHealth)
+                            }
                             "auto" => Some(crate::proxy::ProxyAuthMode::Auto),
                             _ => {
                                 warn!("Invalid AUTH_MODE: {}, ignoring", mode_str);
@@ -360,13 +371,24 @@ pub fn run() {
                             info!("Using Auth Mode from environment variable: {:?}", m);
                             config.proxy.auth_mode = m;
                             modified = true;
+                        } else {
+                            config.proxy.auth_mode = crate::proxy::ProxyAuthMode::Strict;
                         }
+                    } else {
+                        // Headless mode commonly binds to the LAN. Preserve
+                        // its historical secure default even when a persisted
+                        // desktop config says Off; only an explicit environment
+                        // opt-out may disable authentication.
+                        config.proxy.auth_mode = crate::proxy::ProxyAuthMode::Strict;
                     }
 
                     info!("--------------------------------------------------");
                     info!("🚀 Headless mode proxy service starting...");
                     info!("📍 Port: {}", config.proxy.port);
-                    info!("🔑 Current API Key: {}", credential_state(&config.proxy.api_key));
+                    info!(
+                        "🔑 Current API Key: {}",
+                        credential_state(&config.proxy.api_key)
+                    );
                     if let Some(ref pwd) = config.proxy.admin_password {
                         info!("🔐 Web UI Password: {}", credential_state(pwd));
                     } else {
@@ -391,7 +413,9 @@ pub fn run() {
                         &proxy_state,
                         crate::modules::integration::SystemManager::Headless,
                         cf_state.clone(),
-                    ).await {
+                    )
+                    .await
+                    {
                         error!("Failed to start proxy service in headless mode: {}", e);
                         std::process::exit(1);
                     }
@@ -408,9 +432,16 @@ pub fn run() {
                 }
             }
 
-            // Wait for Ctrl-C
             tokio::signal::ctrl_c().await.ok();
             info!("Headless mode shutting down");
+            if let Err(error) =
+                commands::cloudflared::stop_cloudflared_for_shutdown(cf_state.as_ref()).await
+            {
+                error!(
+                    "Failed to stop cloudflared during headless shutdown: {}",
+                    error
+                );
+            }
         });
         return;
     }
@@ -634,6 +665,7 @@ pub fn run() {
             commands::proxy::export_proxy_logs_json,
             commands::proxy::get_proxy_logs_count_filtered,
             commands::proxy::get_proxy_logs_filtered,
+            commands::proxy::get_proxy_log_accounts,
             commands::proxy::set_proxy_monitor_enabled,
             commands::proxy::clear_proxy_logs,
             commands::proxy::generate_api_key,
@@ -738,11 +770,10 @@ pub fn run() {
                 // Handle app exit - cleanup background tasks
                 tauri::RunEvent::Exit => {
                     tracing::info!("Application exiting, cleaning up background tasks...");
-                    if let Some(state) =
-                        app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
-                    {
-                        tauri::async_runtime::block_on(async {
-                            // Use timeout-based read() instead of try_read() to handle lock contention
+                    tauri::async_runtime::block_on(async {
+                        if let Some(state) =
+                            app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
+                        {
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(3),
                                 state.instance.read(),
@@ -751,7 +782,6 @@ pub fn run() {
                             {
                                 Ok(guard) => {
                                     if let Some(instance) = guard.as_ref() {
-                                        // Use graceful_shutdown with 2s timeout for task cleanup
                                         instance
                                             .token_manager
                                             .graceful_shutdown(std::time::Duration::from_secs(2))
@@ -764,8 +794,23 @@ pub fn run() {
                                     );
                                 }
                             }
-                        });
-                    }
+                        }
+                        if let Some(cloudflared_state) =
+                            app_handle.try_state::<crate::commands::cloudflared::CloudflaredState>()
+                        {
+                            if let Err(error) =
+                                crate::commands::cloudflared::stop_cloudflared_for_shutdown(
+                                    cloudflared_state.inner(),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to stop cloudflared during application shutdown: {}",
+                                    error
+                                );
+                            }
+                        }
+                    });
                 }
                 // Handle macOS dock icon click to reopen window
                 #[cfg(target_os = "macos")]

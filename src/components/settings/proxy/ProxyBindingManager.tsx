@@ -18,7 +18,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
     const { accounts, fetchAccounts } = useAccountStore();
     const [bindings, setBindings] = useState<Record<string, string>>({});
     const [isLoading, setIsLoading] = useState(false);
-    const [isSaving, setIsSaving] = useState<string | null>(null);
+    const [savingAccountIds, setSavingAccountIds] = useState<Set<string>>(new Set());
 
     // Filter enabled proxies for selection
     const availableProxies = proxies.filter(p => p.enabled);
@@ -44,26 +44,30 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
     };
 
     const handleBind = async (accountId: string, proxyId: string) => {
-        setIsSaving(accountId);
+        setSavingAccountIds(current => new Set(current).add(accountId));
         try {
             if (proxyId === '') {
-                // Unbind
                 await request('unbind_account_proxy', { accountId });
-                const newBindings = { ...bindings };
-                delete newBindings[accountId];
-                setBindings(newBindings);
+                setBindings(current => {
+                    const next = { ...current };
+                    delete next[accountId];
+                    return next;
+                });
                 showToast(t('settings.proxy_pool.binding.unbind_success', 'Unbound successfully'), 'success');
             } else {
-                // Bind
                 await request('bind_account_proxy', { accountId, proxyId });
-                setBindings({ ...bindings, [accountId]: proxyId });
+                setBindings(current => ({ ...current, [accountId]: proxyId }));
                 showToast(t('settings.proxy_pool.binding.bind_success', 'Bound successfully'), 'success');
             }
         } catch (error) {
             console.error('Failed to update binding:', error);
             showToast(t('settings.proxy_pool.binding.update_failed', 'Failed to update binding'), 'error');
         } finally {
-            setIsSaving(null);
+            setSavingAccountIds(current => {
+                const next = new Set(current);
+                next.delete(accountId);
+                return next;
+            });
         }
     };
 
@@ -121,7 +125,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                                             <select
                                                 value={currentProxyId}
                                                 onChange={(e) => handleBind(account.id, e.target.value)}
-                                                disabled={isSaving === account.id}
+                                                disabled={savingAccountIds.has(account.id)}
                                                 className={`w-full appearance-none pl-3 pr-8 py-2 border rounded-md text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-white transition-colors
                                                     ${bindings[account.id]
                                                         ? 'border-blue-300 dark:border-blue-700 ring-1 ring-blue-100 dark:ring-blue-900/20'
@@ -138,7 +142,7 @@ export default function ProxyBindingManager({ isOpen, onClose, proxies }: ProxyB
                                                 </optgroup>
                                             </select>
                                             <div className="absolute inset-y-0 right-0 flex items-center pr-2 pointer-events-none text-gray-500">
-                                                {isSaving === account.id ? (
+                                                {savingAccountIds.has(account.id) ? (
                                                     <div className="animate-spin h-4 w-4 border-2 border-gray-500 border-t-transparent rounded-full" />
                                                 ) : (
                                                     bindings[account.id] ? <Link2 size={16} className="text-blue-500" /> : <Unlink size={16} className="opacity-50" />

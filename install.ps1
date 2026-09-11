@@ -130,7 +130,11 @@ function Install-App {
         Write-ColorOutput "Yellow" "[DRY-RUN] Start-Process -FilePath $downloadPath -Wait"
     } else {
         try {
-            Start-Process -FilePath $downloadPath -Wait
+            $installer = Start-Process -FilePath $downloadPath -Wait -PassThru
+            if ($installer.ExitCode -ne 0 -and $installer.ExitCode -ne 3010) {
+                Script-Error "Installation failed with exit code $($installer.ExitCode)"
+                return $false
+            }
         } catch {
             Script-Error "Installation failed: $_"
             return $false

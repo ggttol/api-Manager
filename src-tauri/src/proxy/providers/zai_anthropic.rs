@@ -74,17 +74,19 @@ fn copy_passthrough_headers(incoming: &HeaderMap) -> HeaderMap {
     for (k, v) in incoming.iter() {
         let key = k.as_str().to_ascii_lowercase();
         match key.as_str() {
-            "content-type" | "accept" | "anthropic-version" | "user-agent" => {
-                out.insert(k.clone(), v.clone());
-            }
-            // Some clients use these for streaming; safe to pass through.
-            "accept-encoding" | "cache-control" => {
+            "content-type" | "accept" | "anthropic-version" | "user-agent" | "cache-control" => {
                 out.insert(k.clone(), v.clone());
             }
             _ => {}
         }
     }
 
+    // Reqwest is not configured to decode compressed upstream bodies. Request an uncompressed
+    // response rather than forwarding an encoding we cannot safely transform.
+    out.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
     out
 }
 
@@ -109,28 +111,60 @@ fn set_zai_auth(headers: &mut HeaderMap, incoming: &HeaderMap, api_key: &str) {
     }
 }
 
-/// Recursively remove cache_control from all nested objects/arrays
-/// [FIX #290] This is a defensive fix that works regardless of serde annotations
-pub fn deep_remove_cache_control(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            if let Some(v) = map.remove("cache_control") {
-                tracing::info!(
-                    "[ISSUE-744] Deep Cleaning found nested cache_control: {:?}",
-                    v
-                );
-            }
-            for v in map.values_mut() {
-                deep_remove_cache_control(v);
+/// Remove Anthropic cache-control metadata only where the protocol defines content blocks.
+///
+/// Tool inputs and JSON schemas are arbitrary application data, so recursively walking the
+/// payload would corrupt valid fields named `cache_control`.
+pub fn remove_content_block_cache_control(body: &mut Value) {
+    if let Some(root) = body.as_object_mut() {
+        root.remove("cache_control");
+
+        if let Some(system) = root.get_mut("system").and_then(Value::as_array_mut) {
+            clean_content_blocks(system);
+        }
+        if let Some(messages) = root.get_mut("messages").and_then(Value::as_array_mut) {
+            for message in messages {
+                if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+                    clean_content_blocks(content);
+                }
             }
         }
-        Value::Array(arr) => {
-            for v in arr {
-                deep_remove_cache_control(v);
-            }
-        }
-        _ => {}
     }
+}
+
+fn clean_content_blocks(blocks: &mut [Value]) {
+    for block in blocks {
+        let Some(object) = block.as_object_mut() else {
+            continue;
+        };
+        object.remove("cache_control");
+
+        // A tool result may itself contain Anthropic content blocks. Do not traverse any
+        // other fields: in particular, tool_use.input and schema values are opaque payloads.
+        if object.get("type").and_then(Value::as_str) == Some("tool_result") {
+            if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
+                clean_content_blocks(content);
+            }
+        }
+    }
+}
+
+fn upstream_body<S, E>(stream: S) -> Body
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Body::from_stream(stream.map(|chunk| chunk.map_err(std::io::Error::other)))
+}
+
+fn copy_upstream_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for name in [header::CONTENT_TYPE, header::CONTENT_ENCODING] {
+        if let Some(value) = headers.get(&name) {
+            out.insert(name, value.clone());
+        }
+    }
+    out
 }
 
 pub async fn forward_anthropic_json(
@@ -189,15 +223,9 @@ pub async fn forward_anthropic_json(
         .entry(header::CONTENT_TYPE)
         .or_insert(HeaderValue::from_static("application/json"));
 
-    // [FIX #290] Clean cache_control before sending to Anthropic API
-    // This prevents "Extra inputs are not permitted" errors
-    if let Some(cc) = body.get("cache_control") {
-        tracing::info!(
-            "[ISSUE-744] Deep cleaning cache_control from ROOT: {:?}",
-            cc
-        );
-    }
-    deep_remove_cache_control(&mut body);
+    // z.ai rejects Anthropic cache-control metadata, but tool values and JSON schemas are
+    // opaque application payloads and must remain byte-for-byte semantically intact.
+    remove_content_block_cache_control(&mut body);
 
     // [FIX #307] Explicitly serialize body to Vec<u8> to ensure Content-Length is set correctly.
     // This avoids "Transfer-Encoding: chunked" for small bodies which caused connection errors.
@@ -229,21 +257,95 @@ pub async fn forward_anthropic_json(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     let mut out = Response::builder().status(status);
-    if let Some(ct) = resp.headers().get(header::CONTENT_TYPE) {
-        out = out.header(header::CONTENT_TYPE, ct.clone());
+    for (name, value) in copy_upstream_response_headers(resp.headers()).iter() {
+        out = out.header(name, value);
     }
 
-    // Stream response body to the client (covers SSE and non-SSE).
-    let stream = resp.bytes_stream().map(|chunk| match chunk {
-        Ok(b) => Ok::<Bytes, std::io::Error>(b),
-        Err(e) => Ok(Bytes::from(format!("Upstream stream error: {}", e))),
-    });
+    // Stream response body to the client (covers SSE and non-SSE). Body read failures must
+    // remain failures; appending diagnostic bytes produces invalid JSON/SSE success responses.
+    let stream = upstream_body(resp.bytes_stream());
 
-    out.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+    out.body(stream).unwrap_or_else(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to build response",
         )
             .into_response()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    #[test]
+    fn content_metadata_cleanup_preserves_tool_payloads_and_schemas() {
+        let mut request = serde_json::json!({
+            "cache_control": { "type": "ephemeral" },
+            "messages": [{
+                "content": [{
+                    "type": "tool_use",
+                    "cache_control": { "type": "ephemeral" },
+                    "input": { "cache_control": "application value", "thought": "application value" }
+                }, {
+                    "type": "tool_result",
+                    "content": [{ "type": "text", "cache_control": { "type": "ephemeral" }, "text": "ok" }]
+                }]
+            }],
+            "tools": [{
+                "input_schema": {
+                    "properties": { "cache_control": { "type": "string" } },
+                    "required": ["cache_control"]
+                }
+            }]
+        });
+
+        remove_content_block_cache_control(&mut request);
+
+        assert!(request.get("cache_control").is_none());
+        assert!(request["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            request["messages"][0]["content"][0]["input"]["cache_control"],
+            "application value"
+        );
+        assert!(request["messages"][0]["content"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            request["tools"][0]["input_schema"]["properties"]["cache_control"]["type"],
+            "string"
+        );
+        assert_eq!(
+            request["tools"][0]["input_schema"]["required"][0],
+            "cache_control"
+        );
+    }
+
+    #[test]
+    fn passthrough_negotiates_identity_and_retains_upstream_content_encoding() {
+        let mut request = HeaderMap::new();
+        request.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let forwarded = copy_passthrough_headers(&request);
+        assert_eq!(forwarded.get(header::ACCEPT_ENCODING).unwrap(), "identity");
+
+        let mut upstream = HeaderMap::new();
+        upstream.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(
+            copy_upstream_response_headers(&upstream)
+                .get(header::CONTENT_ENCODING)
+                .unwrap(),
+            "gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_body_failure_remains_a_body_failure() {
+        let body = upstream_body(stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
+            "truncated upstream",
+        ))]));
+        assert!(axum::body::to_bytes(body, 1024).await.is_err());
+    }
 }

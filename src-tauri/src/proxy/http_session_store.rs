@@ -59,6 +59,13 @@ impl HttpSessionStore {
     }
 
     fn get(&mut self, response_id: &str) -> Option<(HttpSessionEntry, SessionParent)> {
+        let expired = self.sessions.get(response_id).is_some_and(|stored| {
+            stored.last_accessed.elapsed() >= Duration::from_secs(SESSION_TTL_SECS)
+        });
+        if expired {
+            self.sessions.remove(response_id);
+            return None;
+        }
         let stored = self.sessions.get_mut(response_id)?;
         stored.last_accessed = Instant::now();
         let node = stored.node.clone();
@@ -194,6 +201,17 @@ pub struct PreparedSessionInput {
     pub reset_parent: bool,
 }
 
+fn items_semantically_equal(a: &Value, b: &Value) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    if let Some(object) = a.as_object_mut() {
+        object.remove("id");
+    }
+    if let Some(object) = b.as_object_mut() {
+        object.remove("id");
+    }
+    a == b
+}
 /// 合并请求历史，并在客户端回放完整历史时仅提取新增项。
 pub fn prepare_session_input(
     history: Vec<Value>,
@@ -220,28 +238,19 @@ pub fn prepare_session_input_with_storage(
     let replayed_through = if reset_parent || exact_replay {
         None
     } else {
-        let history_ids: std::collections::HashSet<&str> = history
-            .iter()
-            .filter_map(|item| item.get("id").and_then(Value::as_str))
-            .filter(|id| !id.is_empty())
-            .collect();
         new_input.iter().rposition(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| history_ids.contains(id))
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                return false;
+            };
+            history.iter().any(|history_item| {
+                history_item.get("id").and_then(Value::as_str) == Some(id)
+                    && items_semantically_equal(history_item, item)
+            })
         })
     };
 
-    // Helper: check if two input items are semantically equivalent (ignoring volatile fields like id)
-    let items_semantically_equal = |a: &Value, b: &Value| -> bool {
-        let role_a = a.get("role").and_then(Value::as_str);
-        let role_b = b.get("role").and_then(Value::as_str);
-        let type_a = a.get("type").and_then(Value::as_str);
-        let type_b = b.get("type").and_then(Value::as_str);
-        let content_a = a.get("content").or_else(|| a.get("text"));
-        let content_b = b.get("content").or_else(|| b.get("text"));
-        role_a == role_b && type_a == type_b && content_a == content_b
-    };
+    // IDs are generated afresh when clients replay a Responses history, but tool
+    // payloads (including call_id, name, arguments, and output) define its meaning.
 
     // Semantic prefix match: check if new_input starts with history semantically
     let semantic_prefix_match = !history.is_empty()
@@ -266,8 +275,8 @@ pub fn prepare_session_input_with_storage(
         None
     };
 
-    let (delta_source, use_new_input_as_merged) = if reset_parent || history.is_empty() {
-        (new_input.clone(), false)
+    let (delta_source, replace_parent) = if reset_parent || history.is_empty() {
+        (new_input.clone(), reset_parent)
     } else if exact_replay {
         (new_input[history.len()..].to_vec(), false)
     } else if semantic_prefix_match {
@@ -276,24 +285,11 @@ pub fn prepare_session_input_with_storage(
         (new_input[index + 1..].to_vec(), false)
     } else if let Some(index) = semantic_suffix_idx {
         (new_input[index + 1..].to_vec(), false)
-    } else if new_input.len() >= history.len() {
-        // [FIX #3382] Fallback protection:
-        // When the client sends full conversation history but formatting/IDs differed
-        // such that no boundary was identified, appending all of new_input to history
-        // would double the history (2x, 4x, ...). Instead, treat new_input as the authoritative
-        // current history, extracting the last element as delta.
-        tracing::warn!(
-            "[Session] Match failed but new_input (len: {}) >= history (len: {}). Preventing history duplication.",
-            new_input.len(),
-            history.len()
-        );
-        let delta_slice = if new_input.is_empty() {
-            Vec::new()
-        } else {
-            vec![new_input.last().unwrap().clone()]
-        };
-        (delta_slice, true)
     } else {
+        // A previous_response_id continuation commonly contains only a new user
+        // turn or tool result, so it has no replay boundary in the stored input.
+        // Only an explicit compaction above replaces its parent; otherwise append
+        // the unmatched input and retain every earlier turn.
         (new_input.clone(), false)
     };
 
@@ -303,10 +299,8 @@ pub fn prepare_session_input_with_storage(
     } else {
         Vec::new()
     };
-    let merged = if reset_parent || history.is_empty() {
+    let merged = if replace_parent || history.is_empty() {
         delta
-    } else if use_new_input_as_merged {
-        merge_history_with_new_input(Vec::new(), &[], new_input, tool_call_cache)
     } else {
         merge_history_with_new_input(history, &[], delta, tool_call_cache)
     };
@@ -314,7 +308,7 @@ pub fn prepare_session_input_with_storage(
     PreparedSessionInput {
         merged,
         delta: stored_delta,
-        reset_parent,
+        reset_parent: replace_parent,
     }
 }
 
@@ -607,19 +601,93 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_input_fallback_avoids_duplication_when_unmatched() {
+    fn prepare_session_input_appends_unmatched_continuation() {
         let history = vec![
             json!({"role": "user", "type": "message", "content": "msg 1"}),
             json!({"role": "assistant", "type": "message", "content": "msg 2"}),
         ];
-        // Client sends 2 different messages (length >= history)
         let new_input = vec![
             json!({"role": "user", "type": "message", "content": "different 1"}),
             json!({"role": "assistant", "type": "message", "content": "different 2"}),
         ];
 
-        let prepared = prepare_session_input(history, new_input, &HashMap::new());
-        // Should not duplicate to 4 items
+        let prepared = prepare_session_input(history.clone(), new_input.clone(), &HashMap::new());
+        assert!(!prepared.reset_parent);
+        assert_eq!(prepared.delta, new_input);
+        assert_eq!(prepared.merged, [history, prepared.delta].concat());
+    }
+
+    #[test]
+    fn tool_items_with_different_payloads_append_to_the_parent() {
+        let history = vec![json!({
+            "id": "old-call",
+            "type": "function_call",
+            "call_id": "call-a",
+            "name": "shell",
+            "arguments": "{\"command\":\"pwd\"}"
+        })];
+        let new_input = vec![
+            json!({
+                "id": "old-call",
+                "type": "function_call",
+                "call_id": "call-b",
+                "name": "shell",
+                "arguments": "{\"command\":\"ls\"}"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call-b",
+                "output": "file.txt"
+            }),
+        ];
+
+        let prepared = prepare_session_input(history, new_input.clone(), &HashMap::new());
+        assert!(!prepared.reset_parent);
+        assert_eq!(prepared.delta, new_input);
         assert_eq!(prepared.merged.len(), 2);
+        assert_eq!(prepared.merged[0]["call_id"], "call-b");
+        assert_eq!(prepared.merged[1]["call_id"], "call-b");
+    }
+
+    #[test]
+    fn explicit_compaction_replaces_parent_history() {
+        let mut store = HttpSessionStore::new();
+        store.insert("first".to_string(), entry("A"));
+        let (old, _parent) = store.get("first").expect("old history");
+        let replacement = vec![
+            json!({"type": "compaction", "summary": "C"}),
+            json!({"role": "user", "type": "message", "content": "D"}),
+        ];
+        let prepared = prepare_session_input(old.input_items, replacement.clone(), &HashMap::new());
+        assert!(prepared.reset_parent);
+        store.insert_delta(
+            "second".to_string(),
+            None,
+            prepared.delta,
+            vec![json!({"role": "assistant", "type": "message", "content": "E"})],
+            String::new(),
+            String::new(),
+            None,
+        );
+
+        let (stored, _) = store.get("second").expect("replacement history");
+        assert_eq!(
+            stored.input_items,
+            vec![
+                replacement[1].clone(),
+                json!({"role": "assistant", "type": "message", "content": "E"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_session_is_not_revived_by_lookup() {
+        let mut store = HttpSessionStore::new();
+        store.insert("expired".to_string(), entry("old"));
+        store.sessions.get_mut("expired").unwrap().last_accessed =
+            Instant::now() - Duration::from_secs(SESSION_TTL_SECS + 1);
+
+        assert!(store.get("expired").is_none());
+        assert!(!store.sessions.contains_key("expired"));
     }
 }

@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { RefreshCw, X, Bot } from 'lucide-react';
 import {
@@ -50,124 +50,110 @@ export function DroidSyncModal({ apiKey, getFormattedProxyUrl, onClose, onSyncDo
     const [previewModels, setPreviewModels] = useState<PreviewModelEntry[]>([]);
     const [expanded, setExpanded] = useState<Set<string>>(new Set());
     const [syncing, setSyncing] = useState(false);
-    const [configLoaded, setConfigLoaded] = useState(false);
-    const [currentConfig, setCurrentConfig] = useState<Record<string, unknown> | null>(null);
+    const [configState, setConfigState] = useState<'loading' | 'ready' | 'error'>('loading');
+    const [configError, setConfigError] = useState<string | null>(null);
 
     const sensors = useSensors(
         useSensor(PointerSensor, { activationConstraint: { distance: 3 } }),
         useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
     );
 
-    const rebuildPreview = useCallback((selectedIds: Set<string>, existingConfig: Record<string, unknown> | null) => {
+    const makeNewEntry = useCallback((modelId: string, index: number): PreviewModelEntry | null => {
+        const model = antigravityModels.find(candidate => candidate.id === modelId);
+        if (!model) return null;
         const base = getFormattedProxyUrl('Droid').replace(/\/+$/, '');
-        const existing = existingConfig ?? {};
-        const existingModels = Array.isArray((existing as Record<string, unknown>).customModels)
-            ? [...(existing as Record<string, unknown>).customModels as Record<string, unknown>[]]
-            : [];
-
-        const existingEntries: PreviewModelEntry[] = existingModels.map((m, i) => ({
-            ...(m as PreviewModelEntry),
-            _uid: `existing-${i}`,
-            isAg: ((m as Record<string, unknown>).id as string || '').startsWith('custom:AG-'),
-            index: i,
-        }));
-
-        const existingAgModels = new Set(existingEntries.filter(e => e.isAg).map(e => e.model));
-        const selected = antigravityModels.filter(m => selectedIds.has(m.id));
-        const newEntries: PreviewModelEntry[] = selected
-            .filter(m => {
-                const cfg = buildDroidModel(m.id, m.name);
-                return !existingAgModels.has(cfg.model);
-            })
-            .map((m, i) => {
-                const cfg = buildDroidModel(m.id, m.name);
-                const actualBase = cfg.provider === 'generic-chat-completion-api'
-                    ? (base.endsWith('/v1') ? base : `${base}/v1`) : base;
-                const entry: PreviewModelEntry = {
-                    _uid: `new-${i}`,
-                    model: cfg.model,
-                    id: `custom:${cfg.displayName.replace(/\s/g, '-')}`,
-                    index: 0,
-                    baseUrl: actualBase,
-                    apiKey: apiKey,
-                    displayName: cfg.displayName,
-                    noImageSupport: cfg.noImageSupport ?? false,
-                    provider: cfg.provider,
-                    isAg: true,
-                };
-                if ('maxOutputTokens' in cfg) entry.maxOutputTokens = cfg.maxOutputTokens;
-                if ('extraArgs' in cfg) entry.extraArgs = cfg.extraArgs;
-                return entry;
-            });
-
-        const merged = [...existingEntries, ...newEntries];
-        merged.forEach((m, i) => {
-            m.index = i;
-            if (m.isAg) m.id = `custom:${m.displayName.replace(/\s/g, '-')}-${i}`;
-        });
-        setPreviewModels(merged);
+        const config = buildDroidModel(model.id, model.name);
+        const baseUrl = config.provider === 'generic-chat-completion-api'
+            ? (base.endsWith('/v1') ? base : `${base}/v1`)
+            : base;
+        const entry: PreviewModelEntry = {
+            _uid: `new-${model.id}`,
+            model: config.model,
+            id: `custom:${config.displayName.replace(/\s/g, '-')}-${index}`,
+            index,
+            baseUrl,
+            apiKey,
+            displayName: config.displayName,
+            noImageSupport: config.noImageSupport ?? false,
+            provider: config.provider,
+            isAg: true,
+        };
+        if ('maxOutputTokens' in config) entry.maxOutputTokens = config.maxOutputTokens;
+        if ('extraArgs' in config) entry.extraArgs = config.extraArgs;
+        return entry;
     }, [antigravityModels, apiKey, getFormattedProxyUrl]);
 
-    // 初始加载 settings.json
-    if (!configLoaded) {
-        setConfigLoaded(true);
+    useEffect(() => {
+        let cancelled = false;
         invoke<string>('get_droid_config_content', {})
             .then(content => {
-                const parsed = JSON.parse(content);
-                setCurrentConfig(parsed);
-                rebuildPreview(new Set(), parsed);
+                const parsed: unknown = JSON.parse(content);
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    throw new Error('Droid settings must be a JSON object');
+                }
+                const customModels = (parsed as Record<string, unknown>).customModels;
+                if (customModels !== undefined && (
+                    !Array.isArray(customModels)
+                    || customModels.some(model => !model || typeof model !== 'object' || Array.isArray(model))
+                )) {
+                    throw new Error('Droid customModels must be an array of objects');
+                }
+                if (cancelled) return;
+                const entries = (customModels ?? []).map((model, index) => ({
+                    ...(model as PreviewModelEntry),
+                    _uid: `existing-${index}`,
+                    isAg: ((model as Record<string, unknown>).id as string | undefined)?.startsWith('custom:AG-') ?? false,
+                    index,
+                }));
+                setPreviewModels(entries);
+                setConfigState('ready');
             })
-            .catch(() => rebuildPreview(new Set(), null));
-    }
+            .catch(error => {
+                if (cancelled) return;
+                setConfigError(error instanceof Error ? error.message : String(error));
+                setConfigState('error');
+            });
+        return () => { cancelled = true; };
+    }, []);
 
     const reindexId = (id: string, newIdx: number) => id.replace(/-\d+$/, `-${newIdx}`);
 
-    const allSelected = antigravityModels.length > 0 && antigravityModels.every(m => selectedModels.has(m.id));
+    const allSelected = antigravityModels.length > 0 && antigravityModels.every(model => selectedModels.has(model.id));
     const toggleAll = () => {
-        const next = allSelected ? new Set<string>() : new Set(antigravityModels.map(m => m.id));
+        if (configState !== 'ready') return;
+        const next = allSelected ? new Set<string>() : new Set(antigravityModels.map(model => model.id));
         setSelectedModels(next);
-        rebuildPreview(next, currentConfig);
+        setPreviewModels(previous => {
+            // Existing AG entries remain part of the preview. Only create an
+            // addition when that model is not already retained; entries the user
+            // explicitly removed are absent and can still be deliberately added.
+            const existing = previous.filter(entry => !entry._uid.startsWith('new-'));
+            const retainedModelIds = new Set(existing.map(entry => entry.model));
+            const additions = [...next]
+                .filter(modelId => !retainedModelIds.has(modelId))
+                .map((modelId, offset) => makeNewEntry(modelId, existing.length + offset))
+                .filter((entry): entry is PreviewModelEntry => entry !== null);
+            return [...existing, ...additions].map((entry, index) => ({
+                ...entry, index, id: reindexId(entry.id, index),
+            }));
+        });
     };
 
-    const toggleModel = (modelListId: string) => {
-        const next = new Set(selectedModels);
-        const adding = !next.has(modelListId);
-        if (adding) next.add(modelListId); else next.delete(modelListId);
-        setSelectedModels(next);
-
-        if (adding) {
-            const m = antigravityModels.find(x => x.id === modelListId);
-            if (!m) return;
-            const base = getFormattedProxyUrl('Droid').replace(/\/+$/, '');
-            const cfg = buildDroidModel(m.id, m.name);
-            const actualBase = cfg.provider === 'generic-chat-completion-api'
-                ? (base.endsWith('/v1') ? base : `${base}/v1`) : base;
-            const newIdx = previewModels.length;
-            const entry: PreviewModelEntry = {
-                _uid: `new-${Date.now()}-${m.id}`,
-                model: cfg.model,
-                id: `custom:${cfg.displayName.replace(/\s/g, '-')}-${newIdx}`,
-                index: newIdx,
-                baseUrl: actualBase,
-                apiKey: apiKey,
-                displayName: cfg.displayName,
-                noImageSupport: cfg.noImageSupport ?? false,
-                provider: cfg.provider,
-                isAg: true,
-            };
-            if ('maxOutputTokens' in cfg) entry.maxOutputTokens = cfg.maxOutputTokens;
-            if ('extraArgs' in cfg) entry.extraArgs = cfg.extraArgs;
-            setPreviewModels([...previewModels, entry]);
-        } else {
-            const m = antigravityModels.find(x => x.id === modelListId);
-            if (!m) return;
-            const cfg = buildDroidModel(m.id, m.name);
-            setPreviewModels(
-                previewModels.filter(e => !(e.isAg && e.model === cfg.model)).map((m, i) => ({
-                    ...m, index: i, id: reindexId(m.id, i),
-                }))
-            );
-        }
+    const toggleModel = (modelId: string) => {
+        if (configState !== 'ready') return;
+        const adding = !selectedModels.has(modelId);
+        setSelectedModels(previous => {
+            const next = new Set(previous);
+            if (adding) next.add(modelId); else next.delete(modelId);
+            return next;
+        });
+        setPreviewModels(previous => {
+            const remaining = previous.filter(entry => !(entry._uid.startsWith('new-') && entry.model === modelId));
+            const entry = adding ? makeNewEntry(modelId, remaining.length) : null;
+            return (entry ? [...remaining, entry] : remaining).map((item, index) => ({
+                ...item, index, id: reindexId(item.id, index),
+            }));
+        });
     };
 
     const handleDragEnd = (event: DragEndEvent) => {
@@ -182,14 +168,21 @@ export function DroidSyncModal({ apiKey, getFormattedProxyUrl, onClose, onSyncDo
     };
 
     const handleRemoveModel = (uid: string) => {
-        setPreviewModels(
-            previewModels.filter(m => m._uid !== uid).map((m, i) => ({
-                ...m, index: i, id: reindexId(m.id, i),
-            }))
-        );
+        const removed = previewModels.find(model => model._uid === uid);
+        if (removed?.isAg) {
+            setSelectedModels(selected => {
+                const next = new Set(selected);
+                next.delete(removed.model);
+                return next;
+            });
+        }
+        setPreviewModels(previous => previous.filter(model => model._uid !== uid).map((model, index) => ({
+            ...model, index, id: reindexId(model.id, index),
+        })));
     };
 
     const executeDroidSync = async () => {
+        if (configState !== 'ready') return;
         if (!previewModels.some(m => m.isAg)) {
             showToast(t('proxy.droid_sync.toast.no_models_selected', { defaultValue: '请至少选择一个模型' }), 'error');
             return;
@@ -237,6 +230,16 @@ export function DroidSyncModal({ apiKey, getFormattedProxyUrl, onClose, onSyncDo
                         </button>
                     </div>
                 </div>
+                {configState === 'loading' && (
+                    <div className="px-5 py-2 text-xs text-gray-400 border-b border-gray-100 dark:border-base-200">
+                        {t('common.loading', { defaultValue: 'Loading configuration…' })}
+                    </div>
+                )}
+                {configState === 'error' && (
+                    <div className="px-5 py-2 text-xs text-red-600 bg-red-50 dark:bg-red-900/20 border-b border-red-100 dark:border-red-900/30">
+                        {t('proxy.droid_sync.config_read_error', { defaultValue: 'Unable to read Droid configuration: {{error}}', error: configError })}
+                    </div>
+                )}
 
                 {/* 模型选择区 */}
                 <div className="px-5 pb-3 shrink-0 border-b border-gray-100 dark:border-base-200">
@@ -245,7 +248,7 @@ export function DroidSyncModal({ apiKey, getFormattedProxyUrl, onClose, onSyncDo
                             {t('proxy.droid_sync.select_models', { defaultValue: '选择要添加的模型' })}
                             <span className="ml-2 text-gray-300">{selectedModels.size}/{antigravityModels.length}</span>
                         </span>
-                        <button onClick={toggleAll} className="text-[10px] text-blue-500 hover:text-blue-600 font-medium transition-colors">
+                        <button disabled={configState !== 'ready'} onClick={toggleAll} className="text-[10px] text-blue-500 hover:text-blue-600 font-medium transition-colors disabled:text-gray-300 disabled:cursor-not-allowed">
                             {allSelected ? t('common.deselect_all', { defaultValue: '取消全选' }) : t('common.select_all', { defaultValue: '全选' })}
                         </button>
                     </div>
@@ -261,6 +264,7 @@ export function DroidSyncModal({ apiKey, getFormattedProxyUrl, onClose, onSyncDo
                                             return (
                                                 <button
                                                     key={m.id}
+                                                    disabled={configState !== 'ready'}
                                                     onClick={() => toggleModel(m.id)}
                                                     className={cn(
                                                         "px-2.5 py-1 rounded-md text-[11px] font-medium transition-all duration-150 border",
@@ -333,7 +337,7 @@ export function DroidSyncModal({ apiKey, getFormattedProxyUrl, onClose, onSyncDo
                                 ? "bg-orange-500 hover:bg-orange-600 active:bg-orange-700 text-white shadow-sm"
                                 : "bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed"
                         )}
-                        disabled={!previewModels.some(m => m.isAg) || syncing}
+                        disabled={configState !== 'ready' || !previewModels.some(m => m.isAg) || syncing}
                         onClick={executeDroidSync}
                     >
                         <RefreshCw size={12} className={syncing ? 'animate-spin' : ''} />

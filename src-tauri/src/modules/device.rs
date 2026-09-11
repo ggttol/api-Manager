@@ -1,5 +1,5 @@
 use crate::models::DeviceProfile;
-use crate::modules::{logger, process};
+use crate::modules::{account, logger, process};
 use chrono::Local;
 use rand::{distributions::Alphanumeric, Rng};
 use rusqlite::Connection;
@@ -8,16 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const DATA_DIR: &str = ".antigravity_tools";
 const GLOBAL_BASELINE: &str = "device_original.json";
 
 fn get_data_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("failed_to_get_home_dir")?;
-    let data_dir = home.join(DATA_DIR);
-    if !data_dir.exists() {
-        fs::create_dir_all(&data_dir).map_err(|e| format!("failed_to_create_data_dir: {}", e))?;
-    }
-    Ok(data_dir)
+    account::get_data_dir()
 }
 
 /// Find storage.json path (prefer custom/portable paths)
@@ -237,8 +231,9 @@ pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(),
         .map_err(|e| format!("write_failed ({:?}): {}", storage_path, e))?;
     logger::log_info(&format!("device_profile_written to {:?}", storage_path));
 
-    // Sync ItemTable.storage.serviceMachineId in state.vscdb
-    let _ = sync_state_service_machine_id_value(&profile.dev_device_id);
+    // Keep the database adjacent to the supplied profile, rather than
+    // rediscovering a potentially different IDE installation.
+    let _ = sync_state_service_machine_id_value(storage_path, &profile.dev_device_id);
     Ok(())
 }
 
@@ -261,7 +256,7 @@ pub fn sync_service_machine_id(storage_path: &Path, service_id: &str) -> Result<
     fs::write(storage_path, updated).map_err(|e| format!("write_failed: {}", e))?;
     logger::log_info("service_machine_id_synced");
 
-    let _ = sync_state_service_machine_id_value(service_id);
+    let _ = sync_state_service_machine_id_value(storage_path, service_id);
     Ok(())
 }
 
@@ -314,11 +309,17 @@ pub fn sync_service_machine_id_from_storage(storage_path: &Path) -> Result<(), S
         logger::log_info("service_machine_id_added");
     }
 
-    sync_state_service_machine_id_value(&service_id)
+    sync_state_service_machine_id_value(storage_path, &service_id)
 }
 
-fn sync_state_service_machine_id_value(service_id: &str) -> Result<(), String> {
-    let db_path = get_state_db_path()?;
+fn sync_state_service_machine_id_value(
+    storage_path: &Path,
+    service_id: &str,
+) -> Result<(), String> {
+    let db_path = storage_path
+        .parent()
+        .ok_or_else(|| "failed_to_get_storage_parent_dir".to_string())?
+        .join("state.vscdb");
     if !db_path.exists() {
         logger::log_warn(&format!("state_db_missing: {:?}", db_path));
         return Ok(());

@@ -124,13 +124,15 @@ fn qualify_namespace_tool_name(namespace_name: &str, child_name: &str) -> String
     if child.is_empty() || ns.is_empty() || child.starts_with("mcp__") {
         return child.to_string();
     }
-    if child.starts_with(ns) {
+    let namespace_prefix = if ns.ends_with("__") {
+        ns.to_string()
+    } else {
+        format!("{ns}__")
+    };
+    if child.starts_with(&namespace_prefix) {
         return child.to_string();
     }
-    if ns.ends_with("__") {
-        return format!("{}{}", ns, child);
-    }
-    format!("{}__{}", ns, child)
+    format!("{namespace_prefix}{child}")
 }
 
 fn flatten_tools(tools: &[Value]) -> Vec<Value> {
@@ -173,6 +175,30 @@ fn flatten_tools(tools: &[Value]) -> Vec<Value> {
     flat
 }
 
+fn source_tool_name(tool: &Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .or_else(|| tool.get("name"))
+        .and_then(Value::as_str)
+}
+
+fn emitted_tool_name(name: &str) -> Option<String> {
+    match name {
+        "web_search" | "google_search" | "web_search_20250305" | "builtin_web_search" => None,
+        "local_shell_call" => Some("shell".to_string()),
+        _ => Some(name.to_string()),
+    }
+}
+
+fn declaration_emitted_name(tool: &Value) -> Option<String> {
+    source_tool_name(tool).and_then(emitted_tool_name)
+}
+
+fn is_custom_patch_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("custom")
+        && source_tool_name(tool).is_some_and(is_apply_patch_tool_name)
+}
+
 pub fn extract_client_tool_names(tools: &Option<Vec<Value>>) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     if let Some(tools_list) = tools {
@@ -199,6 +225,55 @@ pub fn extract_client_tool_names(tools: &Option<Vec<Value>>) -> std::collections
         }
     }
     names
+}
+
+/// Rejects named tool choices that cannot be enforced against this request's
+/// declared functions. The mapper itself remains infallible for compatibility,
+/// so endpoint owners must invoke this before calling `transform_openai_request`.
+pub fn validate_openai_tool_choice(request: &OpenAIRequest) -> Result<(), String> {
+    let Some(choice) = request
+        .tool_choice
+        .as_ref()
+        .filter(|choice| choice.is_object())
+    else {
+        return Ok(());
+    };
+
+    if choice.get("type").and_then(Value::as_str) != Some("function") {
+        return Err(format!(
+            "Unsupported named tool_choice type '{}'",
+            choice
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        ));
+    }
+
+    let selected_name = match choice.get("function") {
+        Some(Value::Object(function)) => function.get("name").and_then(Value::as_str),
+        Some(_) => None,
+        None => choice.get("name").and_then(Value::as_str),
+    }
+    .filter(|name| !name.trim().is_empty())
+    .ok_or_else(|| "Named function tool_choice requires a non-empty function name".to_string())?;
+    let selected_emitted_name = emitted_tool_name(selected_name)
+        .ok_or_else(|| format!("tool_choice selects unavailable function '{selected_name}'"))?;
+
+    let declared = request
+        .tools
+        .as_deref()
+        .map(flatten_tools)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| declaration_emitted_name(&tool))
+        .any(|emitted_name| emitted_name == selected_emitted_name);
+    if declared {
+        Ok(())
+    } else {
+        Err(format!(
+            "tool_choice selects undeclared function '{selected_name}'"
+        ))
+    }
 }
 
 pub fn transform_openai_request(
@@ -299,11 +374,15 @@ pub fn transform_openai_request_with_session(
         .as_ref()
         .map(|t| t.thinking_type.as_deref() == Some("enabled"))
         .unwrap_or(false);
+    let user_disabled_thinking = request
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type.as_deref() == Some("disabled"));
     let user_thinking_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
 
     let is_claude_model = mapped_model_lower.contains("claude");
-    let is_claude_thinking = mapped_model_lower.ends_with("-thinking")
-        || (is_claude_model && user_enabled_thinking);
+    let is_claude_thinking =
+        mapped_model_lower.ends_with("-thinking") || (is_claude_model && user_enabled_thinking);
     let is_thinking_model = is_gemini_3_thinking || is_claude_thinking || is_gemini_flash_thinking;
 
     // [NEW] 检查历史消息是否兼容思维模型 (是否有 Assistant 消息缺失 reasoning_content)
@@ -327,7 +406,8 @@ pub fn transform_openai_request_with_session(
     // Claude 上游严格要求每个 thinking 块必须有真实签名且不支持哨兵签名，
     // 注入无签名占位块必触发 400 thinking.signature: Field required。
     // 因此对于带有不兼容历史的 Claude 思考请求，安全降级为不开启 thinking。
-    let mut actual_include_thinking = is_thinking_model || user_enabled_thinking;
+    let mut actual_include_thinking =
+        (is_thinking_model || user_enabled_thinking) && !user_disabled_thinking;
 
     // [REFACTORED] 使用 SignatureCache 获取 Session 级别的签名
     let session_thought_sig = signature_read_key
@@ -713,13 +793,11 @@ pub fn transform_openai_request_with_session(
                         }
                     });
 
-                    // [New] 递归清理参数中可能存在的非法校验字段
-                    crate::proxy::common::json_schema::clean_json_schema(&mut func_call_part);
 
                     if let Some(ref sig) = thought_sig {
                         func_call_part["thoughtSignature"] = json!(sig);
                         func_call_part["thought_signature"] = json!(sig);
-                    } else if is_thinking_model || is_gemini_flash_thinking {
+                    } else if is_gemini_3_thinking || is_gemini_flash_thinking {
                         // [NEW] Handle missing signature for Gemini thinking models
                         // [FIX #1650] Allow sentinel injection for Vertex AI (projects/...) as well
                         // [FIX #2167] Also applies to gemini-3-flash / gemini-3.1-flash
@@ -833,7 +911,7 @@ pub fn transform_openai_request_with_session(
     // [FIX #1575] 针对思维模型的历史故障恢复
     // 在带有工具的历史记录中，剥离旧的思考块，防止 API 因签名失效或结构冲突报 400
     let mut contents = contents;
-    if actual_include_thinking && has_tool_history {
+    if user_disabled_thinking || (actual_include_thinking && has_tool_history) {
         tracing::debug!("[OpenAI-Thinking] Applied thinking recovery (stripping old thought blocks) for tool history");
         contents = super::thinking_recovery::strip_all_thinking_blocks(contents);
     }
@@ -865,7 +943,12 @@ pub fn transform_openai_request_with_session(
             "role": "user",
             "parts": [{ "text": "Continue" }]
         }));
-    } else if contents.first().and_then(|f| f.get("role")).and_then(|r| r.as_str()) == Some("model") {
+    } else if contents
+        .first()
+        .and_then(|f| f.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("model")
+    {
         contents.insert(
             0,
             json!({
@@ -1013,7 +1096,7 @@ pub fn transform_openai_request_with_session(
 
     // Tiered Flash models select the upstream thinking level directly. This intentionally
     // replaces the budget-based config above and leaves the upstream model ID untouched.
-    if is_tiered_flash_model(mapped_model) {
+    if is_tiered_flash_model(mapped_model) && !user_disabled_thinking {
         let mut thinking_config = json!({ "includeThoughts": true });
         if let Some(level) = tiered_flash_thinking_level(
             request
@@ -1102,7 +1185,7 @@ pub fn transform_openai_request_with_session(
         let raw_json = serde_json::to_string(original_tools).unwrap_or_default();
         if !raw_json.is_empty() {
             let key = crate::proxy::cache_manager::CacheManager::compute_tools_key(&format!(
-                "apply_patch_input_schema_v2:{raw_json}"
+                "apply_patch_input_schema_v3:{raw_json}"
             ));
             let cm = crate::proxy::cache_manager::global_cache_manager();
             if let Some(cached_json) = cm.lookup_tools(&key) {
@@ -1128,6 +1211,8 @@ pub fn transform_openai_request_with_session(
         if let Some(original_tools) = &request.tools {
             let tools = flatten_tools(original_tools);
             for tool in tools.iter() {
+                let is_custom_patch = is_custom_patch_tool(tool);
+                let is_custom_tool = tool.get("type").and_then(Value::as_str) == Some("custom");
                 let mut gemini_func = if let Some(func) = tool.get("function") {
                     func.clone()
                 } else {
@@ -1158,18 +1243,12 @@ pub fn transform_openai_request_with_session(
                     .map(|s| s.to_string());
 
                 if let Some(name) = &name_opt {
-                    // 跳过内置联网工具名称，避免重复定义
-                    if name == "web_search"
-                        || name == "google_search"
-                        || name == "web_search_20250305"
-                        || name == "builtin_web_search"
-                    {
+                    let Some(emitted_name) = emitted_tool_name(name) else {
                         continue;
-                    }
-
-                    if name == "local_shell_call" {
+                    };
+                    if emitted_name != *name {
                         if let Some(obj) = gemini_func.as_object_mut() {
-                            obj.insert("name".to_string(), json!("shell"));
+                            obj.insert("name".to_string(), json!(emitted_name));
                         }
                     }
                 } else {
@@ -1196,7 +1275,7 @@ pub fn transform_openai_request_with_session(
                     *obj = clean_obj;
                 }
 
-                if gemini_func.get("name").and_then(|v| v.as_str()) == Some("apply_patch") {
+                if is_custom_patch {
                     gemini_func.as_object_mut().unwrap().insert(
                         "parameters".to_string(),
                         json!({
@@ -1225,7 +1304,7 @@ pub fn transform_openai_request_with_session(
 
                     // 递归转换 type 为大写 (符合 Protobuf 定义)
                     enforce_uppercase_types(params);
-                } else {
+                } else if is_custom_tool {
                     gemini_func.as_object_mut().unwrap().insert(
                         "parameters".to_string(),
                         json!({
@@ -1233,10 +1312,18 @@ pub fn transform_openai_request_with_session(
                             "properties": {
                                 "content": {
                                     "type": "STRING",
-                                    "description": "The raw content or patch to be applied"
+                                    "description": "The raw content to be applied"
                                 }
                             },
                             "required": ["content"]
+                        }),
+                    );
+                } else {
+                    gemini_func.as_object_mut().unwrap().insert(
+                        "parameters".to_string(),
+                        json!({
+                            "type": "OBJECT",
+                            "properties": {}
                         }),
                     );
                 }
@@ -1270,28 +1357,60 @@ pub fn transform_openai_request_with_session(
     // Removed auto-inject since we handle it above now if Codex passes it.
 
     if !function_declarations.is_empty() {
-        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations }]);
+        inner_request["tools"] = json!([{ "functionDeclarations": function_declarations.clone() }]);
 
         let mut mode = "VALIDATED";
+        let selected_function = request.tool_choice.as_ref().and_then(|tool_choice| {
+            tool_choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .or_else(|| tool_choice.get("name"))
+                .and_then(Value::as_str)
+                .and_then(emitted_tool_name)
+        });
         if let Some(tool_choice) = &request.tool_choice {
-            if let Some(s) = tool_choice.as_str() {
-                match s {
-                    "none" => mode = "NONE",
-                    "auto" => mode = "AUTO",
-                    "required" => mode = "ANY",
-                    _ => mode = "ANY",
-                }
+            if let Some(choice) = tool_choice.as_str() {
+                mode = match choice {
+                    "none" => "NONE",
+                    "auto" => "AUTO",
+                    "required" => "ANY",
+                    _ => "ANY",
+                };
             } else {
                 mode = "ANY";
             }
         }
 
+        let allowed_function_names: Vec<String> = selected_function
+            .filter(|selected| {
+                function_declarations.iter().any(|declaration| {
+                    declaration.get("name").and_then(Value::as_str) == Some(selected.as_str())
+                })
+            })
+            .into_iter()
+            .collect();
+        let function_calling_config = if allowed_function_names.is_empty() {
+            json!({ "mode": mode })
+        } else {
+            json!({
+                "mode": "ANY",
+                "allowedFunctionNames": allowed_function_names,
+            })
+        };
+        let function_calling_config_snake = if allowed_function_names.is_empty() {
+            json!({ "mode": mode })
+        } else {
+            json!({
+                "mode": "ANY",
+                "allowed_function_names": allowed_function_names,
+            })
+        };
         inner_request["toolConfig"] = json!({
-            "functionCallingConfig": { "mode": mode },
+            "functionCallingConfig": function_calling_config,
             "includeServerSideToolInvocations": true
         });
         inner_request["tool_config"] = json!({
-            "function_calling_config": { "mode": mode },
+            "function_calling_config": function_calling_config_snake,
             "include_server_side_tool_invocations": true
         });
     }
@@ -1368,8 +1487,7 @@ pub fn transform_openai_request_with_session(
     //   - 不同对话使用不同 sessionId,避免共享同一服务端累计会话
     //   - 检测到上游 1M 累计报错后 bump 代数,新 sessionId = 全新上游会话,对话无感恢复
     if let Some(t) = token {
-        let generation =
-            crate::proxy::common::session::current_bump(&t.account_id, &session_id);
+        let generation = crate::proxy::common::session::current_bump(&t.account_id, &session_id);
         inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
             &t.account_id,
             &session_id,
@@ -1506,6 +1624,62 @@ fn enforce_uppercase_types(value: &mut Value) {
 mod tests {
     use super::*;
     use crate::proxy::mappers::openai::models::*;
+
+    #[test]
+    fn explicit_thinking_disable_preserves_tools_without_claude_sentinels() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-6-thinking",
+            "thinking": { "type": "disabled" },
+            "tools": [{ "type": "function", "function": {
+                "name": "echo", "parameters": { "type": "object" }
+            }}],
+            "messages": [
+                { "role": "user", "content": "Inspect the payload" },
+                { "role": "assistant", "content": "Checking", "reasoning_content": "private",
+                  "tool_calls": [{ "id": uuid::Uuid::new_v4().to_string(), "type": "function",
+                    "function": { "name": "echo", "arguments": "{\"thought\":true,\"thinking\":7}" }
+                  }] },
+                { "role": "user", "content": "Continue" }
+            ]
+        }))
+        .unwrap();
+        let body = transform_openai_request(&request, "test-project", &request.model, None).0;
+        assert!(body["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_none());
+        let parts: Vec<&Value> = body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .collect();
+        assert!(parts
+            .iter()
+            .all(|part| part.get("thought") != Some(&Value::Bool(true))));
+        let call = parts
+            .iter()
+            .find(|part| part.get("functionCall").is_some())
+            .unwrap();
+        assert_eq!(
+            call["functionCall"]["args"],
+            json!({"thought":true,"thinking":7})
+        );
+        assert!(call.get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn explicit_thinking_disable_overrides_tiered_flash_defaults() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash-tiered",
+            "thinking": { "type": "disabled" },
+            "messages": [{"role":"user","content":"Answer directly"}]
+        }))
+        .unwrap();
+        let body = transform_openai_request(&request, "test-project", &request.model, None).0;
+        assert!(body["request"]["generationConfig"]
+            .get("thinkingConfig")
+            .is_none());
+    }
 
     fn tiered_request_body(model: &str, effort: Option<&str>) -> Value {
         let mut raw = json!({
@@ -1709,16 +1883,15 @@ mod tests {
     #[test]
     fn test_issue_1602_custom_mode_gemini_capping() {
         // [FIX #1602] Regression test for custom mode capping
-        use crate::proxy::config::{
-            update_thinking_budget_config, ThinkingBudgetConfig, ThinkingBudgetMode,
-        };
+        use crate::proxy::config::{ThinkingBudgetConfig, ThinkingBudgetMode};
 
         // 设置自定义模式，且数值超过 24k
-        update_thinking_budget_config(ThinkingBudgetConfig {
-            mode: ThinkingBudgetMode::Custom,
-            custom_value: 32000,
-            effort: None,
-        });
+        let _thinking_budget =
+            crate::proxy::config::override_thinking_budget_config_for_test(ThinkingBudgetConfig {
+                mode: ThinkingBudgetMode::Custom,
+                custom_value: 32000,
+                effort: None,
+            });
 
         let req = OpenAIRequest {
             model: "gemini-2.0-flash-thinking".to_string(),
@@ -1765,9 +1938,6 @@ mod tests {
         // 如果不是 gemini模型且协议中没带 thinking 配置，可能会是 None 或 32000
         // 在该测试环境下，由于模拟的是 OpenAI 格式转 Gemini 路径，如果没有 gemini 关键词通常不进入 thinking 逻辑
         // 我们只需确保 gemini 路径正确受限即可。
-
-        // 恢复默认配置
-        update_thinking_budget_config(ThinkingBudgetConfig::default());
     }
 
     #[test]
@@ -1822,11 +1992,15 @@ mod tests {
                 role: "user".to_string(),
                 refusal: None,
                 content: Some(OpenAIContent::Array(vec![
-                    OpenAIContentBlock::Text { text: "Describe this video".to_string() },
-                    OpenAIContentBlock::VideoUrl { video_url: OpenAIVideoUrl {
-                        url: "data:video/mp4;base64,AAAA".to_string(),
-                        mime_type: None,
-                    } }
+                    OpenAIContentBlock::Text {
+                        text: "Describe this video".to_string(),
+                    },
+                    OpenAIContentBlock::VideoUrl {
+                        video_url: OpenAIVideoUrl {
+                            url: "data:video/mp4;base64,AAAA".to_string(),
+                            mime_type: None,
+                        },
+                    },
                 ])),
                 reasoning_content: None,
                 tool_calls: None,
@@ -1845,10 +2019,7 @@ mod tests {
             parts[1]["inlineData"]["mimeType"].as_str().unwrap(),
             "video/mp4"
         );
-        assert_eq!(
-            parts[1]["inlineData"]["data"].as_str().unwrap(),
-            "AAAA"
-        );
+        assert_eq!(parts[1]["inlineData"]["data"].as_str().unwrap(), "AAAA");
     }
 
     #[test]
@@ -1881,11 +2052,13 @@ mod tests {
         };
 
         // Set passthrough mode so user-specified budget is retained
-        crate::proxy::config::update_thinking_budget_config(crate::proxy::config::ThinkingBudgetConfig {
-            mode: crate::proxy::config::ThinkingBudgetMode::Passthrough,
-            custom_value: 16000,
-            effort: None,
-        });
+        let _thinking_budget = crate::proxy::config::override_thinking_budget_config_for_test(
+            crate::proxy::config::ThinkingBudgetConfig {
+                mode: crate::proxy::config::ThinkingBudgetMode::Passthrough,
+                custom_value: 16000,
+                effort: None,
+            },
+        );
 
         // Pass explicit gemini-3-pro-preview which doesn't have "-thinking" suffix
         let (result, _sid, _msg_count, _) =
@@ -1903,9 +2076,6 @@ mod tests {
             .unwrap();
         // Should use user budget (16000)
         assert_eq!(budget, 16000);
-
-        // Restore default Auto mode
-        crate::proxy::config::update_thinking_budget_config(crate::proxy::config::ThinkingBudgetConfig::default());
     }
     #[test]
     fn test_gemini_3_pro_image_not_thinking() {
@@ -1985,7 +2155,7 @@ mod tests {
 
     #[test]
     fn test_flash_thinking_budget_capping() {
-        crate::proxy::config::update_thinking_budget_config(
+        let _thinking_budget = crate::proxy::config::override_thinking_budget_config_for_test(
             crate::proxy::config::ThinkingBudgetConfig::default(),
         );
 
@@ -2145,7 +2315,7 @@ mod tests {
     #[test]
     fn test_openai_image_thinking_mode_disabled() {
         // 1. Set global mode to disabled
-        crate::proxy::config::update_image_thinking_mode(Some("disabled".to_string()));
+        let _image_mode = crate::proxy::config::override_image_thinking_mode_for_test("disabled");
 
         let req = OpenAIRequest {
             model: "gemini-3-pro-image".to_string(),
@@ -2176,9 +2346,6 @@ mod tests {
         let thinking_config = gen_config["thinkingConfig"].as_object().unwrap();
 
         assert_eq!(thinking_config["includeThoughts"], false);
-
-        // 4. Reset global mode
-        crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
     }
 
     #[test]
@@ -2270,7 +2437,8 @@ mod tests {
         });
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
-        let (res_val, _sid, _msg_count, _) = transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
+        let (res_val, _sid, _msg_count, _) =
+            transform_openai_request(&request, "test-v", "gemini-2.5-flash", None);
         let gen_config = &res_val["request"]["generationConfig"];
         assert_eq!(gen_config["responseMimeType"], "application/json");
         assert!(gen_config.get("responseSchema").is_some());
@@ -2329,8 +2497,13 @@ mod tests {
             .find(|m| m["role"] == "model")
             .expect("Should have model message");
         let parts = assistant_msg["parts"].as_array().unwrap();
-        let has_thought_part = parts.iter().any(|p| p.get("thought") == Some(&serde_json::json!(true)));
-        assert!(!has_thought_part, "Should not inject placeholder thinking block into assistant message for Claude");
+        let has_thought_part = parts
+            .iter()
+            .any(|p| p.get("thought") == Some(&serde_json::json!(true)));
+        assert!(
+            !has_thought_part,
+            "Should not inject placeholder thinking block into assistant message for Claude"
+        );
     }
 
     #[test]
@@ -2369,8 +2542,11 @@ mod tests {
         });
 
         let request: OpenAIRequest = serde_json::from_value(raw_json).unwrap();
-        let (res_val, _sid, _msg_count, _) = transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None);
-        let contents = res_val["request"]["contents"].as_array().expect("contents must be an array");
+        let (res_val, _sid, _msg_count, _) =
+            transform_openai_request(&request, "test-v", "gemini-3.8-flash-high", None);
+        let contents = res_val["request"]["contents"]
+            .as_array()
+            .expect("contents must be an array");
 
         // First turn MUST be user
         assert_eq!(contents[0]["role"], "user");
@@ -2378,13 +2554,174 @@ mod tests {
 
         // Second turn MUST be model with functionCall
         assert_eq!(contents[1]["role"], "model");
-        let has_func_call = contents[1]["parts"].as_array().unwrap().iter().any(|p| p.get("functionCall").is_some());
+        let has_func_call = contents[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.get("functionCall").is_some());
         assert!(has_func_call);
 
         // Third turn MUST be user with functionResponse
         assert_eq!(contents[2]["role"], "user");
-        let has_func_resp = contents[2]["parts"].as_array().unwrap().iter().any(|p| p.get("functionResponse").is_some());
+        let has_func_resp = contents[2]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.get("functionResponse").is_some());
         assert!(has_func_resp);
     }
-}
+    #[test]
+    fn named_tool_choice_must_select_a_declared_function() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-test",
+            "messages": [{"role": "user", "content": "read"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "safe_read",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "safe_read"}}
+        }))
+        .expect("request fixture");
+        assert!(validate_openai_tool_choice(&request).is_ok());
 
+        let unknown: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-test",
+            "messages": [{"role": "user", "content": "write"}],
+            "tools": request.tools,
+            "tool_choice": {"type": "function", "function": {"name": "destructive_write"}}
+        }))
+        .expect("request fixture");
+        assert!(validate_openai_tool_choice(&unknown)
+            .expect_err("unknown named tool must fail")
+            .contains("undeclared"));
+    }
+
+    #[test]
+    fn named_choice_uses_the_emitted_declaration_name() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-test",
+            "messages": [{"role": "user", "content": "run"}],
+            "tools": [
+                {"type": "function", "function": {"name": "local_shell_call", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "destructive_write", "parameters": {"type": "object"}}}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "local_shell_call"}}
+        }))
+        .expect("request fixture");
+
+        assert!(validate_openai_tool_choice(&request).is_ok());
+        let (body, _, _, _) =
+            transform_openai_request(&request, "test-project", "gemini-test", None);
+        let declarations = &body["request"]["tools"][0]["functionDeclarations"];
+        assert!(declarations
+            .as_array()
+            .expect("declarations")
+            .iter()
+            .any(|declaration| declaration["name"] == "shell"));
+        assert_eq!(
+            body["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["shell"])
+        );
+    }
+
+    #[test]
+    fn function_declarations_preserve_zero_args_and_ordinary_patch_schemas() {
+        let request: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-test",
+            "messages": [{"role": "user", "content": "run"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_status", "description": "status"}},
+                {"type": "function", "function": {
+                    "name": "apply_patch",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "diff": {"type": "string"}
+                        },
+                        "required": ["path", "diff"]
+                    }
+                }},
+                {"type": "custom", "name": "apply_patch"}
+            ]
+        }))
+        .expect("request fixture");
+
+        let (body, _, _, _) =
+            transform_openai_request(&request, "test-project", "gemini-test", None);
+        let declarations = body["request"]["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("declarations");
+        let status = declarations
+            .iter()
+            .find(|declaration| declaration["name"] == "get_status")
+            .expect("status declaration");
+        assert_eq!(
+            status["parameters"],
+            json!({"type": "OBJECT", "properties": {}})
+        );
+        let ordinary_patch = declarations
+            .iter()
+            .find(|declaration| {
+                declaration["name"] == "apply_patch"
+                    && declaration["parameters"]["properties"]
+                        .get("path")
+                        .is_some()
+            })
+            .expect("ordinary patch declaration");
+        assert_eq!(
+            ordinary_patch["parameters"]["required"],
+            json!(["path", "diff"])
+        );
+        let custom_patch = declarations
+            .iter()
+            .find(|declaration| {
+                declaration["parameters"]["properties"]
+                    .get("input")
+                    .is_some()
+            })
+            .expect("custom patch declaration");
+        assert_eq!(custom_patch["name"], "apply_patch");
+    }
+
+    #[test]
+    fn namespace_qualification_requires_its_delimiter() {
+        assert_eq!(
+            qualify_namespace_tool_name("file", "file_search"),
+            "file__file_search"
+        );
+        assert_eq!(
+            qualify_namespace_tool_name("file", "file__search"),
+            "file__search"
+        );
+        assert_eq!(
+            qualify_namespace_tool_name("file", "mcp__search"),
+            "mcp__search"
+        );
+    }
+
+    #[test]
+    fn malformed_named_tool_choices_are_rejected() {
+        for tool_choice in [
+            json!({"type": "function", "function": {}}),
+            json!({"type": "function", "function": {"name": ""}}),
+            json!({"type": "function", "function": {"name": 42}}),
+            json!({"type": "other", "function": {"name": "safe_read"}}),
+        ] {
+            let request: OpenAIRequest = serde_json::from_value(json!({
+                "model": "gemini-test",
+                "messages": [{"role": "user", "content": "read"}],
+                "tools": [
+                    {"type": "function", "function": {"name": "safe_read"}},
+                    {"type": "function", "function": {"name": "destructive_write"}}
+                ],
+                "tool_choice": tool_choice
+            }))
+            .expect("request fixture");
+            assert!(validate_openai_tool_choice(&request).is_err());
+        }
+    }
+}

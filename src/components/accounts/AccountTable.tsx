@@ -407,10 +407,10 @@ function AccountRowContent({
                 };
             }).filter((item): item is { id: string; label: string; protectedKey: string; data: ModelQuota | undefined } => item !== null)
     ).filter(m => {
-            // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
-            const isHiddenThinking = m.id.includes('thinking');
-
-            if (isHiddenThinking) return false;
+            const isPinnedThinking = pinnedModels.some((model) => model.toLowerCase() === m.id);
+            if (m.id.includes('thinking') && !showAllQuotas && !isPinnedThinking) {
+                return false;
+            }
 
             // 基于标签去重 (例如 G3.1 Pro 只显示一次)
             // 优先显示有配额数据的 ID
@@ -801,7 +801,7 @@ function AccountTable({
                                 <input
                                     type="checkbox"
                                     className="checkbox checkbox-sm rounded border-2 border-gray-400 dark:border-gray-500 checked:border-blue-600 checked:bg-blue-600 [--chkbg:theme(colors.blue.600)] [--chkfg:white]"
-                                    checked={accounts.length > 0 && selectedIds.size === accounts.length}
+                                    checked={accounts.length > 0 && accounts.every((account) => selectedIds.has(account.id))}
                                     onChange={onToggleAll}
                                 />
                             </th>

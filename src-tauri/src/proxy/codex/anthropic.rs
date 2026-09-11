@@ -909,18 +909,29 @@ fn usage(response: &Value, provisional: bool) -> Result<Value, CodexError> {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .ok_or_else(|| CodexError::upstream("Codex response is missing output token usage"))?;
-    let cached = value
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if cached > input {
+    let cached = match value.pointer("/input_tokens_details/cached_tokens") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| CodexError::upstream("Invalid Codex cached token usage"))?,
+    };
+    let cache_write = match value.pointer("/input_tokens_details/cache_write_tokens") {
+        None => 0,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| CodexError::upstream("Invalid Codex cache-write token usage"))?,
+    };
+    let non_input = cached
+        .checked_add(cache_write)
+        .ok_or_else(|| CodexError::upstream("Codex cache token usage overflows input tokens"))?;
+    if non_input > input {
         return Err(CodexError::upstream(
-            "Codex cached token usage exceeds input tokens",
+            "Codex cache token usage exceeds input tokens",
         ));
     }
-    // Responses input_tokens INCLUDES cache reads; Anthropic input_tokens EXCLUDES them.
-    // Output tokens already include reasoning; never add reasoning_tokens again.
-    let mut mapped = json!({"input_tokens":input-cached, "output_tokens":output, "cache_creation_input_tokens":0, "cache_read_input_tokens":cached});
+    // Responses input_tokens includes cache reads and writes; Anthropic input_tokens excludes
+    // both categories. Output tokens already include reasoning.
+    let mut mapped = json!({"input_tokens":input-non_input, "output_tokens":output, "cache_creation_input_tokens":cache_write, "cache_read_input_tokens":cached});
     if let Some(count) = response.pointer("/tool_usage/web_search/num_requests") {
         let count = count
             .as_u64()
@@ -938,6 +949,26 @@ fn usage(response: &Value, provisional: bool) -> Result<Value, CodexError> {
     }
     Ok(mapped)
 }
+fn native_error(value: &Value, fallback: &'static str) -> CodexError {
+    let error = value
+        .get("error")
+        .filter(|error| error.is_object())
+        .unwrap_or(value);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(fallback);
+    match error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
+    {
+        Some("context_length_exceeded" | "invalid_prompt") => CodexError::bad_request(message),
+        _ => CodexError::upstream(message),
+    }
+}
+
 fn stop_reason(response: &Value, tools: bool) -> Result<&'static str, CodexError> {
     match response.get("status").and_then(Value::as_str) {
         Some("completed") => Ok(if tools { "tool_use" } else { "end_turn" }),
@@ -949,12 +980,7 @@ fn stop_reason(response: &Value, tools: bool) -> Result<&'static str, CodexError
         {
             Ok("max_tokens")
         }
-        Some("failed") => Err(CodexError::upstream(
-            response
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Codex response failed"),
-        )),
+        Some("failed") => Err(native_error(response, "Codex response failed")),
         Some("incomplete") => Err(CodexError::upstream(
             "Codex response was incomplete for a reason other than the output limit",
         )),
@@ -1458,18 +1484,9 @@ impl StreamMapper {
                 self.terminal = true;
             }
             "response.failed" => {
-                stop_reason(&event["response"], false)?;
-                return Err(CodexError::upstream("Codex response failed"));
+                return Err(native_error(&event["response"], "Codex response failed"))
             }
-            "error" => {
-                return Err(CodexError::upstream(
-                    event
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .or_else(|| event.pointer("/error/message").and_then(Value::as_str))
-                        .unwrap_or("Codex upstream stream failed"),
-                ))
-            }
+            "error" => return Err(native_error(event, "Codex upstream stream failed")),
             // Codex's private reasoning is not Anthropic signed thinking. The complete reasoning
             // item is retained at item.done/terminal, never emitted or accepted from the caller.
             kind if kind.starts_with("response.reasoning") => {}
@@ -1516,7 +1533,16 @@ pub(super) async fn respond(
             (status, value)
         };
         record.tokens.redact(&mut value);
+        if !is_sse {
+            relay::observe_terminal_event(&manager, &account, &value).await?;
+        }
         if !status.is_success() {
+            if is_sse {
+                let mut response =
+                    error_response(native_error(&value, "Codex upstream stream failed"));
+                response.headers_mut().extend(headers);
+                return Ok(response);
+            }
             return Ok(relay::json_response(
                 status,
                 headers,
@@ -1586,6 +1612,7 @@ pub(super) async fn respond(
             for mut event in events {
                 record.tokens.redact(&mut event);
                 let result = async {
+                    relay::observe_terminal_event(&manager, &account, &event).await?;
                     if let Some(response) = event.get("response") { relay::remember_response(&manager, &scope, &account, response).await?; }
                     let events = mapper.event(&event)?;
                     if mapper.terminal {
@@ -1701,6 +1728,66 @@ mod tests {
                 Some(fixture.first.as_str())
             );
         }
+    }
+    #[tokio::test]
+    async fn collected_native_messages_error_keeps_client_error_classification() {
+        let fixture = Fixture::new(vec![Reply::sse(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"invalid input\"}}\n\n",
+        )])
+        .await;
+        let response = messages_inner(
+            fixture.manager.clone(),
+            HeaderMap::new(),
+            Ok(Json(request(json!([{"role":"user","content":"Hello"}])))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), relay::MAX_COLLECTED)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(value["error"]["message"], "invalid input");
+    }
+
+    #[tokio::test]
+    async fn messages_json_failed_quota_response_cools_the_selected_account() {
+        let fixture = Fixture::new(vec![
+            Reply::json(json!({
+                "id":"failed-response",
+                "status":"failed",
+                "error":{"code":"usage_limit_reached","message":"quota exhausted"}
+            })),
+            Reply::ok("recovered-response"),
+        ])
+        .await;
+        let body = request(json!([{"role":"user","content":"Hello"}]));
+        let failed = messages_inner(
+            fixture.manager.clone(),
+            HeaderMap::new(),
+            Ok(Json(body.clone())),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::BAD_GATEWAY);
+        let recovered =
+            messages_inner(fixture.manager.clone(), HeaderMap::new(), Ok(Json(body))).await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        assert_eq!(
+            recovered.headers()["x-account-email"],
+            fixture.second.as_str()
+        );
+        assert_eq!(
+            fixture
+                .calls
+                .lock()
+                .await
+                .iter()
+                .map(|call| call.0.as_str())
+                .collect::<Vec<_>>(),
+            ["first-workspace", "second-workspace"]
+        );
     }
 
     #[tokio::test]
@@ -2046,6 +2133,76 @@ mod tests {
         let error = malformed_tool.event(&json!({"type":"response.function_call_arguments.done", "output_index":0, "arguments":"{"})).unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert!(!malformed_tool.terminal);
+    }
+
+    #[test]
+    fn cache_write_usage_is_reported_separately_and_bounded() {
+        let response = json!({
+            "id":"resp-cache-write",
+            "status":"completed",
+            "output":[],
+            "usage":{
+                "input_tokens":100,
+                "output_tokens":10,
+                "input_tokens_details":{"cached_tokens":40,"cache_write_tokens":60}
+            }
+        });
+        assert_eq!(
+            usage(&response, false).unwrap(),
+            json!({"input_tokens":0,"output_tokens":10,"cache_creation_input_tokens":60,"cache_read_input_tokens":40})
+        );
+        let no_write = json!({"usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":40}}});
+        assert_eq!(usage(&no_write, false).unwrap()["input_tokens"], 60);
+        let mut mapper = StreamMapper::new("native".into());
+        let events = mapper
+            .event(&json!({"type":"response.completed","response":response}))
+            .unwrap();
+        assert_eq!(
+            events[events.len() - 2]["usage"]["cache_creation_input_tokens"],
+            60
+        );
+        let invalid = json!({"usage":{"input_tokens":100,"output_tokens":10,"input_tokens_details":{"cached_tokens":40,"cache_write_tokens":61}}});
+        assert_eq!(
+            usage(&invalid, false).unwrap_err().status,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn native_client_errors_remain_invalid_requests_in_unary_and_streaming_modes() {
+        let mut response = terminal(json!([]));
+        response["status"] = json!("failed");
+        response["error"] = json!({
+            "code":"context_length_exceeded",
+            "message":"Your input exceeds the context window."
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
+        let unary = convert_response(response.clone(), &manager, &[3; 32], "account", "native")
+            .await
+            .unwrap_err();
+        assert_eq!(unary.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_value(&unary)["error"]["type"],
+            "invalid_request_error"
+        );
+        let mut mapper = StreamMapper::new("native".into());
+        let error = mapper
+            .event(&json!({"type":"response.failed","response":response}))
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_value(&error)["error"]["type"],
+            "invalid_request_error"
+        );
+        let error = StreamMapper::new("native".into())
+            .event(&json!({"type":"error","error":{"code":"invalid_prompt","message":"invalid"}}))
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        let error = StreamMapper::new("native".into())
+            .event(&json!({"type":"error","error":{"code":"server_error","message":"failed"}}))
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
     }
 
     #[test]

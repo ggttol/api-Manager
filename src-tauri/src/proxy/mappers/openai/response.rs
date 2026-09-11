@@ -72,7 +72,7 @@ pub fn transform_openai_response(
 
     // 支持多候选结果 (n > 1)
     if let Some(candidates) = raw.get("candidates").and_then(|c| c.as_array()) {
-        for (idx, candidate) in candidates.iter().enumerate() {
+        for (position, candidate) in candidates.iter().enumerate() {
             let mut content_out = String::new();
             let mut thought_out = String::new();
             let mut tool_calls = Vec::new();
@@ -117,21 +117,6 @@ pub fn transform_openai_response(
                         let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut args_json =
                             fc.get("args").unwrap_or(&serde_json::json!({})).clone();
-
-                        // [FIX #1575] 标准化 shell 工具参数名称
-                        if name == "shell" || name == "bash" || name == "local_shell" {
-                            if let Some(obj) = args_json.as_object_mut() {
-                                if !obj.contains_key("command") {
-                                    for alt_key in &["cmd", "code", "script", "shell_command"] {
-                                        if let Some(val) = obj.remove(*alt_key) {
-                                            obj.insert("command".to_string(), val);
-                                            tracing::debug!("[OpenAI-Stream] Normalized shell arg '{}' -> 'command'", alt_key);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
 
                         let mut arguments_str = args_json.to_string();
 
@@ -301,7 +286,11 @@ pub fn transform_openai_response(
             };
 
             choices.push(Choice {
-                index: idx as u32,
+                index: candidate
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|index| index as u32)
+                    .unwrap_or(position as u32),
                 message: OpenAIMessage {
                     role: "assistant".to_string(),
                     content: if content_out.is_empty() {
@@ -561,5 +550,28 @@ mod tests {
 
         let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn response_preserves_explicit_candidate_indexes() {
+        let response = transform_openai_response(
+            &json!({
+                "candidates": [
+                    {"index": 1, "content": {"parts": [{"text": "B"}]}, "finishReason": "STOP"},
+                    {"index": 0, "content": {"parts": [{"text": "A"}]}, "finishReason": "STOP"}
+                ]
+            }),
+            None,
+            0,
+            None,
+        );
+        assert_eq!(
+            response
+                .choices
+                .iter()
+                .map(|choice| choice.index)
+                .collect::<Vec<_>>(),
+            [1, 0]
+        );
     }
 }

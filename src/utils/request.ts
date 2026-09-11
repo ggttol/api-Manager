@@ -64,6 +64,7 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   // Logs & Monitoring
   'get_proxy_logs_filtered': { url: '/api/logs', method: 'GET' },
   'get_proxy_logs_count_filtered': { url: '/api/logs/count', method: 'GET' },
+  'get_proxy_log_accounts': { url: '/api/logs/accounts', method: 'GET' },
   'clear_proxy_logs': { url: '/api/logs/clear', method: 'POST' },
   'get_proxy_log_detail': { url: '/api/logs/:logId', method: 'GET' },
 
@@ -87,6 +88,12 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'execute_opencode_clear': { url: '/api/proxy/opencode/clear', method: 'POST' },
   'get_opencode_config_content': { url: '/api/proxy/opencode/config', method: 'POST' },
   'get_canonical_families': { url: '/api/proxy/opencode/families', method: 'GET' },
+
+  // Droid Sync
+  'get_droid_sync_status': { url: '/api/proxy/droid/status', method: 'POST' },
+  'execute_droid_sync': { url: '/api/proxy/droid/sync', method: 'POST' },
+  'execute_droid_restore': { url: '/api/proxy/droid/restore', method: 'POST' },
+  'get_droid_config_content': { url: '/api/proxy/droid/config', method: 'POST' },
 
   // Stats
   'get_token_stats_hourly': { url: '/api/stats/token/hourly', method: 'GET' },
@@ -229,11 +236,9 @@ export async function request<T>(cmd: string, inputArgs?: unknown, requestOption
     },
   };
 
-  if ((mapping.method === 'GET' || mapping.method === 'DELETE') && args) {
+  if ((mapping.method === 'GET' || mapping.method === 'DELETE') && bodyArgs) {
     const params = new URLSearchParams();
-    Object.entries(args).forEach(([key, value]) => {
-      // [FIX] 跳过已用于路径替换的参数
-      if (url.includes(encodeURIComponent(String(value)))) return;
+    Object.entries(bodyArgs).forEach(([key, value]) => {
       if (value !== undefined && value !== null) {
         params.append(key, String(value));
       }

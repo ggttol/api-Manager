@@ -24,6 +24,8 @@ mod tests {
             }],
             system: None,
             tools: None, // 无工具调用
+            tool_choice: None,
+            stop_sequences: None,
             stream: false,
             max_tokens: None,
             temperature: None,

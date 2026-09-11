@@ -156,6 +156,25 @@ impl CacheManager {
         timestamp.elapsed() > ttl
     }
 
+    fn enforce_layer_12_capacity<T>(
+        cache: &DashMap<String, T>,
+        limit: usize,
+        timestamp: impl Fn(&T) -> Instant,
+    ) {
+        cache.retain(|_, entry| !Self::is_expired(timestamp(entry), LAYER_12_TTL));
+        while cache.len() > limit {
+            let oldest_key = cache
+                .iter()
+                .min_by_key(|entry| timestamp(entry.value()))
+                .map(|entry| entry.key().clone());
+            if let Some(key) = oldest_key {
+                cache.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+
     // ===== Layer 1: System Instruction Cache =====
 
     /// 查找已缓存的 sanitized system instruction
@@ -234,20 +253,10 @@ impl CacheManager {
             &raw_hash[..raw_hash.len().min(16)]
         );
 
-        // LRU 淘汰: 超出限制时清除过期条目
         if self.si_cache.len() > SI_CACHE_LIMIT {
-            let before = self.si_cache.len();
-            self.si_cache
-                .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
-            let after = self.si_cache.len();
-            if before != after {
-                tracing::debug!(
-                    "[CacheManager:L1-SI] LRU cleanup: {} → {} (limit: {})",
-                    before,
-                    after,
-                    SI_CACHE_LIMIT
-                );
-            }
+            Self::enforce_layer_12_capacity(&self.si_cache, SI_CACHE_LIMIT, |entry| {
+                entry.timestamp
+            });
         }
     }
 
@@ -332,18 +341,9 @@ impl CacheManager {
         );
 
         if self.tools_cache.len() > TOOLS_CACHE_LIMIT {
-            let before = self.tools_cache.len();
-            self.tools_cache
-                .retain(|_, v| !Self::is_expired(v.timestamp, LAYER_12_TTL));
-            let after = self.tools_cache.len();
-            if before != after {
-                tracing::debug!(
-                    "[CacheManager:L2-Tools] LRU cleanup: {} → {} (limit: {})",
-                    before,
-                    after,
-                    TOOLS_CACHE_LIMIT
-                );
-            }
+            Self::enforce_layer_12_capacity(&self.tools_cache, TOOLS_CACHE_LIMIT, |entry| {
+                entry.timestamp
+            });
         }
     }
 
@@ -663,6 +663,21 @@ mod tests {
         assert_eq!(stats.active_si_entries, 2);
     }
 
+    #[test]
+    fn test_layer_12_caches_evict_oldest_live_entries_at_capacity() {
+        let cm = CacheManager::new();
+        for i in 0..=SI_CACHE_LIMIT {
+            cm.cache_si(format!("si-{i}"), format!("value-{i}"));
+        }
+        for i in 0..=TOOLS_CACHE_LIMIT {
+            cm.cache_tools(format!("tools-{i}"), format!("value-{i}"));
+        }
+
+        let stats = cm.get_layer_stats();
+        assert_eq!(stats.active_si_entries, SI_CACHE_LIMIT);
+        assert_eq!(stats.active_tools_entries, TOOLS_CACHE_LIMIT);
+    }
+
     // ===== Layer 2 Tests =====
 
     #[test]
@@ -927,10 +942,9 @@ mod tests {
     }
 
     #[test]
-    fn test_evict_expired_all_layers() {
+    fn test_expired_prefix_is_not_returned_or_retained() {
         let cm = CacheManager::new();
 
-        // Insert into all layers with 0 TTL via insert_prefix
         cm.cache_si("si_key".to_string(), "text".to_string());
         cm.cache_tools("tools_key".to_string(), "{}".to_string());
         cm.insert_prefix(
@@ -944,17 +958,14 @@ mod tests {
 
         thread::sleep(Duration::from_millis(10));
 
-        // should be expired
         assert!(cm.lookup_prefix("prefix_key").is_none());
-
-        let evicted = cm.evict_expired();
-        // prefix entry removed, SI and tools still valid (30min TTL)
-        assert_eq!(evicted, 1, "Only prefix should be evicted");
-
         let stats = cm.get_layer_stats();
         assert_eq!(stats.active_si_entries, 1);
         assert_eq!(stats.active_tools_entries, 1);
         assert_eq!(stats.active_prefix_entries, 0);
+
+        // Lazy expiration already removed the prefix, so a later sweep has no work.
+        assert_eq!(cm.evict_expired(), 0);
     }
 
     #[test]

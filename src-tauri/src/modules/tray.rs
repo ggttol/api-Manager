@@ -90,14 +90,22 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 }
                 "quit" => {
                     // 先停止 Admin Server 和反代服务，避免进程残留和端口占用
-                    let state = app.state::<crate::commands::proxy::ProxyServiceState>();
-                    let admin_server = state.admin_server.clone();
-                    let instance = state.instance.clone();
+                    let proxy_state = app.state::<crate::commands::proxy::ProxyServiceState>();
+                    let lifecycle = proxy_state.lifecycle.clone();
+                    let admin_server = proxy_state.admin_server.clone();
+                    let instance = proxy_state.instance.clone();
+                    let cloudflared_state = app
+                        .state::<crate::commands::cloudflared::CloudflaredState>()
+                        .inner()
+                        .clone();
                     tauri::async_runtime::spawn(async move {
+                        let _lifecycle = lifecycle.lock().await;
                         {
                             let mut lock = admin_server.write().await;
                             if let Some(admin) = lock.take() {
-                                admin.axum_server.stop();
+                                admin.axum_server.stop().await;
+                                let _ = admin.server_handle.await;
+                                admin.axum_server.drain_connections().await;
                             }
                         }
                         {
@@ -106,6 +114,16 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                                 inst.token_manager.abort_background_tasks().await;
                                 inst.axum_server.set_running(false).await;
                             }
+                        }
+                        if let Err(error) =
+                            crate::commands::cloudflared::stop_cloudflared_for_shutdown(
+                                &cloudflared_state,
+                            )
+                            .await
+                        {
+                            modules::logger::log_warn(&format!(
+                                "Failed to stop cloudflared during tray shutdown: {error}"
+                            ));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         std::process::exit(0);
@@ -148,7 +166,12 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                                 return;
                             }
 
-                            let current_id = modules::get_current_account_id().unwrap_or(None);
+                            let account_index = modules::account::load_account_index().ok();
+                            let current_id = account_index
+                                .as_ref()
+                                .and_then(|index| index.current_account_id.clone());
+                            let target_ide =
+                                account_index.and_then(|index| index.current_target_ide);
                             let next_account = if let Some(curr) = current_id {
                                 let idx = accounts.iter().position(|a| a.id == curr).unwrap_or(0);
                                 let next_idx = (idx + 1) % accounts.len();
@@ -161,8 +184,13 @@ pub fn create_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                             let integration = crate::modules::integration::DesktopIntegration {
                                 app_handle: app_handle.clone(),
                             };
-                            if let Ok(_) =
-                                modules::switch_account(&next_account.id, None, &integration).await
+                            if modules::switch_account(
+                                &next_account.id,
+                                target_ide.as_deref(),
+                                &integration,
+                            )
+                            .await
+                            .is_ok()
                             {
                                 // 3. Notify frontend
                                 let _ = app_handle

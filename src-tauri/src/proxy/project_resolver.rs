@@ -3,6 +3,14 @@ use serde_json::Value;
 /// 使用 Antigravity 的 loadCodeAssist API 获取 project_id
 /// 这是获取 cloudaicompanionProject 的正确方式
 pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
+    fetch_project_id_for_account(access_token, None).await
+}
+
+/// Resolve a project through the same effective route as requests for this account.
+pub async fn fetch_project_id_for_account(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<String, String> {
     // 使用 Sandbox 环境，避免 Prod 环境的 429 错误
     let url = "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
 
@@ -12,7 +20,11 @@ pub async fn fetch_project_id(access_token: &str) -> Result<String, String> {
         }
     });
 
-    let client = crate::utils::http::get_client();
+    let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
+        pool.get_effective_client(account_id, 30).await
+    } else {
+        crate::utils::http::get_client()
+    };
     let response = client
         .post(url)
         .bearer_auth(access_token)

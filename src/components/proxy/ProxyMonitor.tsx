@@ -8,6 +8,7 @@ import { Trash2, Search, X, Copy, CheckCircle, ChevronLeft, ChevronRight, Refres
 import { AppConfig } from '../../types/config';
 import { formatCompactNumber } from '../../utils/format';
 import { useAccountStore } from '../../stores/useAccountStore';
+import { useConfigStore } from '../../stores/useConfigStore';
 import { isTauri } from '../../utils/env';
 import { copyToClipboard } from '../../utils/clipboard';
 
@@ -88,7 +89,7 @@ const LogTable: React.FC<LogTableProps> = ({
                             }}
                         >
                             <td style={{ width: '60px' }}>
-                                <span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 ? 'badge-success' : 'badge-error'}`}>
+                                <span className={`badge badge-xs text-white border-none ${log.status >= 200 && log.status < 400 && !log.error ? 'badge-success' : 'badge-error'}`} title={log.error}>
                                     {log.status}
                                 </span>
                             </td>
@@ -152,10 +153,16 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [stats, setStats] = useState<ProxyStats>({ total_requests: 0, success_count: 0, error_count: 0 });
     const [filter, setFilter] = useState('');
     const [accountFilter, setAccountFilter] = useState('');
-    // [FIX] 使用 ref 存储最新的筛选条件，避免 setInterval 闭包问题
-    const filterRef = useRef(filter);
-    const accountFilterRef = useRef(accountFilter);
-    const currentPageRef = useRef(1);
+    const [reloadSequence, setReloadSequence] = useState(0);
+    const [knownAccounts, setKnownAccounts] = useState<string[]>([]);
+    const [accountsLoadError, setAccountsLoadError] = useState(false);
+    const dataGeneration = useRef(0);
+    const detailGeneration = useRef(0);
+    const dataLoading = useRef(false);
+    const refreshPending = useRef(false);
+    const loggingGeneration = useRef(0);
+    const [loggingBusy, setLoggingBusy] = useState(false);
+    const [actionError, setActionError] = useState<string | null>(null);
     const [selectedLog, setSelectedLog] = useState<ProxyRequestLog | null>(null);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
     const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
@@ -173,7 +180,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [loadError, setLoadError] = useState(false);
 
     const uniqueAccounts = useMemo(() => {
-        const emailSet = new Set<string>();
+        const emailSet = new Set(knownAccounts);
         logs.forEach(log => {
             if (log.account_email) {
                 emailSet.add(log.account_email);
@@ -182,81 +189,11 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         accounts.forEach(acc => {
             emailSet.add(acc.email);
         });
+        if (accountFilter) emailSet.add(accountFilter);
         return Array.from(emailSet).sort();
-    }, [logs, accounts]);
+    }, [logs, accounts, knownAccounts, accountFilter]);
 
-    const loadData = async (page = 1, searchFilter = filter, accountEmailFilter = accountFilter) => {
-        if (loading) return;
-        setLoading(true);
-        setLoadError(false);
-
-        try {
-            // Add timeout control (10 seconds)
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Request timeout')), 10000)
-            );
-
-            const config = await Promise.race([
-                invoke<AppConfig>('load_config'),
-                timeoutPromise
-            ]) as AppConfig;
-
-            if (config && config.proxy) {
-                setIsLoggingEnabled(config.proxy.enable_logging);
-                await invoke('set_proxy_monitor_enabled', { enabled: config.proxy.enable_logging });
-            }
-
-            const errorsOnly = searchFilter === '__ERROR__';
-            const baseFilter = errorsOnly ? '' : searchFilter;
-            const actualFilter = accountEmailFilter
-                ? (baseFilter ? `${baseFilter} ${accountEmailFilter}` : accountEmailFilter)
-                : baseFilter;
-
-            // Get count with filter
-            const count = await Promise.race([
-                invoke<number>('get_proxy_logs_count_filtered', {
-                    filter: actualFilter,
-                    errorsOnly: errorsOnly
-                }),
-                timeoutPromise
-            ]) as number;
-            setTotalCount(count);
-
-            // Use filtered paginated query
-            const offset = (page - 1) * pageSize;
-            const history = await Promise.race([
-                invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', {
-                    filter: actualFilter,
-                    errorsOnly: errorsOnly,
-                    limit: pageSize,
-                    offset: offset
-                }),
-                timeoutPromise
-            ]) as ProxyRequestLog[];
-
-            if (Array.isArray(history)) {
-                setLogs(history);
-                // Clear pending logs to avoid duplicates (database data is authoritative)
-                pendingLogsRef.current = [];
-            }
-
-            const currentStats = await Promise.race([
-                invoke<ProxyStats>('get_proxy_stats'),
-                timeoutPromise
-            ]) as ProxyStats;
-
-            if (currentStats) setStats(currentStats);
-        } catch (e: any) {
-            setLoadError(true);
-            console.error("Failed to load proxy data", e);
-            if (e.message === 'Request timeout') {
-                // Show timeout error to user
-                console.error('Loading monitor data timeout, please try again later');
-            }
-        } finally {
-            setLoading(false);
-        }
-    };
+    const reloadData = () => setReloadSequence(sequence => sequence + 1);
 
     const totalPages = Math.ceil(totalCount / pageSize);
     const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * pageSize + 1;
@@ -265,154 +202,179 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const goToPage = (page: number) => {
         if (page >= 1 && page <= totalPages && page !== currentPage) {
             setCurrentPage(page);
-            currentPageRef.current = page; // [FIX] 同步 ref
-            loadData(page, filter, accountFilter);
+            setLoadError(false);
         }
     };
 
     const toggleLogging = async () => {
+        if (loggingBusy) return;
         const newState = !isLoggingEnabled;
+        loggingGeneration.current += 1;
+        setLoggingBusy(true);
+        setActionError(null);
         try {
-            const config = await invoke<AppConfig>('load_config');
-            if (config && config.proxy) {
-                config.proxy.enable_logging = newState;
-                await invoke('save_config', { config });
-                await invoke('set_proxy_monitor_enabled', { enabled: newState });
-                setIsLoggingEnabled(newState);
-            }
+            if (!useConfigStore.getState().config) await useConfigStore.getState().loadConfig();
+            await useConfigStore.getState().updateConfig(config => ({
+                ...config,
+                proxy: { ...config.proxy, enable_logging: newState },
+            }), true);
+            await invoke('set_proxy_monitor_enabled', { enabled: newState });
+            setIsLoggingEnabled(newState);
         } catch (e) {
-            console.error("Failed to toggle logging", e);
+            console.error('Failed to toggle logging', e);
+            setActionError(e instanceof Error ? e.message : String(e));
+        } finally {
+            loggingGeneration.current += 1;
+            setLoggingBusy(false);
+            reloadData();
         }
     };
 
-    const pendingLogsRef = useRef<ProxyRequestLog[]>([]);
-    const listenerSetupRef = useRef(false);
-    const isMountedRef = useRef(true);
-
     useEffect(() => {
-        isMountedRef.current = true;
-        loadData();
-        fetchAccounts();
+        const generation = ++dataGeneration.current;
+        const loggingRevision = loggingGeneration.current;
+        dataLoading.current = true;
+        refreshPending.current = false;
+        const controller = new AbortController();
+        let active = true;
+        let timeoutId: number | undefined;
+        const current = () => active && generation === dataGeneration.current;
+        const timeout = new Promise<never>((_, reject) => {
+            timeoutId = window.setTimeout(() => {
+                controller.abort();
+                reject(new Error('Request timeout'));
+            }, 10000);
+        });
 
-        let unlistenFn: (() => void) | null = null;
-        let updateTimeout: number | null = null;
-
-        const setupListener = async () => {
-            if (!isTauri()) return;
-            // Prevent duplicate listener registration (React 18 StrictMode)
-            if (listenerSetupRef.current) {
-                console.debug('[ProxyMonitor] Listener already set up, skipping...');
-                return;
-            }
-            listenerSetupRef.current = true;
-
-            console.debug('[ProxyMonitor] Setting up event listener for proxy://request');
-            unlistenFn = await listen<ProxyRequestLog>('proxy://request', (event) => {
-                if (!isMountedRef.current) return;
-
-                const newLog = event.payload;
-
-                // 移除 body 以减少内存占用
-                const logSummary = {
-                    ...newLog,
-                    request_body: undefined,
-                    response_body: undefined
-                };
-
-                // Check if this log already exists (deduplicate at event level)
-                const alreadyExists = pendingLogsRef.current.some(log => log.id === newLog.id);
-                if (alreadyExists) {
-                    console.debug('[ProxyMonitor] Duplicate event ignored:', newLog.id);
+        const load = async () => {
+            setLoading(true);
+            setLoadError(false);
+            const query = {
+                filter: filter === '__ERROR__' ? '' : filter,
+                errorsOnly: filter === '__ERROR__',
+                accountEmail: accountFilter || undefined,
+            };
+            try {
+                const [config, count, currentStats] = await Promise.race([
+                    Promise.all([
+                        invoke<AppConfig>('load_config', undefined, { signal: controller.signal }),
+                        invoke<number>('get_proxy_logs_count_filtered', query, { signal: controller.signal }),
+                        invoke<ProxyStats>('get_proxy_stats', undefined, { signal: controller.signal }),
+                    ]),
+                    timeout,
+                ]);
+                if (!current()) return;
+                const page = Math.min(currentPage, Math.max(1, Math.ceil(count / pageSize)));
+                if (page !== currentPage) {
+                    setCurrentPage(page);
                     return;
                 }
-
-                pendingLogsRef.current.push(logSummary);
-
-                // 防抖:每 500ms 批量更新一次
-                if (updateTimeout) clearTimeout(updateTimeout);
-                updateTimeout = window.setTimeout(async () => {
-                    if (!isMountedRef.current) return;
-
-                    const currentPending = pendingLogsRef.current;
-                    if (currentPending.length > 0) {
-                        setLogs(prev => {
-                            // Deduplicate by id
-                            const existingIds = new Set(prev.map(log => log.id));
-                            const uniqueNewLogs = currentPending.filter(log => !existingIds.has(log.id));
-                            // Merge and sort by timestamp descending (newest first)
-                            const merged = [...uniqueNewLogs, ...prev];
-                            merged.sort((a, b) => b.timestamp - a.timestamp);
-                            return merged.slice(0, 100);
-                        });
-
-                        // Fetch stats and total count from backend instead of local calculation
-                        try {
-                            const [currentStats, count] = await Promise.all([
-                                invoke<ProxyStats>('get_proxy_stats'),
-                                invoke<number>('get_proxy_logs_count_filtered', { filter: '', errorsOnly: false })
-                            ]);
-                            if (isMountedRef.current) {
-                                if (currentStats) setStats(currentStats);
-                                setTotalCount(count);
-                            }
-                        } catch (e) {
-                            console.error('Failed to fetch stats:', e);
-                        }
-
-                        pendingLogsRef.current = [];
-                    }
-                }, 500);
-            });
-        };
-        setupListener();
-
-        // Web 模式補強：如果不是 Tauri 環境，則啟用定時輪詢
-        let pollInterval: number | null = null;
-        if (!isTauri()) {
-            console.debug('[ProxyMonitor] Web mode detected, starting auto-poll (10s)');
-            pollInterval = window.setInterval(() => {
-                if (isMountedRef.current && !loading) {
-                    // [FIX] 使用 ref.current 获取最新的筛选条件
-                    loadData(currentPageRef.current, filterRef.current, accountFilterRef.current);
+                const history = await Promise.race([
+                    invoke<ProxyRequestLog[]>('get_proxy_logs_filtered', {
+                        ...query,
+                        limit: pageSize,
+                        offset: (page - 1) * pageSize,
+                    }, { signal: controller.signal }),
+                    timeout,
+                ]);
+                if (!current()) return;
+                setLogs(history);
+                setTotalCount(count);
+                setStats(currentStats);
+                if (loggingRevision === loggingGeneration.current) {
+                    setIsLoggingEnabled(config.proxy.enable_logging);
                 }
-            }, 10000);
-        }
-
-        return () => {
-            isMountedRef.current = false;
-            listenerSetupRef.current = false;
-            if (unlistenFn) unlistenFn();
-            if (updateTimeout) clearTimeout(updateTimeout);
-            if (pollInterval) clearInterval(pollInterval);
+            } catch (error) {
+                if (current()) {
+                    setLoadError(true);
+                    console.error('Failed to load proxy data', error);
+                }
+            } finally {
+                window.clearTimeout(timeoutId);
+                if (current()) {
+                    dataLoading.current = false;
+                    setLoading(false);
+                    if (refreshPending.current) {
+                        refreshPending.current = false;
+                        setReloadSequence(sequence => sequence + 1);
+                    }
+                }
+            }
         };
-    }, []);
+        void load();
+        return () => {
+            active = false;
+            controller.abort();
+            window.clearTimeout(timeoutId);
+        };
+    }, [currentPage, pageSize, filter, accountFilter, reloadSequence]);
+
+    useEffect(() => {
+        const controller = new AbortController();
+        let active = true;
+        setAccountsLoadError(false);
+        void Promise.all([
+            invoke<string[]>('get_proxy_log_accounts', undefined, { signal: controller.signal }),
+            isTauri()
+                ? Promise.resolve({ accounts: [] })
+                : invoke<{ accounts: { id: string; email: string | null }[] }>(
+                    'codex_list_accounts', undefined, { signal: controller.signal }),
+        ]).then(([history, codex]) => {
+            if (active) setKnownAccounts([...history, ...codex.accounts.map(account => account.email ?? account.id)]);
+        }).catch(error => {
+            if (active) {
+                setAccountsLoadError(true);
+                console.error('Failed to load log account options', error);
+            }
+        });
+        return () => {
+            active = false;
+            controller.abort();
+        };
+    }, [reloadSequence]);
+
+    useEffect(() => {
+        void fetchAccounts();
+        let active = true;
+        let unlisten: (() => void) | undefined;
+        let updateTimeout: number | undefined;
+        const refreshWhenIdle = () => {
+            if (!active) return;
+            if (dataLoading.current) refreshPending.current = true;
+            else setReloadSequence(sequence => sequence + 1);
+        };
+        // Refresh authoritative filtered pages instead of prepending unfiltered events.
+        if (isTauri()) {
+            void listen<ProxyRequestLog>('proxy://request', () => {
+                if (!active || updateTimeout !== undefined) return;
+                updateTimeout = window.setTimeout(() => {
+                    updateTimeout = undefined;
+                    refreshWhenIdle();
+                }, 500);
+            }).then(dispose => {
+                if (active) unlisten = dispose;
+                else dispose();
+            }).catch(error => console.error('Failed to listen for proxy requests', error));
+        }
+        const pollInterval = window.setInterval(refreshWhenIdle, 10000);
+        return () => {
+            active = false;
+            detailGeneration.current += 1;
+            unlisten?.();
+            window.clearTimeout(updateTimeout);
+            window.clearInterval(pollInterval);
+        };
+    }, [fetchAccounts]);
 
     useEffect(() => {
         setCopiedRequestId(null);
     }, [selectedLog?.id]);
 
-    // Reload when pageSize changes
-    useEffect(() => {
-        setCurrentPage(1);
-        loadData(1, filter, accountFilter);
-    }, [pageSize]);
-
-    // Reload when filter changes (search based on all logs)
-    useEffect(() => {
-        setCurrentPage(1);
-        loadData(1, filter, accountFilter);
-        // [FIX] 同步 ref 值，供 setInterval 使用
-        filterRef.current = filter;
-        accountFilterRef.current = accountFilter;
-        currentPageRef.current = 1;
-    }, [filter, accountFilter]);
-
-    // Logs are already filtered and sorted by backend
-    // Apply account filter on frontend
-    const filteredLogs = useMemo(() => {
-        if (!accountFilter) return logs;
-        return logs.filter(log => log.account_email === accountFilter);
-    }, [logs, accountFilter]);
+    const closeDetail = () => {
+        detailGeneration.current += 1;
+        setSelectedLog(null);
+        setLoadingDetail(false);
+    };
 
     const quickFilters = [
         { label: t('monitor.filters.all'), value: '' },
@@ -429,13 +391,19 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
 
     const executeClearLogs = async () => {
         setIsClearConfirmOpen(false);
+        setActionError(null);
         try {
+            dataGeneration.current += 1;
             await invoke('clear_proxy_logs');
             setLogs([]);
             setStats({ total_requests: 0, success_count: 0, error_count: 0 });
             setTotalCount(0);
+            setCurrentPage(1);
+            reloadData();
         } catch (e) {
             console.error("Failed to clear logs", e);
+            setActionError(e instanceof Error ? e.message : String(e));
+            reloadData();
         }
     };
 
@@ -466,6 +434,8 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     <button
                         onClick={toggleLogging}
                         aria-pressed={isLoggingEnabled}
+                        disabled={loggingBusy}
+                        aria-busy={loggingBusy}
                         className={`console-button ${isLoggingEnabled ? 'text-emerald-700 dark:text-emerald-400' : ''}`}
                     >
                         <div className={`w-2 h-2 rounded-full ${isLoggingEnabled ? 'bg-emerald-500' : 'bg-gray-400'}`} />
@@ -480,7 +450,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             aria-label={t('monitor.filters.placeholder')}
                             className="input input-sm input-bordered w-full pl-9 text-xs"
                             value={filter}
-                            onChange={(e) => setFilter(e.target.value)}
+                            onChange={(e) => { setFilter(e.target.value); setCurrentPage(1); }}
                         />
                     </div>
 
@@ -489,7 +459,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         <select
                             className="select select-sm select-bordered pl-8 text-xs min-w-[140px] max-w-[220px]"
                             value={accountFilter}
-                            onChange={(e) => setAccountFilter(e.target.value)}
+                            onChange={(e) => { setAccountFilter(e.target.value); setCurrentPage(1); }}
                             title={t('monitor.filters.by_account')}
                         >
                             <option value="">{t('monitor.filters.all_accounts')}</option>
@@ -507,7 +477,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                         <span className="text-red-500">{formatCompactNumber(stats.error_count)} {t('monitor.stats.err')}</span>
                     </div>
 
-                    <button onClick={() => loadData(currentPage, filter)} disabled={loading} className="console-button" title={t('common.refresh')}>
+                    <button onClick={reloadData} disabled={loading} className="console-button" title={t('common.refresh')}>
                         <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
                     </button>
                     <button onClick={clearLogs} className="console-button text-error" title={t('common.delete')}>
@@ -518,28 +488,30 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                 <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-medium text-gray-500">{t('monitor.filters.quick_filters')}</span>
                     {quickFilters.map(q => (
-                        <button key={q.label} onClick={() => setFilter(q.value)} aria-pressed={filter === q.value} className={`console-button !py-1 !px-3 ${filter === q.value ? 'console-button-primary' : ''}`}>
+                        <button key={q.label} onClick={() => { setFilter(q.value); setCurrentPage(1); }} aria-pressed={filter === q.value} className={`console-button !py-1 !px-3 ${filter === q.value ? 'console-button-primary' : ''}`}>
                             {q.label}
                         </button>
                     ))}
-                    {(filter || accountFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); }} className="console-button"> {t('monitor.filters.reset')} </button>}
+                    {(filter || accountFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); setCurrentPage(1); }} className="console-button"> {t('monitor.filters.reset')} </button>}
                 </div>
             </div>
-            {loadError && <div role="alert" className="p-4 text-sm text-error">{t('common.load_failed')}</div>}
+            {(loadError || accountsLoadError || actionError) && <div role="alert" className="p-4 text-sm text-error">{actionError || t('common.load_failed')}</div>}
 
             <LogTable
-                logs={filteredLogs}
+                logs={logs}
                 loading={loading}
                 onLogClick={async (log: ProxyRequestLog) => {
+                    const generation = ++detailGeneration.current;
+                    setSelectedLog(log);
                     setLoadingDetail(true);
                     try {
                         const detail = await invoke<ProxyRequestLog>('get_proxy_log_detail', { logId: log.id });
-                        setSelectedLog(detail);
+                        if (generation === detailGeneration.current) setSelectedLog(detail);
                     } catch (e) {
                         console.error('Failed to load log detail', e);
-                        setSelectedLog(log);
+                        if (generation === detailGeneration.current) setLoadError(true);
                     } finally {
-                        setLoadingDetail(false);
+                        if (generation === detailGeneration.current) setLoadingDetail(false);
                     }
                 }}
                 t={t}
@@ -551,7 +523,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     <span className="text-gray-500">{t('common.per_page')}</span>
                     <select
                         value={pageSize}
-                        onChange={(e) => setPageSize(Number(e.target.value))}
+                        onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
                         className="select select-xs select-bordered w-16"
                     >
                         {PAGE_SIZE_OPTIONS.map(size => (
@@ -588,17 +560,17 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             </div>
 
             {selectedLog && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setSelectedLog(null)}>
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={closeDetail}>
                     <div className="bg-white dark:bg-base-100 rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden border border-gray-200 dark:border-base-300" onClick={e => e.stopPropagation()}>
                         {/* Modal Header */}
                         <div className="px-4 py-3 border-b border-gray-100 dark:border-base-300 flex items-center justify-between bg-gray-50 dark:bg-base-200">
                             <div className="flex items-center gap-3">
                                 {loadingDetail && <div className="loading loading-spinner loading-sm"></div>}
-                                <span className={`badge badge-sm text-white border-none ${selectedLog.status >= 200 && selectedLog.status < 400 ? 'badge-success' : 'badge-error'}`}>{selectedLog.status}</span>
+                                <span className={`badge badge-sm text-white border-none ${selectedLog.status >= 200 && selectedLog.status < 400 && !selectedLog.error ? 'badge-success' : 'badge-error'}`} title={selectedLog.error}>{selectedLog.status}</span>
                                 <span className="font-mono font-bold text-gray-900 dark:text-base-content text-sm">{selectedLog.method}</span>
                                 <span className="text-xs text-gray-500 dark:text-gray-400 font-mono truncate max-w-md hidden sm:inline">{selectedLog.url}</span>
                             </div>
-                            <button onClick={() => setSelectedLog(null)} aria-label={t('common.close')} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300"><X size={18} /></button>
+                            <button onClick={closeDetail} aria-label={t('common.close')} className="btn btn-ghost btn-sm btn-circle text-gray-500 dark:text-gray-400 hover:dark:bg-base-300"><X size={18} /></button>
                         </div>
 
                         {/* Modal Content */}

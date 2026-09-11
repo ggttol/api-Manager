@@ -141,6 +141,27 @@ pub fn determine_retry_strategy(
     )
 }
 
+pub(crate) fn is_invalid_signature_error(status: u16, error_text: &str) -> bool {
+    status == 400
+        && [
+            "invalid thought signature",
+            "invalid `signature`",
+            "invalid signature",
+            "thought_signature",
+            "thoughtsignature",
+            "thinking.signature",
+            "thinking.thinking",
+            "corrupted thought signature",
+        ]
+        .iter()
+        .any(|needle| {
+            error_text
+                .as_bytes()
+                .windows(needle.len())
+                .any(|part| part.eq_ignore_ascii_case(needle.as_bytes()))
+        })
+}
+
 fn determine_retry_strategy_inner(
     status_code: u16,
     error_text: &str,
@@ -148,25 +169,15 @@ fn determine_retry_strategy_inner(
     retried_without_thinking: bool,
     allow_grace_retry: bool,
 ) -> RetryStrategy {
-    // 400 signature errors must be case-insensitive and cover all Google variants.
-    let lower = error_text.to_lowercase();
     match status_code {
         // 400 错误：仅在特定 Thinking 签名失败时重试一次
-        400 if !retried_without_thinking
-            && (lower.contains("invalid thought signature")
-                || lower.contains("invalid `signature`")
-                || lower.contains("invalid signature")
-                || lower.contains("thought_signature")
-                || lower.contains("thoughtsignature")
-                || lower.contains("thinking.signature")
-                || lower.contains("thinking.thinking")
-                || lower.contains("corrupted thought signature")) =>
-        {
+        400 if !retried_without_thinking && is_invalid_signature_error(status_code, error_text) => {
             RetryStrategy::FixedDelay(Duration::from_millis(200))
         }
 
         // 429 限流错误
         429 => {
+            let lower = error_text.to_lowercase();
             let is_hard_quota_exhausted = lower.contains("resource_exhausted")
                 || lower.contains("quota_exhausted")
                 || lower.contains("exceeded your current quota")
@@ -237,6 +248,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn signature_recovery_matches_retry_classification_once() {
+        for error in [
+            "INVALID THOUGHT SIGNATURE.",
+            "Corrupted thought signature",
+            "thinking.thinking: Field required",
+            "Invalid `signature`",
+        ] {
+            assert!(is_invalid_signature_error(400, error));
+            assert!(matches!(
+                determine_retry_strategy(400, error, false),
+                RetryStrategy::FixedDelay(_)
+            ));
+            assert!(matches!(
+                determine_retry_strategy(400, error, true),
+                RetryStrategy::NoRetry
+            ));
+        }
+        assert!(!is_invalid_signature_error(500, "Invalid signature"));
+        assert!(!is_invalid_signature_error(
+            400,
+            "Unrelated invalid request"
+        ));
+    }
+
+    #[test]
     fn task_short_429_preserves_rotation_budget_and_structured_status() {
         let body = r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#;
 
@@ -246,16 +282,13 @@ mod tests {
             let mut retry_same_account = false;
             let mut sends = Vec::new();
 
-            while let Some(attempt) = next_rotation_attempt(
-                &mut used_attempts,
-                account_count,
-                retry_same_account,
-            ) {
+            while let Some(attempt) =
+                next_rotation_attempt(&mut used_attempts, account_count, retry_same_account)
+            {
                 retry_same_account = false;
                 sends.push(attempt);
                 let account_id = format!("account-{}", attempt);
-                let strategy =
-                    state.determine_strategy(&account_id, 429, body, None, false);
+                let strategy = state.determine_strategy(&account_id, 429, body, None, false);
                 if matches!(strategy, RetryStrategy::GraceRetry(_)) {
                     assert!(!should_rotate_account(429, Some(&strategy)));
                     retry_same_account = true;
@@ -479,10 +512,7 @@ mod retry_after_tests {
             extract_retry_after_seconds("Token error: All accounts limited. Wait 5s."),
             Some(5)
         );
-        assert_eq!(
-            extract_retry_after_seconds("Token pool is empty"),
-            None
-        );
+        assert_eq!(extract_retry_after_seconds("Token pool is empty"), None);
         assert_eq!(
             extract_retry_after_seconds("All accounts failed or unhealthy."),
             None
@@ -504,10 +534,7 @@ mod retry_after_tests {
             headers.get("x-account-email").unwrap().to_str().unwrap(),
             "test@example.com"
         );
-        assert_eq!(
-            headers.get("retry-after").unwrap().to_str().unwrap(),
-            "45"
-        );
+        assert_eq!(headers.get("retry-after").unwrap().to_str().unwrap(), "45");
 
         let headers_no_wait = build_token_error_headers(
             Some("gemini-2.5-pro"),
@@ -516,9 +543,12 @@ mod retry_after_tests {
         );
         assert!(headers_no_wait.get("retry-after").is_none());
         assert_eq!(
-            headers_no_wait.get("x-mapped-model").unwrap().to_str().unwrap(),
+            headers_no_wait
+                .get("x-mapped-model")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "gemini-2.5-pro"
         );
     }
 }
-

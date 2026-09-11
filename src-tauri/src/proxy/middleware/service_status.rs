@@ -19,7 +19,8 @@ pub async fn service_status_middleware(
         || path.starts_with("/codex/v1/")
         || path == "/responses"
         || path.starts_with("/responses/")
-        || path.starts_with("/mcp/");
+        || path.starts_with("/mcp/")
+        || path == "/internal/warmup";
     if !inference {
         return next.run(request).await;
     }

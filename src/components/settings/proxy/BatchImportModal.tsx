@@ -87,11 +87,11 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
             p.name = `Proxy ${i + 1}`;
         });
 
+        setPreview(newProxies);
         if (newProxies.length === 0 && lines.length > 0) {
             setError(t('settings.proxy_pool.no_valid_proxies', 'No valid proxies found'));
         } else {
             setError(null);
-            setPreview(newProxies);
         }
     };
 
@@ -102,7 +102,7 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
     };
 
     const handleImport = () => {
-        if (preview.length > 0) {
+        if (preview.length > 0 && !error) {
             onImport(preview);
             onClose();
             setRawText('');
@@ -192,7 +192,7 @@ export default function BatchImportModal({ isOpen, onClose, onImport }: BatchImp
                     </button>
                     <button
                         onClick={handleImport}
-                        disabled={preview.length === 0}
+                        disabled={preview.length === 0 || Boolean(error)}
                         className="px-5 py-2.5 rounded-xl bg-blue-500 hover:bg-blue-600 active:scale-95 text-white font-medium shadow-sm shadow-blue-200 dark:shadow-none transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                     >
                         <CheckCircle2 size={18} />

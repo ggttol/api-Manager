@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::State;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 
 /// 反代服务状态
@@ -22,6 +22,8 @@ pub struct ProxyServiceState {
     pub instance: Arc<RwLock<Option<ProxyServiceInstance>>>,
     pub monitor: Arc<RwLock<Option<Arc<ProxyMonitor>>>>,
     pub admin_server: Arc<RwLock<Option<AdminServerInstance>>>, // [NEW] 常驻管理服务器
+    /// Serializes complete listener start/stop transitions.
+    pub lifecycle: Arc<Mutex<()>>,
     pub starting: Arc<AtomicBool>, // [NEW] 标识是否正在启动中，防止死锁
 }
 
@@ -44,6 +46,7 @@ impl ProxyServiceState {
             instance: Arc::new(RwLock::new(None)),
             monitor: Arc::new(RwLock::new(None)),
             admin_server: Arc::new(RwLock::new(None)),
+            lifecycle: Arc::new(Mutex::new(())),
             starting: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -80,6 +83,10 @@ pub async fn internal_start_proxy_service(
     integration: crate::modules::integration::SystemManager,
     cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<ProxyStatus, String> {
+    // Hold the lifecycle guard until this transition has published a running
+    // instance, so stop cannot tear down the listener under a concurrent start.
+    let _lifecycle = state.lifecycle.lock().await;
+
     // 1. 检查状态并加锁
     {
         let instance_lock = state.instance.read().await;
@@ -193,10 +200,11 @@ pub async fn internal_start_proxy_service(
 
     // 成功启动后，guard 在这里结束并重置 starting 是 OK 的
     // 但其实我们可以直接手动掉，或者相信 guard
+    let bound_port = axum_server.port;
     Ok(ProxyStatus {
         running: true,
-        port: config.port,
-        base_url: format!("http://127.0.0.1:{}", config.port),
+        port: bound_port,
+        base_url: format!("http://127.0.0.1:{}", bound_port),
         active_accounts,
     })
 }
@@ -209,7 +217,8 @@ pub async fn ensure_admin_server(
     cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<(), String> {
     let mut admin_lock = state.admin_server.write().await;
-    if admin_lock.is_some() {
+    if let Some(admin) = admin_lock.as_ref() {
+        apply_runtime_proxy_config(&admin.axum_server, &config).await;
         return Ok(());
     }
 
@@ -275,26 +284,33 @@ pub async fn ensure_admin_server(
         config.experimental.compression_level.clone(),
         config.experimental.enable_usage_scaling,
     );
+    crate::proxy::config::update_global_thresholds(
+        config.experimental.context_compression_threshold_l1,
+        config.experimental.context_compression_threshold_l2,
+        config.experimental.context_compression_threshold_l3,
+    );
 
     Ok(())
 }
 
-/// 停止反代服务
+/// Stop the listener completely so the next start can bind a changed address or port.
 #[tauri::command]
 pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(), String> {
-    let mut instance_lock = state.instance.write().await;
-
-    if instance_lock.is_none() {
+    // An acknowledged stop has no listener or accepted connection left alive.
+    let _lifecycle = state.lifecycle.lock().await;
+    let instance = state.instance.write().await.take();
+    let Some(instance) = instance else {
         return Err("服务未运行".to_string());
-    }
+    };
 
-    // 停止 Axum 服务器 (仅逻辑停止，不杀死进程)
-    if let Some(instance) = instance_lock.take() {
-        instance.token_manager.abort_background_tasks().await;
-        instance.axum_server.set_running(false).await;
-        // 已移除 instance.axum_server.stop() 调用，防止杀死 Admin Server
-    }
+    instance.token_manager.abort_background_tasks().await;
+    instance.axum_server.set_running(false).await;
 
+    if let Some(admin) = state.admin_server.write().await.take() {
+        admin.axum_server.stop().await;
+        let _ = admin.server_handle.await;
+        admin.axum_server.drain_connections().await;
+    }
     Ok(())
 }
 
@@ -316,12 +332,15 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
 
     match lock_res {
         Ok(instance_lock) => match instance_lock.as_ref() {
-            Some(instance) => Ok(ProxyStatus {
-                running: true,
-                port: instance.config.port,
-                base_url: format!("http://127.0.0.1:{}", instance.config.port),
-                active_accounts: instance.token_manager.len(),
-            }),
+            Some(instance) => {
+                let port = instance.axum_server.port;
+                Ok(ProxyStatus {
+                    running: true,
+                    port,
+                    base_url: format!("http://127.0.0.1:{}", port),
+                    active_accounts: instance.token_manager.len(),
+                })
+            }
             None => Ok(ProxyStatus {
                 running: false,
                 port: 0,
@@ -329,15 +348,12 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
                 active_accounts: 0,
             }),
         },
-        Err(_) => {
-            // 如果拿不到锁，说明正在进行写操作（可能是正在启动或停止中）
-            Ok(ProxyStatus {
-                running: false,
-                port: 0,
-                base_url: "busy".to_string(),
-                active_accounts: 0,
-            })
-        }
+        Err(_) => Ok(ProxyStatus {
+            running: false,
+            port: 0,
+            base_url: "busy".to_string(),
+            active_accounts: 0,
+        }),
     }
 }
 
@@ -382,9 +398,9 @@ pub async fn set_proxy_monitor_enabled(
 /// 清除反代请求日志
 #[tauri::command]
 pub async fn clear_proxy_logs(state: State<'_, ProxyServiceState>) -> Result<(), String> {
-    let monitor_lock = state.monitor.read().await;
-    if let Some(monitor) = monitor_lock.as_ref() {
-        monitor.clear().await;
+    let monitor = state.monitor.read().await.as_ref().cloned();
+    if let Some(monitor) = monitor {
+        monitor.clear().await?;
     }
     Ok(())
 }
@@ -441,13 +457,67 @@ pub async fn export_proxy_logs_json(file_path: String, json_data: String) -> Res
     Ok(count)
 }
 
+async fn apply_runtime_proxy_config(
+    server: &crate::proxy::AxumServer,
+    config: &crate::proxy::ProxyConfig,
+) {
+    server.update_mapping(config).await;
+    server.update_proxy(config.upstream_proxy.clone()).await;
+    server.update_proxy_pool(config.proxy_pool.clone()).await;
+    server.update_security(config).await;
+    server.update_zai(config).await;
+    server.update_experimental(config).await;
+    server.update_debug_logging(config).await;
+    server.update_user_agent(config).await;
+    server
+        .update_only_raw_quota_models(config.only_raw_quota_models)
+        .await;
+    crate::proxy::update_thinking_budget_config(config.thinking_budget.clone());
+    crate::proxy::update_global_system_prompt_config(config.global_system_prompt.clone());
+    crate::proxy::update_image_thinking_mode(config.image_thinking_mode.clone());
+    crate::proxy::config::update_global_compression_level(
+        config.experimental.compression_level.clone(),
+        config.experimental.enable_usage_scaling,
+    );
+    crate::proxy::config::update_global_thresholds(
+        config.experimental.context_compression_threshold_l1,
+        config.experimental.context_compression_threshold_l2,
+        config.experimental.context_compression_threshold_l3,
+    );
+
+    // The shared desktop/web save path must also retain app-level runtime
+    // controls not represented inside ProxyConfig.
+    if let Ok(app_config) = crate::modules::config::load_app_config() {
+        server
+            .token_manager
+            .update_circuit_breaker_config(app_config.circuit_breaker)
+            .await;
+    }
+}
+
+/// Apply persisted settings to the retained runtime, including when it is logically stopped.
+pub async fn apply_saved_proxy_config(
+    state: &ProxyServiceState,
+    config: &crate::proxy::ProxyConfig,
+) -> Result<(), String> {
+    if let Some(admin) = state.admin_server.read().await.as_ref() {
+        apply_runtime_proxy_config(&admin.axum_server, config).await;
+    }
+    Ok(())
+}
+
 /// 获取带搜索条件的日志数量
 #[tauri::command]
 pub async fn get_proxy_logs_count_filtered(
     filter: String,
     errors_only: bool,
+    account_email: Option<String>,
 ) -> Result<u64, String> {
-    crate::modules::proxy_db::get_logs_count_filtered(&filter, errors_only)
+    crate::modules::proxy_db::get_logs_count_filtered(
+        &filter,
+        errors_only,
+        account_email.as_deref(),
+    )
 }
 
 /// 获取带搜索条件的分页日志
@@ -457,8 +527,20 @@ pub async fn get_proxy_logs_filtered(
     errors_only: bool,
     limit: usize,
     offset: usize,
+    account_email: Option<String>,
 ) -> Result<Vec<crate::proxy::monitor::ProxyRequestLog>, String> {
-    crate::modules::proxy_db::get_logs_filtered(&filter, errors_only, limit, offset)
+    crate::modules::proxy_db::get_logs_filtered(
+        &filter,
+        errors_only,
+        account_email.as_deref(),
+        limit,
+        offset,
+    )
+}
+
+#[tauri::command]
+pub async fn get_proxy_log_accounts() -> Result<Vec<String>, String> {
+    crate::modules::proxy_db::get_log_accounts()
 }
 
 /// 生成 API Key
@@ -496,19 +578,16 @@ pub async fn update_model_mapping(
     config: ProxyConfig,
     state: State<'_, ProxyServiceState>,
 ) -> Result<(), String> {
-    let instance_lock = state.instance.read().await;
+    let custom_mapping = config.custom_mapping;
+    let committed = crate::modules::config::update_app_config(|app_config| {
+        app_config.proxy.custom_mapping = custom_mapping;
+        Ok(())
+    })?;
 
-    // 1. 如果服务正在运行，立即更新内存中的映射 (这里目前只更新了 anthropic_mapping 的 RwLock,
-    // 后续可以根据需要让 resolve_model_route 直接读取全量 config)
-    if let Some(instance) = instance_lock.as_ref() {
-        instance.axum_server.update_mapping(&config).await;
-        tracing::debug!("后端服务已接收全量模型映射配置");
+    if let Some(instance) = state.instance.read().await.as_ref() {
+        instance.axum_server.update_mapping(&committed.proxy).await;
+        tracing::debug!("后端服务已接收提交后的模型映射配置");
     }
-
-    // 2. 无论是否运行，都保存到全局配置持久化
-    let mut app_config = crate::modules::config::load_app_config().map_err(|e| e)?;
-    app_config.proxy.custom_mapping = config.custom_mapping;
-    crate::modules::config::save_app_config(&app_config).map_err(|e| e)?;
 
     Ok(())
 }
@@ -683,37 +762,32 @@ pub async fn set_preferred_account(
     state: State<'_, ProxyServiceState>,
     account_id: Option<String>,
 ) -> Result<(), String> {
-    let instance_lock = state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        // 过滤空字符串为 None
-        let cleaned_id = account_id.filter(|s| !s.trim().is_empty());
+    // Persist first through the transaction API so a concurrent settings save
+    // cannot be overwritten, then apply exactly the committed setting.
+    let cleaned_id = account_id.filter(|s| !s.trim().is_empty());
+    let committed = crate::modules::config::update_app_config(|app_config| {
+        app_config.proxy.preferred_account_id = cleaned_id.clone();
+        Ok(())
+    })
+    .map_err(|e| format!("保存配置失败: {}", e))?;
 
-        // 1. 更新内存状态
+    if let Some(instance) = state.instance.read().await.as_ref() {
         instance
             .token_manager
-            .set_preferred_account(cleaned_id.clone())
+            .set_preferred_account(committed.proxy.preferred_account_id.clone())
             .await;
-
-        // 2. 持久化到配置文件 (修复 Issue #820 自动关闭问题)
-        let mut app_config = crate::modules::config::load_app_config()
-            .map_err(|e| format!("加载配置失败: {}", e))?;
-        app_config.proxy.preferred_account_id = cleaned_id.clone();
-        crate::modules::config::save_app_config(&app_config)
-            .map_err(|e| format!("保存配置失败: {}", e))?;
-
-        if let Some(ref id) = cleaned_id {
-            tracing::info!(
-                "🔒 [FIX #820] Fixed account mode enabled and persisted: {}",
-                id
-            );
-        } else {
-            tracing::info!("🔄 [FIX #820] Round-robin mode enabled and persisted");
-        }
-
-        Ok(())
-    } else {
-        Err("服务未运行".to_string())
     }
+
+    if let Some(id) = &cleaned_id {
+        tracing::info!(
+            "🔒 [FIX #820] Fixed account mode enabled and persisted: {}",
+            id
+        );
+    } else {
+        tracing::info!("🔄 [FIX #820] Round-robin mode enabled and persisted");
+    }
+
+    Ok(())
 }
 
 /// 获取当前优先使用的账号ID
@@ -765,9 +839,11 @@ pub async fn check_proxy_health(
     let instance_lock = state.instance.read().await;
     if let Some(instance) = instance_lock.as_ref() {
         let pool_state = instance.axum_server.proxy_pool_state.clone();
-        let manager = crate::proxy::proxy_pool::ProxyPoolManager::new(pool_state.clone());
-
-        manager.health_check().await?;
+        instance
+            .axum_server
+            .proxy_pool_manager
+            .health_check()
+            .await?;
 
         // Return the updated config from memory
         let config = pool_state.read().await;

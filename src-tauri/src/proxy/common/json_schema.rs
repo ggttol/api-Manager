@@ -47,6 +47,12 @@ pub fn clean_response_schema(value: &mut Value) {
 }
 
 pub fn clean_json_schema(value: &mut Value) {
+    // Function call/response objects carry client payload data, not schemas. In
+    // particular, arguments may legitimately contain schema-shaped keys or $ref.
+    if is_function_payload(value) {
+        return;
+    }
+
     // 0. 预处理：展开 $ref (Schema Flattening)
     // [FIX #952] 递归收集所有层级的 $defs/definitions，而非仅从根层级提取
     let mut all_defs = serde_json::Map::new();
@@ -97,6 +103,14 @@ pub fn clean_json_schema_for_tool(value: &mut Value, tool_name: &str) {
     if let Some(adapter) = adapter {
         let _ = adapter.post_process(value);
     }
+}
+
+fn is_function_payload(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(map)
+            if map.contains_key("functionCall") || map.contains_key("functionResponse")
+    )
 }
 
 /// [NEW #952] 递归收集所有层级的 $defs 和 definitions
@@ -206,6 +220,10 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
 
     match value {
         Value::Object(map) => {
+            if map.contains_key("functionCall") || map.contains_key("functionResponse") {
+                return false;
+            }
+
             // 0. [NEW] 合并 allOf
             merge_all_of(map);
 
@@ -326,20 +344,6 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 }
             }
 
-            // Gemini's Schema proto requires every ARRAY node to declare `items`,
-            // including nested arrays. JSON Schema permits an itemless array, so
-            // clients such as Claude Code may legitimately emit {"type":"array"}.
-            // Use a string item schema as a Gemini-compatible fallback for these
-            // otherwise unconstrained arrays.
-            let is_array = map
-                .get("type")
-                .and_then(Value::as_str)
-                .map(|t| t.eq_ignore_ascii_case("array"))
-                .unwrap_or(false);
-            if is_array && !map.contains_key("items") {
-                map.insert("items".to_string(), json!({ "type": "string" }));
-            }
-
             // Fallback: 对既没有 properties 也没有 items 的常规对象进行清理
             if !map.contains_key("properties") && !map.contains_key("items") {
                 for (k, v) in map.iter_mut() {
@@ -350,18 +354,9 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                 }
             }
 
-            // 1.5. [FIX] 递归清理 anyOf/oneOf 数组中的每个分支
-            // 必须在合并逻辑之前执行，确保合并的分支已经被清洗
-            if let Some(Value::Array(any_of)) = map.get_mut("anyOf") {
-                for branch in any_of.iter_mut() {
-                    clean_json_schema_recursive(branch, true, depth + 1);
-                }
-            }
-            if let Some(Value::Array(one_of)) = map.get_mut("oneOf") {
-                for branch in one_of.iter_mut() {
-                    clean_json_schema_recursive(branch, true, depth + 1);
-                }
-            }
+            // Select a union branch while null still has its original identity.
+            // Cleaning a null branch first turns it into a string fallback and makes
+            // result depend on branch order.
 
             // 2. [FIX #815] 处理 anyOf/oneOf 联合类型: 合并属性或择优选择分支
             let mut union_to_merge = None;
@@ -372,8 +367,11 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
             }
 
             if let Some(union_array) = union_to_merge {
-                if let Some((best_branch, all_types)) = extract_best_schema_from_union(&union_array)
+                let nullable_union = union_array.iter().any(is_null_schema);
+                if let Some((mut best_branch, all_types)) =
+                    extract_best_schema_from_union(&union_array)
                 {
+                    clean_json_schema_recursive(&mut best_branch, true, depth + 1);
                     if let Value::Object(branch_obj) = best_branch {
                         // 合并分支属性到当前 map
                         for (k, v) in branch_obj {
@@ -411,10 +409,14 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                         }
                     }
 
-                    // [NEW] 添加类型提示到描述中 (参考 CLIProxyAPI)
+                    if nullable_union {
+                        is_effectively_nullable = true;
+                    }
                     if all_types.len() > 1 {
-                        let type_hint = format!("Accepts: {}", all_types.join(" | "));
-                        append_hint_to_description(map, type_hint);
+                        append_hint_to_description(
+                            map,
+                            format!("Accepts: {}", all_types.join(" | ")),
+                        );
                     }
                 }
             }
@@ -567,6 +569,14 @@ fn clean_json_schema_recursive(value: &mut Value, is_schema_node: bool, depth: u
                             s.push_str("(nullable)");
                         }
                     }
+                }
+
+                // Type unions are normalized above, so complete nullable arrays only
+                // after their final concrete type is known.
+                if map.get("type").and_then(Value::as_str) == Some("array")
+                    && !map.contains_key("items")
+                {
+                    map.insert("items".to_string(), json!({ "type": "string" }));
                 }
 
                 // 9. Enum 值强制转字符串
@@ -730,6 +740,13 @@ fn score_schema_option(val: &Value) -> i32 {
         }
     }
     0
+}
+
+fn is_null_schema(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("null")
+    )
 }
 
 /// [NEW] 从 anyOf/oneOf 联合类型数组中选取最佳非 null Schema 分支
@@ -1038,6 +1055,33 @@ mod tests {
             schema["properties"]["home"]["properties"]["city"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn test_flatten_refs_when_properties_are_named_like_function_payloads() {
+        let mut schema = json!({
+            "$defs": {
+                "Address": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "functionCall": { "$ref": "#/$defs/Address" },
+                "functionResponse": { "$ref": "#/$defs/Address" }
+            }
+        });
+
+        clean_json_schema(&mut schema);
+
+        for name in ["functionCall", "functionResponse"] {
+            assert_eq!(schema["properties"][name]["type"], "object");
+            assert_eq!(
+                schema["properties"][name]["properties"]["city"]["type"],
+                "string"
+            );
+        }
     }
 
     #[test]
@@ -1739,7 +1783,10 @@ mod tests {
         clean_json_schema(&mut schema1);
 
         assert_eq!(schema1["properties"]["action_type"]["type"], "string");
-        assert_eq!(schema1["properties"]["action_type"]["enum"], json!(["element"]));
+        assert_eq!(
+            schema1["properties"]["action_type"]["enum"],
+            json!(["element"])
+        );
         assert!(schema1["properties"]["action_type"].get("const").is_none());
 
         assert_eq!(schema1["properties"]["count"]["type"], "integer");
@@ -1828,5 +1875,60 @@ mod tests {
             schema["properties"]["query"]["properties"]["where"]["items"]["items"],
             json!({ "type": "string" })
         );
+    }
+
+    #[test]
+    fn test_function_call_payload_is_not_schema_cleaned_or_ref_expanded() {
+        let mut payload = json!({
+            "functionCall": {
+                "name": "drive",
+                "args": {
+                    "type": "car",
+                    "color": "red",
+                    "nested": { "description": "literal", "items": "payload" },
+                    "$ref": "literal-data"
+                }
+            }
+        });
+        let original = payload.clone();
+
+        clean_json_schema(&mut payload);
+
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn test_nullable_unions_select_non_null_branch_regardless_of_order() {
+        for key in ["anyOf", "oneOf"] {
+            for scalar in ["integer", "boolean"] {
+                for branches in [
+                    json!([{ "type": "null" }, { "type": scalar }]),
+                    json!([{ "type": scalar }, { "type": "null" }]),
+                ] {
+                    let mut schema = json!({ (key): branches });
+                    clean_json_schema(&mut schema);
+                    assert_eq!(schema["type"], scalar);
+                    assert!(schema["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("nullable")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_array_type_gets_items_after_normalization() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "values": { "type": ["array", "null"] }
+            }
+        });
+
+        clean_json_schema(&mut schema);
+
+        let values = &schema["properties"]["values"];
+        assert_eq!(values["type"], "array");
+        assert_eq!(values["items"], json!({ "type": "string" }));
     }
 }

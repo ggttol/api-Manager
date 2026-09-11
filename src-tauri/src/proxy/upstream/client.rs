@@ -77,7 +77,7 @@ const V1_INTERNAL_BASE_URL_FALLBACKS: [&str; 3] = [
 pub struct UpstreamClient {
     default_client: RwLock<Client>,
     proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
-    client_cache: DashMap<String, Client>, // proxy_id -> Client
+    client_cache: DashMap<String, Client>, // proxy configuration fingerprint -> Client
     user_agent_override: RwLock<Option<String>>,
 }
 
@@ -177,7 +177,10 @@ impl UpstreamClient {
                 let url = crate::proxy::config::normalize_proxy_url(&config.url);
                 if let Ok(proxy) = rquest::Proxy::all(&url) {
                     builder = builder.proxy(proxy);
-                    tracing::info!("UpstreamClient enabled proxy: {}", url);
+                    tracing::info!(
+                        "UpstreamClient enabled proxy: {}",
+                        crate::proxy::proxy_pool::redact_proxy_url(&url)
+                    );
                 }
             }
         }
@@ -240,14 +243,13 @@ impl UpstreamClient {
                 match pool.get_proxy_for_account(acc_id).await {
                     Ok(Some(proxy_cfg)) => {
                         // Check cache
-                        if let Some(client) = self.client_cache.get(&proxy_cfg.entry_id) {
+                        if let Some(client) = self.client_cache.get(&proxy_cfg.cache_key) {
                             return client.clone();
                         }
-                        // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
                             Ok(client) => {
                                 self.client_cache
-                                    .insert(proxy_cfg.entry_id.clone(), client.clone());
+                                    .insert(proxy_cfg.cache_key.clone(), client.clone());
                                 tracing::info!(
                                     "Using ProxyPool proxy ID: {} for account: {}",
                                     proxy_cfg.entry_id,
@@ -336,11 +338,10 @@ impl UpstreamClient {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", access_token))
-                .map_err(|e| e.to_string())?,
-        );
+        let mut authorization = header::HeaderValue::from_str(&format!("Bearer {}", access_token))
+            .map_err(|e| e.to_string())?;
+        authorization.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, authorization);
 
         headers.insert(
             header::USER_AGENT,
@@ -388,11 +389,13 @@ impl UpstreamClient {
             }
         }
 
-        // 注入额外的 Headers (如 anthropic-beta)
-        for (k, v) in extra_headers {
-            if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
-                if let Ok(hv) = header::HeaderValue::from_str(&v) {
-                    headers.insert(hk, hv);
+        // Inject extra headers without permitting them to replace the bearer credential.
+        for (key, value) in extra_headers {
+            if let Ok(header_name) = header::HeaderName::from_bytes(key.as_bytes()) {
+                if header_name == header::AUTHORIZATION {
+                    tracing::warn!("Ignoring attempted Authorization header override");
+                } else if let Ok(header_value) = header::HeaderValue::from_str(&value) {
+                    headers.insert(header_name, header_value);
                 }
             }
         }

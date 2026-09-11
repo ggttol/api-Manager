@@ -1,3 +1,4 @@
+use crate::utils::atomic_file::{lock_client_config, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
@@ -221,45 +222,66 @@ pub fn get_sync_status(_proxy_url: &str) -> (bool, bool, Option<String>, usize) 
     let (synced_count, first_url) = count_synced_models(&json);
     (synced_count > 0, has_backup, first_url, synced_count)
 }
-
-fn create_backup(path: &PathBuf) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let backup_path = path.with_file_name(format!(
+fn backup_path(path: &PathBuf) -> PathBuf {
+    path.with_file_name(format!(
         "{}{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         BACKUP_SUFFIX
-    ));
-    if backup_path.exists() {
+    ))
+}
+
+fn created_marker_path(path: &PathBuf) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.antigravity-manager.created",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+fn create_backup(path: &PathBuf) -> Result<(), String> {
+    if !path.exists() || created_marker_path(path).exists() {
         return Ok(());
     }
-    fs::copy(path, &backup_path).map_err(|e| format!("Failed to create backup: {}", e))?;
-    tracing::info!("Created backup: {:?}", backup_path);
+    let backup = backup_path(path);
+    if backup.exists() {
+        return Ok(());
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("Failed to read config for backup: {error}"))?;
+    write_atomic(&backup, &bytes).map_err(|error| format!("Failed to create backup: {error}"))?;
+    tracing::info!("Created backup: {:?}", backup);
     Ok(())
 }
 
 /// 接收前端 preview 里完整的 customModels 数组，直接替换写入
 pub fn sync_droid_config(full_custom_models: Vec<Value>) -> Result<usize, String> {
+    let _transaction = lock_client_config();
     let config_path =
         get_config_path().ok_or_else(|| "Failed to get Droid config directory".to_string())?;
 
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    create_backup(&config_path)?;
-
-    let mut config: Value = if config_path.exists() {
+    let existed_before_sync = config_path.exists();
+    // Parse and validate before creating a backup, marker, directory, or any
+    // companion file, so malformed user state cannot produce a partial sync.
+    let mut config: Value = if existed_before_sync {
         let content = fs::read_to_string(&config_path)
             .map_err(|e| format!("Failed to read config: {}", e))?;
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?
     } else {
         serde_json::json!({})
     };
-
     if !config.is_object() {
-        config = serde_json::json!({});
+        return Err("Droid config root must be a JSON object".to_string());
+    }
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+    create_backup(&config_path)?;
+    if !existed_before_sync {
+        write_atomic(
+            &created_marker_path(&config_path),
+            b"created by api-manager\n",
+        )
+        .map_err(|error| format!("Failed to record config ownership: {error}"))?;
     }
 
     let ag_count = full_custom_models
@@ -277,23 +299,41 @@ pub fn sync_droid_config(full_custom_models: Vec<Value>) -> Result<usize, String
         .unwrap()
         .insert("customModels".to_string(), Value::Array(full_custom_models));
 
-    let tmp_path = config_path.with_extension("tmp");
-    fs::write(&tmp_path, serde_json::to_string_pretty(&config).unwrap())
-        .map_err(|e| format!("Failed to write temp file: {}", e))?;
-    fs::rename(&tmp_path, &config_path)
-        .map_err(|e| format!("Failed to rename config file: {}", e))?;
+    let content = serde_json::to_string_pretty(&config)
+        .map_err(|error| format!("Failed to serialize config: {error}"))?;
+    write_atomic(&config_path, content.as_bytes())
+        .map_err(|error| format!("Failed to write config: {error}"))?;
 
     Ok(ag_count)
 }
 
 pub fn restore_droid_config() -> Result<(), String> {
+    let _transaction = lock_client_config();
     let config_path =
         get_config_path().ok_or_else(|| "Failed to get Droid config directory".to_string())?;
 
-    let backup_path = config_path.with_file_name(format!("{}{}", DROID_CONFIG_FILE, BACKUP_SUFFIX));
-    if backup_path.exists() {
-        fs::rename(&backup_path, &config_path)
-            .map_err(|e| format!("Failed to restore config: {}", e))?;
+    let backup = backup_path(&config_path);
+    let marker = created_marker_path(&config_path);
+    // A marker records that no user configuration existed. It also takes
+    // precedence over stale backups left by pre-fix repeated syncs.
+    if marker.exists() {
+        if config_path.exists() {
+            fs::remove_file(&config_path)
+                .map_err(|error| format!("Failed to remove integration-created config: {error}"))?;
+        }
+        fs::remove_file(&marker)
+            .map_err(|error| format!("Failed to remove ownership record: {error}"))?;
+        if backup.exists() {
+            fs::remove_file(&backup)
+                .map_err(|error| format!("Failed to remove stale backup: {error}"))?;
+        }
+        Ok(())
+    } else if backup.exists() {
+        let bytes = fs::read(&backup).map_err(|error| format!("Failed to read backup: {error}"))?;
+        write_atomic(&config_path, &bytes)
+            .map_err(|error| format!("Failed to restore config: {error}"))?;
+        fs::remove_file(&backup)
+            .map_err(|error| format!("Failed to remove restored backup: {error}"))?;
         Ok(())
     } else {
         Err("No backup file found".to_string())

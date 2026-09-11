@@ -46,6 +46,7 @@ function Accounts() {
     accounts,
     currentAccount,
     fetchAccounts,
+    fetchCurrentAccount,
     addAccount,
     deleteAccount,
     deleteAccounts,
@@ -232,8 +233,8 @@ function Accounts() {
   }, [localPageSize, config?.accounts_page_size, containerSize, viewMode]);
 
   useEffect(() => {
-    fetchAccounts();
-  }, []);
+    void Promise.all([fetchAccounts(), fetchCurrentAccount()]);
+  }, [fetchAccounts, fetchCurrentAccount]);
 
   // Reset pagination when view mode changes to avoid empty pages or confusion
   useEffect(() => {
@@ -286,11 +287,17 @@ function Accounts() {
     return result;
   }, [searchedAccounts, filter]);
 
+  const totalPages = Math.max(1, Math.ceil(filteredAccounts.length / ITEMS_PER_PAGE));
+
+  useEffect(() => {
+    setCurrentPage((page) => Math.min(page, totalPages));
+  }, [totalPages]);
+
   // Pagination Logic
   const paginatedAccounts = useMemo(() => {
-    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+    const startIndex = (Math.min(currentPage, totalPages) - 1) * ITEMS_PER_PAGE;
     return filteredAccounts.slice(startIndex, startIndex + ITEMS_PER_PAGE);
-  }, [filteredAccounts, currentPage, ITEMS_PER_PAGE]);
+  }, [filteredAccounts, currentPage, totalPages, ITEMS_PER_PAGE]);
 
   const handlePageChange = (page: number) => {
     setCurrentPage(page);
@@ -360,8 +367,6 @@ function Accounts() {
       return next;
     });
     try {
-      await refreshQuota(accountId);
-      await refreshQuota(accountId);
       await refreshQuota(accountId);
       showToast(t("common.success"), "success");
     } catch (error) {
@@ -742,6 +747,15 @@ function Accounts() {
     }
   };
 
+  const handleReorder = async (visibleOrder: string[]) => {
+    const visibleIds = new Set(visibleOrder);
+    let nextVisible = 0;
+    const fullOrder = accounts.map((account) =>
+      visibleIds.has(account.id) ? visibleOrder[nextVisible++] : account.id,
+    );
+    await reorderAccounts(fullOrder);
+  };
+
   return (
     <div className="console-page console-page-fixed overflow-y-auto">
       <input
@@ -814,6 +828,7 @@ function Accounts() {
         )}
       </section>
 
+
       {/* 账号列表内容区域 */}
       <div className="flex-1 min-h-64 min-w-0 w-full relative" ref={containerRef}>
         {viewMode === "list" ? (
@@ -839,7 +854,7 @@ function Accounts() {
                     !!accounts.find((a) => a.id === id)?.proxy_disabled,
                   )
                 }
-                onReorder={reorderAccounts}
+                onReorder={handleReorder}
                 onWarmup={handleWarmup}
                 onUpdateLabel={handleUpdateLabel}
                 onViewError={(id: string) => setErrorAccountId(id)}
@@ -882,7 +897,7 @@ function Accounts() {
         <div className="flex-none">
           <Pagination
             currentPage={currentPage}
-            totalPages={Math.ceil(filteredAccounts.length / ITEMS_PER_PAGE)}
+            totalPages={totalPages}
             onPageChange={handlePageChange}
             totalItems={filteredAccounts.length}
             itemsPerPage={ITEMS_PER_PAGE}

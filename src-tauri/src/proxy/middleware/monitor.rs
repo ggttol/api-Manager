@@ -4,16 +4,17 @@ use crate::proxy::server::AppState;
 use axum::{
     body::Body,
     extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use base64::Engine as _;
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::time::Instant;
 
-const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB
-const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024; // 100MB for image responses
+const MAX_REQUEST_LOG_SIZE: usize = 100 * 1024 * 1024;
+const MAX_RESPONSE_LOG_SIZE: usize = 100 * 1024 * 1024;
 const MAX_LOGGED_FIELD_CHARS: usize = 500;
 
 async fn next_chunk_while_receiver_open<S, T>(
@@ -30,6 +31,45 @@ where
     }
 }
 
+/// Forward every upstream body frame while retaining only a bounded prefix for
+/// monitoring. Waiting on `tx` deliberately carries client backpressure to the
+/// upstream body; if the client disconnects, `next_chunk_while_receiver_open`
+/// stops polling and drops that body.
+async fn relay_body_with_bounded_capture(
+    body: Body,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, axum::Error>>,
+    capture_limit: usize,
+) -> (Vec<u8>, bool, Option<String>) {
+    let mut stream = body.into_data_stream();
+    let mut captured = Vec::with_capacity(capture_limit.min(8192));
+    let mut capture_truncated = false;
+
+    while let Some(chunk_result) = next_chunk_while_receiver_open(&mut stream, &tx).await {
+        match chunk_result {
+            Ok(chunk) => {
+                let remaining = capture_limit.saturating_sub(captured.len());
+                if remaining >= chunk.len() {
+                    captured.extend_from_slice(&chunk);
+                } else {
+                    captured.extend_from_slice(&chunk[..remaining]);
+                    capture_truncated = true;
+                }
+
+                if tx.send(Ok(chunk)).await.is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let message = format!("Response body read failed: {}", error);
+                let _ = tx.send(Err(error)).await;
+                return (captured, capture_truncated, Some(message));
+            }
+        }
+    }
+
+    (captured, capture_truncated, None)
+}
+
 fn truncate_for_log(value: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in value.chars().enumerate() {
@@ -40,6 +80,13 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn is_terminal_stream_error(json: &Value) -> bool {
+    matches!(
+        json.get("type").and_then(|value| value.as_str()),
+        Some("response.failed") | Some("error")
+    ) || json.get("error").is_some()
 }
 
 fn extract_quoted_param(header: &str, key: &str) -> Option<String> {
@@ -377,28 +424,19 @@ pub async fn monitor_middleware(
 
     let method = request.method().to_string();
     let uri = request.uri().to_string();
+    let path = request.uri().path();
 
-    if uri.contains("event_logging") || uri.contains("/api/") || uri.starts_with("/internal/") {
+    // Query text is client-controlled and must not disable accounting for an
+    // otherwise ordinary inference route.
+    if path.starts_with("/api/") || path.starts_with("/internal/") {
         return next.run(request).await;
     }
 
     let start = Instant::now();
-
-    // Extract client IP from headers (X-Forwarded-For or X-Real-IP)
-    // IMPORTANT: Extract from Request headers, not Response headers (since we want the client's IP)
-    // Note: We need to do this BEFORE consuming the request body if possible, or extract it from the original request
-    let client_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+    let trusted_proxies = { state.security.read().await.trusted_proxies.clone() };
+    let client_ip =
+        crate::proxy::middleware::client_ip::resolve_client_ip(&request, &trusted_proxies)
+            .map(|ip| ip.to_string());
 
     let user_agent = request
         .headers()
@@ -430,7 +468,11 @@ pub async fn monitor_middleware(
 
     let request = if method == "POST" {
         let (parts, body) = request.into_parts();
-        match axum::body::to_bytes(body, MAX_REQUEST_LOG_SIZE).await {
+        let request_limit = std::env::var("ABV_MAX_BODY_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(MAX_REQUEST_LOG_SIZE);
+        match axum::body::to_bytes(body, request_limit).await {
             Ok(bytes) => {
                 request_body_str = if request_content_type.starts_with("multipart/form-data") {
                     if let Some((summary, multipart_model)) =
@@ -460,9 +502,9 @@ pub async fn monitor_middleware(
                 };
                 Request::from_parts(parts, Body::from(bytes))
             }
-            Err(_) => {
-                request_body_str = None;
-                Request::from_parts(parts, Body::empty())
+            Err(error) => {
+                tracing::warn!("Unable to read request body for monitoring: {}", error);
+                return StatusCode::BAD_REQUEST.into_response();
             }
         }
     } else {
@@ -547,12 +589,19 @@ pub async fn monitor_middleware(
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
-            let mut all_stream_data = Vec::new();
+            let mut all_stream_data = Vec::with_capacity(MAX_RESPONSE_LOG_SIZE.min(8192));
+            let mut capture_truncated = false;
             let mut last_few_bytes = Vec::new();
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
-                    all_stream_data.extend_from_slice(&chunk);
+                    let remaining = MAX_RESPONSE_LOG_SIZE.saturating_sub(all_stream_data.len());
+                    if remaining >= chunk.len() {
+                        all_stream_data.extend_from_slice(&chunk);
+                    } else {
+                        all_stream_data.extend_from_slice(&chunk[..remaining]);
+                        capture_truncated = true;
+                    }
 
                     if chunk.len() > 8192 {
                         last_few_bytes = chunk.slice(chunk.len() - 8192..).to_vec();
@@ -566,6 +615,7 @@ pub async fn monitor_middleware(
                         break;
                     }
                 } else if let Err(e) = chunk_res {
+                    log.error = Some(format!("Stream body read failed: {}", e));
                     if tx.send(Err(axum::Error::new(e))).await.is_err() {
                         break;
                     }
@@ -592,6 +642,9 @@ pub async fn monitor_middleware(
                     }
 
                     if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                        if is_terminal_stream_error(&json) {
+                            log.error = Some(truncate_for_log(json_str, MAX_LOGGED_FIELD_CHARS));
+                        }
                         // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
                         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                             for choice in choices {
@@ -915,6 +968,37 @@ pub async fn monitor_middleware(
                 ));
             }
 
+            if capture_truncated {
+                let marker = format!(
+                    "\n[stream log capture truncated at {} bytes]",
+                    MAX_RESPONSE_LOG_SIZE
+                );
+                log.response_body = Some(match log.response_body.take() {
+                    Some(body) => format!("{}{}", body, marker),
+                    None => marker,
+                });
+            }
+
+            // A terminal error can occur after the bounded capture. Inspect the
+            // rolling tail as well so a successful transport status does not
+            // classify it as a successful request.
+            if log.error.is_none() {
+                if let Ok(tail) = std::str::from_utf8(&last_few_bytes) {
+                    for line in tail.lines().rev() {
+                        let Some(json_str) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
+                        if let Ok(json) = serde_json::from_str::<Value>(json_str.trim()) {
+                            if is_terminal_stream_error(&json) {
+                                log.error =
+                                    Some(truncate_for_log(json_str.trim(), MAX_LOGGED_FIELD_CHARS));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Fallback token extraction from tail if not already extracted
             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                 if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
@@ -971,11 +1055,20 @@ pub async fn monitor_middleware(
         )
     } else if content_type.contains("application/json") || content_type.contains("text/") {
         let (parts, body) = response.into_parts();
-        match axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE).await {
-            Ok(bytes) => {
-                if let Ok(s) = std::str::from_utf8(&bytes) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&s) {
-                        // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let (captured, capture_truncated, body_error) =
+                relay_body_with_bounded_capture(body, tx, MAX_RESPONSE_LOG_SIZE).await;
+
+            if let Some(error) = body_error {
+                log.error = Some(error);
+            }
+
+            if let Ok(response_text) = std::str::from_utf8(&captured) {
+                if !capture_truncated {
+                    if let Ok(json) = serde_json::from_str::<Value>(response_text) {
+                        // Support OpenAI "usage" and Gemini "usageMetadata".
                         if let Some(usage) = json
                             .get("usage")
                             .or(json.get("usageMetadata"))
@@ -996,48 +1089,60 @@ pub async fn monitor_middleware(
                             }
                         }
                     }
-                    if is_image_route {
-                        log.response_body = serde_json::from_str::<Value>(&s)
-                            .ok()
-                            .and_then(|json| summarize_image_json_response(&json))
-                            .or_else(|| Some(s.to_string()));
-                    } else {
-                        log.response_body = Some(s.to_string());
-                    }
+                }
+
+                let captured_body = if is_image_route && !capture_truncated {
+                    serde_json::from_str::<Value>(response_text)
+                        .ok()
+                        .and_then(|json| summarize_image_json_response(&json))
+                        .unwrap_or_else(|| response_text.to_string())
                 } else {
-                    log.response_body = Some("[Binary Response Data]".to_string());
-                }
+                    response_text.to_string()
+                };
+                log.response_body = Some(if capture_truncated {
+                    format!(
+                        "{}\n[response log capture truncated at {} bytes]",
+                        captured_body, MAX_RESPONSE_LOG_SIZE
+                    )
+                } else {
+                    captured_body
+                });
+            } else {
+                log.response_body = Some(if capture_truncated {
+                    format!(
+                        "[Binary Response Data; log capture truncated at {} bytes]",
+                        MAX_RESPONSE_LOG_SIZE
+                    )
+                } else {
+                    "[Binary Response Data]".to_string()
+                });
+            }
 
-                if log.status >= 400 {
-                    log.error = log.response_body.clone();
-                }
+            if log.status >= 400 && log.error.is_none() {
+                log.error = log.response_body.clone();
+            }
 
-                // [FIX #3325] Fallback input token estimation if upstream returned an error (no usage metadata)
-                if log.input_tokens.is_none() {
-                    if let Some(ref req_body) = log.request_body {
-                        let estimated = crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(req_body);
-                        if estimated > 0 {
-                            log.input_tokens = Some(estimated);
-                        }
+            // Fallback input token estimation if upstream returned no usage metadata.
+            if log.input_tokens.is_none() {
+                if let Some(req_body) = &log.request_body {
+                    let estimated =
+                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(
+                            req_body,
+                        );
+                    if estimated > 0 {
+                        log.input_tokens = Some(estimated);
                     }
                 }
-
-                // Record User Token Usage
-                record_user_token_usage(&user_token_identity, &log, user_agent.clone());
-
-                monitor.log_request(log).await;
-                Response::from_parts(parts, Body::from(bytes))
             }
-            Err(_) => {
-                log.response_body = Some("[Response too large (>100MB)]".to_string());
 
-                // Record User Token Usage (even if too large)
-                record_user_token_usage(&user_token_identity, &log, user_agent.clone());
+            record_user_token_usage(&user_token_identity, &log, user_agent);
+            monitor.log_request(log).await;
+        });
 
-                monitor.log_request(log).await;
-                Response::from_parts(parts, Body::empty())
-            }
-        }
+        Response::from_parts(
+            parts,
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
     } else {
         log.response_body = Some(format!("[{}]", content_type));
 
@@ -1051,13 +1156,32 @@ pub async fn monitor_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_input_tokens, next_chunk_while_receiver_open};
+    use super::{
+        extract_input_tokens, is_terminal_stream_error, next_chunk_while_receiver_open,
+        relay_body_with_bounded_capture,
+    };
+    use axum::body::Body;
+    use bytes::Bytes;
     use futures::stream;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
     use std::task::Poll;
+    #[test]
+    fn terminal_sse_failures_are_not_classified_as_transport_successes() {
+        assert!(is_terminal_stream_error(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {"code": "usage_limit_reached"}}
+        })));
+        assert!(is_terminal_stream_error(&serde_json::json!({
+            "type": "error",
+            "error": {"message": "upstream failed"}
+        })));
+        assert!(!is_terminal_stream_error(&serde_json::json!({
+            "type": "response.completed"
+        })));
+    }
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -1079,6 +1203,53 @@ mod tests {
         });
         assert_eq!(extract_input_tokens(&anthropic), Some(37));
         assert_eq!(extract_input_tokens(&consolidated), Some(37));
+    }
+
+    #[tokio::test]
+    async fn response_capture_limit_does_not_limit_forwarded_response() {
+        let expected = b"response larger than the monitor capture".to_vec();
+        let body = Body::from_stream(stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::copy_from_slice(&expected[..9])),
+            Ok(Bytes::copy_from_slice(&expected[9..])),
+        ]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let forwarder =
+            tokio::spawn(async move { relay_body_with_bounded_capture(body, tx, 9).await });
+
+        let mut received = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            received.extend_from_slice(&chunk.expect("upstream body should succeed"));
+        }
+        let (captured, truncated, error) = forwarder.await.expect("forwarder should not panic");
+
+        assert_eq!(received, expected);
+        assert_eq!(captured, expected[..9]);
+        assert!(truncated);
+        assert_eq!(error, None);
+    }
+
+    #[tokio::test]
+    async fn response_body_error_reaches_the_client_stream() {
+        let body = Body::from_stream(stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("upstream disconnected")),
+        ]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let forwarder =
+            tokio::spawn(async move { relay_body_with_bounded_capture(body, tx, 1024).await });
+
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("first response frame")
+                .expect("first response frame should succeed"),
+            Bytes::from_static(b"partial")
+        );
+        assert!(rx.recv().await.expect("body failure frame").is_err());
+        let (_, _, error) = forwarder.await.expect("forwarder should not panic");
+        assert!(error
+            .expect("body read failure must be logged")
+            .contains("upstream disconnected"));
     }
 
     #[tokio::test]

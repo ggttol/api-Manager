@@ -2,6 +2,18 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Two-pass functional audit repairs
+
+Request-log account options now combine Google, Codex, and historical accounts independently of the current page, including Codex identifiers without email addresses. Account, text, and error filtering share database predicates and matching totals; semantic errors inside HTTP 200 responses remain visible. Fixed stale log details, statistics and configuration responses, plus concurrent configuration saves and failed-write rollback.
+
+Fixed confirmed defects in account/OAuth credential persistence and cancellation, Codex session/private-state boundaries, pool and quota scheduling, Responses input conversion, tool/SSE termination, thinking budgets and signature recovery, token-policy updates, trusted-proxy/CIDR enforcement, and CLI configuration backup/restore. Administration authentication remains mandatory when inference authentication is disabled; server-side login errors no longer authorize the UI. Credential files use private atomic writes, and startup logs and localized login help no longer expose or direct users to plaintext credentials in logs.
+
+Service transitions are serialized and persistence errors are reported: failed startup prerequisites do not enable inference, while stopping immediately closes inference even if saving fails. Verification uses isolated data directories, synthetic accounts, and local HTTP scenarios; live upstream authorization, production inference, and Windows runtime execution were not exercised in this audit.
+
+A missing Google account directory is an empty pool, while invalid or unreadable storage remains an error. Fresh and Codex-only installations can restart the shared gateway; regression coverage distinguishes absence from invalid storage.
+
+Fixed Settings crashing when unset startup arguments are serialized as `null`; frontend types now represent that contract, and saved/detected arguments use the same lossless formatter.
+
 ## Codex native client image generation
 
 Added `/codex/v1/images/generations`, backed by the existing subscription pool and native Responses image tool. Ordinary conversations are unchanged. The client-facing `gpt-image-2` identifier is a compatibility alias; the upstream chooses its renderer, disclosed in a compatibility header. Single-image requests preserve supported options, upstream errors, quota scheduling and reported Responses usage. Official Codex 0.153.4 invoked the real endpoint, saved a kitten PNG and completed its conversation under isolated gateway configuration. This client version hides the image tool for a locally cached Free login regardless of the gateway pool's paid accounts. Image editing is not included.

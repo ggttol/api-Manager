@@ -70,7 +70,9 @@ pub fn start_scheduler(
     proxy_state: crate::commands::proxy::ProxyServiceState,
 ) {
     tauri::async_runtime::spawn(async move {
-        logger::log_info("[Scheduler] Weekly Reset Warmup Scheduler started. Monitoring 7-day quota windows...");
+        logger::log_info(
+            "[Scheduler] Weekly Reset Warmup Scheduler started. Monitoring 7-day quota windows...",
+        );
 
         // Scan every 5 minutes (300s) to check for accounts reaching weekly reset time
         let mut interval = time::interval(Duration::from_secs(300));
@@ -108,13 +110,9 @@ pub fn start_scheduler(
                     continue;
                 };
 
-                let Ok((fresh_quota, _)) = quota::fetch_quota_with_cache(
-                    &token,
-                    &acc.email,
-                    Some(&pid),
-                    Some(&acc.id),
-                )
-                .await
+                let Ok((fresh_quota, _)) =
+                    quota::fetch_quota_with_cache(&token, &acc.email, Some(&pid), Some(&acc.id))
+                        .await
                 else {
                     continue;
                 };
@@ -144,15 +142,14 @@ pub fn start_scheduler(
                                         );
                                         // 6-day cooldown for the same weekly cycle
                                         if !check_cooldown(&history_key, 6 * 86400) {
-                                            // Pick representative model for this group
-                                            let model_to_ping = if bucket
-                                                .bucket_id
-                                                .contains("3p")
-                                                || group.display_name.contains("Claude")
-                                            {
-                                                "claude-sonnet-4-6".to_string()
-                                            } else {
-                                                "gemini-3-flash".to_string()
+                                            // A grouped quota bucket represents a family, so only
+                                            // warm it with a user-enabled model from that family.
+                                            let Some(model_to_ping) = select_group_warmup_model(
+                                                &bucket.bucket_id,
+                                                &group.display_name,
+                                                &app_config.scheduled_warmup.monitored_models,
+                                            ) else {
+                                                continue;
                                             };
 
                                             tasks_to_run.push((
@@ -182,10 +179,8 @@ pub fn start_scheduler(
                             }
                             if let Some(reset_ts) = parse_reset_time_ts(&model.reset_time) {
                                 if now_ts >= reset_ts - 60 {
-                                    let history_key = format!(
-                                        "{}:{}:weekly:{}",
-                                        acc.email, model.name, reset_ts
-                                    );
+                                    let history_key =
+                                        format!("{}:{}:weekly:{}", acc.email, model.name, reset_ts);
                                     if !check_cooldown(&history_key, 6 * 86400) {
                                         tasks_to_run.push((
                                             acc.id.clone(),
@@ -304,12 +299,12 @@ pub async fn trigger_warmup_for_account(account: &Account) {
                                 account.email, bucket.bucket_id, reset_ts
                             );
                             if !check_cooldown(&history_key, 6 * 86400) {
-                                let model_to_ping = if bucket.bucket_id.contains("3p")
-                                    || group.display_name.contains("Claude")
-                                {
-                                    "claude-sonnet-4-6".to_string()
-                                } else {
-                                    "gemini-3-flash".to_string()
+                                let Some(model_to_ping) = select_group_warmup_model(
+                                    &bucket.bucket_id,
+                                    &group.display_name,
+                                    &app_config.scheduled_warmup.monitored_models,
+                                ) else {
+                                    continue;
                                 };
 
                                 let success = quota::warmup_model_directly(
@@ -331,5 +326,43 @@ pub async fn trigger_warmup_for_account(account: &Account) {
                 }
             }
         }
+    }
+}
+
+fn select_group_warmup_model(
+    bucket_id: &str,
+    display_name: &str,
+    monitored_models: &[String],
+) -> Option<String> {
+    let is_claude = bucket_id.to_ascii_lowercase().contains("3p")
+        || display_name.to_ascii_lowercase().contains("claude");
+    monitored_models
+        .iter()
+        .find(|model| {
+            let normalized = model.to_ascii_lowercase();
+            if is_claude {
+                normalized.contains("claude")
+            } else {
+                normalized.contains("gemini")
+            }
+        })
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_group_warmup_model;
+
+    #[test]
+    fn grouped_warmups_only_select_enabled_model_family() {
+        let enabled = vec!["gemini-3-flash".to_string()];
+        assert_eq!(
+            select_group_warmup_model("3p-weekly", "Claude", &enabled),
+            None
+        );
+        assert_eq!(
+            select_group_warmup_model("gemini-weekly", "Gemini", &enabled),
+            Some("gemini-3-flash".to_string())
+        );
     }
 }

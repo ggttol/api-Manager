@@ -1,5 +1,5 @@
 use crate::modules::user_token_db::{self, TokenIpBinding, UserToken};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateTokenRequest {
@@ -18,8 +18,17 @@ pub struct UpdateTokenRequest {
     pub description: Option<String>,
     pub enabled: Option<bool>,
     pub max_ips: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_update")]
     pub curfew_start: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_update")]
     pub curfew_end: Option<Option<String>>,
+}
+
+fn deserialize_optional_update<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 // 命令实现
@@ -104,4 +113,27 @@ pub async fn get_user_token_summary() -> Result<UserTokenStats, String> {
         total_users: users.len(),
         today_requests,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpdateTokenRequest;
+
+    #[test]
+    fn curfew_update_preserves_missing_null_and_value() {
+        let omitted: UpdateTokenRequest =
+            serde_json::from_str("{}").expect("omitted update payload");
+        assert_eq!(omitted.curfew_start, None);
+
+        let cleared: UpdateTokenRequest =
+            serde_json::from_str(r#"{"curfew_start":null,"curfew_end":null}"#)
+                .expect("null update payload");
+        assert_eq!(cleared.curfew_start, Some(None));
+        assert_eq!(cleared.curfew_end, Some(None));
+
+        let set: UpdateTokenRequest =
+            serde_json::from_str(r#"{"curfew_start":"22:00"}"#).expect("value update payload");
+        assert_eq!(set.curfew_start, Some(Some("22:00".to_string())));
+        assert_eq!(set.curfew_end, None);
+    }
 }

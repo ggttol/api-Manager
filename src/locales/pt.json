@@ -1284,8 +1284,8 @@
     "error_invalid_key": "Chave de acesso inválida ou expirada",
     "error_network": "Erro ao conectar ao serviço de autenticação",
     "note": "Nota: Se uma senha de administração separada estiver definida, insira-a; caso contrário, insira a API_KEY.",
-    "lookup_hint": "Se esqueceu, execute docker logs antigravity-manager para encontrar a Chave de API atual ou a senha da Web UI.",
-    "config_hint": "Ou execute grep -E '\"api_key\"|\"admin_password\"' ~/.antigravity_tools/gui_config.json para visualizar."
+    "lookup_hint": "Se esqueceu as credenciais, verifique WEB_PASSWORD ou API_KEY (incluindo as variantes ABV_) nas configurações da implantação. Os logs de inicialização não exibem credenciais.",
+    "config_hint": "Sem substituições por variáveis de ambiente, verifique proxy.admin_password ou proxy.api_key no gui_config.json do diretório de dados. Não compartilhe este arquivo."
   },
   "token_stats": {
     "title": "Estatísticas de Consumo de Tokens",

@@ -4,7 +4,12 @@ use std::path::PathBuf;
 
 fn get_antigravity_path(target_ide: Option<&str>) -> Option<PathBuf> {
     if let Ok(config) = crate::modules::config::load_app_config() {
-        if let Some(path_str) = config.antigravity_executable {
+        let configured = if target_ide == Some("ide") {
+            config.antigravity_ide_executable
+        } else {
+            config.antigravity_executable
+        };
+        if let Some(path_str) = configured {
             let path = PathBuf::from(path_str);
             if path.exists() {
                 return Some(path);
@@ -12,6 +17,67 @@ fn get_antigravity_path(target_ide: Option<&str>) -> Option<PathBuf> {
         }
     }
     crate::modules::process::get_antigravity_executable_path(target_ide)
+}
+
+/// Get database candidates for the exact application currently selected by the
+/// caller. Unlike `get_all_candidate_db_paths`, this never falls back across
+/// Antigravity products.
+fn get_current_application_db_paths(target_ide: Option<&str>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(user_data_dir) = crate::modules::process::get_user_data_dir_from_process(target_ide)
+    {
+        paths.push(
+            user_data_dir
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb"),
+        );
+    }
+
+    if let Some(antigravity_path) = get_antigravity_path(target_ide) {
+        if let Some(parent_dir) = antigravity_path.parent() {
+            paths.push(
+                parent_dir
+                    .join("data")
+                    .join("user-data")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("state.vscdb"),
+            );
+        }
+    }
+
+    let folder_name = if target_ide == Some("ide") {
+        "Antigravity IDE"
+    } else {
+        "Antigravity"
+    };
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(format!(
+            "Library/Application Support/{folder_name}/User/globalStorage/state.vscdb"
+        )));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        paths.push(
+            PathBuf::from(appdata)
+                .join(folder_name)
+                .join("User\\globalStorage\\state.vscdb"),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(format!(
+            ".config/{folder_name}/User/globalStorage/state.vscdb"
+        )));
+    }
+
+    paths
 }
 
 /// Get all possible Antigravity database candidate paths
@@ -81,6 +147,19 @@ pub fn get_all_candidate_db_paths(target_ide: Option<&str>) -> Vec<PathBuf> {
     }
 
     paths
+}
+
+/// Resolve an existing database for the exact application currently selected.
+///
+/// This is for synchronization/current-account operations. Broad discovery
+/// imports must continue to use `get_all_candidate_db_paths`.
+pub fn get_current_application_db_path(target_ide: Option<&str>) -> Result<PathBuf, String> {
+    get_current_application_db_paths(target_ide)
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            "Login state data not found in the selected application's database".to_string()
+        })
 }
 
 /// Get Antigravity database path (cross-platform)

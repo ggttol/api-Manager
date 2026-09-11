@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
@@ -39,6 +39,9 @@ pub struct ProxyMonitor {
     pub max_logs: usize,
     pub enabled: AtomicBool,
     app_handle: Option<tauri::AppHandle>,
+    /// Serializes persistence with clear so an acknowledged clear cannot be
+    /// followed by a write that began before it.
+    operation_lock: Mutex<()>,
 }
 
 impl ProxyMonitor {
@@ -68,6 +71,7 @@ impl ProxyMonitor {
             max_logs,
             enabled: AtomicBool::new(false), // Default to disabled
             app_handle,
+            operation_lock: Mutex::new(()),
         }
     }
 
@@ -99,18 +103,56 @@ impl ProxyMonitor {
             return;
         }
         tracing::info!("[Monitor] Logging request: {} {}", log.method, log.url);
-        // Update stats
+        let _operation = self.operation_lock.lock().await;
+
+        // Persist before updating local state or notifying listeners. This makes
+        // the event safe for consumers that immediately refresh authoritative DB
+        // data and serializes persistence with clear().
+        let log_to_save = log.clone();
+        let persisted = tokio::task::spawn_blocking(move || {
+            crate::modules::proxy_db::save_log(&log_to_save)?;
+
+            if let Some(ip) = &log_to_save.client_ip {
+                let security_log = crate::modules::security_db::IpAccessLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    client_ip: ip.clone(),
+                    timestamp: log_to_save.timestamp / 1000,
+                    method: Some(log_to_save.method.clone()),
+                    path: Some(log_to_save.url.clone()),
+                    user_agent: None,
+                    status: Some(log_to_save.status as i32),
+                    duration: Some(log_to_save.duration as i64),
+                    api_key_hash: None,
+                    blocked: false,
+                    block_reason: None,
+                    username: log_to_save.username.clone(),
+                };
+                crate::modules::security_db::save_ip_access_log(&security_log)?;
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!("Failed to persist proxy log: {}", error);
+                return;
+            }
+            Err(error) => {
+                tracing::error!("Proxy log persistence task failed: {}", error);
+                return;
+            }
+        }
+
         {
             let mut stats = self.stats.write().await;
             stats.total_requests += 1;
-            if log.status >= 200 && log.status < 400 {
+            if log.status >= 200 && log.status < 400 && log.error.is_none() {
                 stats.success_count += 1;
             } else {
                 stats.error_count += 1;
             }
         }
-
-        // Add log to memory
         {
             let mut logs = self.logs.write().await;
             if logs.len() >= self.max_logs {
@@ -118,36 +160,6 @@ impl ProxyMonitor {
             }
             logs.push_front(log.clone());
         }
-
-        // Save to DB
-        let log_to_save = log.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::modules::proxy_db::save_log(&log_to_save) {
-                tracing::error!("Failed to save proxy log to DB: {}", e);
-            }
-
-            // Sync to Security DB (IpAccessLogs) so it appears in Security Monitor
-            if let Some(ip) = &log_to_save.client_ip {
-                let security_log = crate::modules::security_db::IpAccessLog {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    client_ip: ip.clone(),
-                    timestamp: log_to_save.timestamp / 1000, // ms to s
-                    method: Some(log_to_save.method.clone()),
-                    path: Some(log_to_save.url.clone()),
-                    user_agent: None, // We don't have UA in ProxyRequestLog easily accessible here without plumbing
-                    status: Some(log_to_save.status as i32),
-                    duration: Some(log_to_save.duration as i64),
-                    api_key_hash: None,
-                    blocked: false, // This comes from monitor, so it wasn't blocked by IP filter
-                    block_reason: None,
-                    username: log_to_save.username.clone(),
-                };
-
-                if let Err(e) = crate::modules::security_db::save_ip_access_log(&security_log) {
-                    tracing::error!("Failed to save security log: {}", e);
-                }
-            }
-        });
 
         // Emit event (send summary only, without body to reduce memory)
         if let Some(app) = &self.app_handle {
@@ -224,7 +236,13 @@ impl ProxyMonitor {
         let search = search_text.unwrap_or_default();
 
         let res = tokio::task::spawn_blocking(move || {
-            crate::modules::proxy_db::get_logs_filtered(&search, errors_only, page_size, offset)
+            crate::modules::proxy_db::get_logs_filtered(
+                &search,
+                errors_only,
+                None,
+                page_size,
+                offset,
+            )
         })
         .await;
 
@@ -234,17 +252,16 @@ impl ProxyMonitor {
         }
     }
 
-    pub async fn clear(&self) {
+    pub async fn clear(&self) -> Result<(), String> {
+        let _operation = self.operation_lock.lock().await;
+        tokio::task::spawn_blocking(crate::modules::proxy_db::clear_logs)
+            .await
+            .map_err(|error| format!("Proxy log clear task failed: {}", error))??;
+
         let mut logs = self.logs.write().await;
         logs.clear();
         let mut stats = self.stats.write().await;
         *stats = ProxyStats::default();
-
-        let _ = tokio::task::spawn_blocking(|| {
-            if let Err(e) = crate::modules::proxy_db::clear_logs() {
-                tracing::error!("Failed to clear logs in DB: {}", e);
-            }
-        })
-        .await;
+        Ok(())
     }
 }

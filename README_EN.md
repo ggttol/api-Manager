@@ -217,6 +217,8 @@ If you are upgrading from v4.0.1 or earlier, your installation won't have a `WEB
 > - **Environment Variable** (`WEB_PASSWORD`) has the highest priority. If set, the application will always use it and ignore values in the configuration file.
 > - **Configuration File** (`gui_config.json`) is used for persistent storage. When you change the password via Web UI and save, it is written here.
 > - **Fallback**: If neither is set, it falls back to `API_KEY`; if even `API_KEY` is missing, a random one is generated.
+>
+> Startup logs do not print plaintext keys or passwords. If credentials are forgotten, check deployment environment variables or `proxy.admin_password` / `proxy.api_key` in the data directory's `gui_config.json`. Keep this file private.
 
 # Option 2: Use Docker Compose
 # 1. Enter the Docker directory

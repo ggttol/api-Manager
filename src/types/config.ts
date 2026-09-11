@@ -26,6 +26,7 @@ export interface ProxyConfig {
     image_thinking_mode?: 'enabled' | 'disabled'; // [NEW] 图像思维模式开关
     only_raw_quota_models?: boolean; // [NEW] 是否只暴露真实配额模型
     proxy_pool?: ProxyPoolConfig;
+    trusted_proxies?: string[];
 }
 
 // ============================================================================
@@ -137,7 +138,7 @@ export interface AppConfig {
     antigravity_executable?: string; // [NEW] 手动指定的反重力程序路径
     antigravity_ide_executable?: string; // [NEW] 手动指定的 Antigravity IDE 程序路径
     antigravity_cli_executable?: string; // [NEW] 手动指定的 Antigravity CLI (agy) 路径
-    antigravity_args?: string[]; // [NEW] Antigravity 启动参数
+    antigravity_args?: string[] | null; // [NEW] Antigravity 启动参数
     auto_launch?: boolean; // 开机自动启动
     accounts_page_size?: number; // 账号列表每页显示数量,默认 0 表示自动计算
     hidden_menu_items?: string[]; // 隐藏的菜单项路径列表

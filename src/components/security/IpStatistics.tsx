@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
 import { Activity, ShieldAlert, Users, Globe } from 'lucide-react';
@@ -39,26 +39,30 @@ export const IpStatistics: React.FC<Props> = ({ refreshKey }) => {
     const [loadError, setLoadError] = useState(false);
     const [timeRange, setTimeRange] = useState<number>(24);
 
-    const loadStats = async () => {
-        setLoading(true);
-        setLoadError(false);
-        try {
-            const [statsData, tokenData] = await Promise.all([
-                invoke<IpStatsResponse>('get_ip_stats'),
-                invoke<IpTokenStats[]>('get_ip_token_stats', { limit: 20, hours: timeRange })
-            ]);
-            setStats(statsData);
-            setTokenStats(tokenData || []);
-        } catch (e) {
-            setLoadError(true);
-            console.error('Failed to load stats', e);
-        } finally {
-            setLoading(false);
-        }
-    };
+    const requestGeneration = useRef(0);
 
     useEffect(() => {
-        loadStats();
+        const generation = ++requestGeneration.current;
+        setLoading(true);
+        setLoadError(false);
+        const loadStats = async () => {
+            try {
+                const [statsData, tokenData] = await Promise.all([
+                    invoke<IpStatsResponse>('get_ip_stats'),
+                    invoke<IpTokenStats[]>('get_ip_token_stats', { limit: 20, hours: timeRange }),
+                ]);
+                if (generation !== requestGeneration.current) return;
+                setStats(statsData);
+                setTokenStats(tokenData || []);
+            } catch (e) {
+                if (generation !== requestGeneration.current) return;
+                setLoadError(true);
+                console.error('Failed to load stats', e);
+            } finally {
+                if (generation === requestGeneration.current) setLoading(false);
+            }
+        };
+        void loadStats();
     }, [timeRange, refreshKey]);
 
     const getTimeRangeLabel = () => {

@@ -151,19 +151,42 @@ pub(super) fn usage(value: &Value, now: i64) -> Usage {
     }
 }
 
-pub(super) fn from_429(headers: &HeaderMap, value: &Value, now: i64) -> Cooldown {
+pub(super) fn is_quota_error(value: &Value, now: i64) -> bool {
     let error = value
         .get("error")
         .filter(|error| error.is_object())
         .unwrap_or(value);
-    let known_quota = ["type", "code"].iter().any(|key| {
+    ["type", "code"].iter().any(|key| {
         matches!(
             error.get(*key).and_then(Value::as_str),
             Some(
                 "usage_limit_reached" | "insufficient_quota" | "quota_exceeded" | "quota_exhausted"
             )
         )
-    });
+    }) || matches!(usage(value, now), Usage::Exhausted(_))
+}
+
+pub(super) fn is_cooldown_error(value: &Value, now: i64) -> bool {
+    is_quota_error(value, now)
+        || ["type", "code"].iter().any(|key| {
+            matches!(
+                value
+                    .get("error")
+                    .filter(|error| error.is_object())
+                    .unwrap_or(value)
+                    .get(*key)
+                    .and_then(Value::as_str),
+                Some("rate_limit_exceeded" | "rate_limited")
+            )
+        })
+}
+
+pub(super) fn from_429(headers: &HeaderMap, value: &Value, now: i64) -> Cooldown {
+    let error = value
+        .get("error")
+        .filter(|error| error.is_object())
+        .unwrap_or(value);
+    let known_quota = is_quota_error(value, now);
     let reached = headers
         .get("x-codex-rate-limit-reached-type")
         .and_then(|value| value.to_str().ok())
@@ -321,5 +344,29 @@ mod tests {
             usage(&json!({"code_review_rate_limit":{"allowed":false}}), now),
             Usage::Unknown
         ));
+        let transient = json!({"error":{"code":"rate_limit_exceeded"}});
+        assert!(is_cooldown_error(&transient, now));
+        assert!(!is_quota_error(&transient, now));
+        assert_eq!(
+            from_429(&headers, &transient, now),
+            Cooldown {
+                until: now + 240,
+                reason: "rate_limited"
+            }
+        );
+        let mut account = Account {
+            id: "account".into(),
+            email: None,
+            label: "account".into(),
+            plan_type: None,
+            enabled: true,
+            expires_at: None,
+            last_used_at: None,
+            last_error: None,
+            cooldown_until: Some(now + 240),
+            cooldown_reason: Some("rate_limited".into()),
+        };
+        assert_eq!(account.cooldown_until, Some(now + 240));
+        assert_eq!(account.cooldown_reason.as_deref(), Some("rate_limited"));
     }
 }

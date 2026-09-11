@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -151,7 +152,10 @@ pub fn init_db() -> Result<(), String> {
     Ok(())
 }
 
-/// Record token usage from a request
+/// Record token usage from a request.
+///
+/// Raw events and their hourly rollup are one logical record: neither is allowed
+/// to survive if the other write fails.
 pub fn record_usage(
     account_email: &str,
     model: &str,
@@ -159,19 +163,40 @@ pub fn record_usage(
     output_tokens: u32,
     cached_tokens: u32,
 ) -> Result<(), String> {
-    let conn = connect_db()?;
-    let timestamp = chrono::Local::now().timestamp();
-    let total_tokens = input_tokens + output_tokens;
+    let mut conn = connect_db()?;
+    record_usage_at(
+        &mut conn,
+        account_email,
+        model,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        Local::now(),
+    )
+}
 
-    // Insert into raw usage table
-    conn.execute(
+fn record_usage_at(
+    conn: &mut Connection,
+    account_email: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_tokens: u32,
+    recorded_at: chrono::DateTime<Local>,
+) -> Result<(), String> {
+    let timestamp = recorded_at.timestamp();
+    let total_tokens = input_tokens + output_tokens;
+    let hour_bucket = recorded_at.format("%Y-%m-%d %H:00").to_string();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    tx.execute(
         "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, total_tokens)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, total_tokens],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
-    let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
-    conn.execute(
+    tx.execute(
         "INSERT INTO token_stats_hourly (hour_bucket, account_email, total_input_tokens, total_output_tokens, total_cached_tokens, total_tokens, request_count)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
          ON CONFLICT(hour_bucket, account_email) DO UPDATE SET
@@ -181,16 +206,47 @@ pub fn record_usage(
             total_tokens = total_tokens + ?6,
             request_count = request_count + 1",
         params![hour_bucket, account_email, input_tokens, output_tokens, cached_tokens, total_tokens],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
+}
+
+/// Statistics windows are aligned to an elapsed-hour boundary, rather than a
+/// local wall-clock boundary. A Unix timestamp identifies one real instant, so
+/// this remains unambiguous across repeated or skipped local DST hours.
+///
+/// All statistics views for a selected range use this cutoff. Rollups are
+/// hourly, so flooring the elapsed range to an hour prevents a rollup from
+/// including usage excluded by a raw-event query.
+fn hourly_window_start(hours: i64) -> DateTime<Local> {
+    hourly_window_start_at(Local::now(), hours)
+}
+
+fn hourly_window_start_at(now: DateTime<Local>, hours: i64) -> DateTime<Local> {
+    let timestamp = hourly_window_timestamp(now.timestamp(), hours);
+
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|boundary| boundary.with_timezone(&Local))
+        // `timestamp` comes from an existing DateTime and is therefore always
+        // representable. Retain a real instant rather than panicking if Chrono
+        // ever rejects an out-of-range value.
+        .unwrap_or(now)
+}
+
+fn hourly_window_timestamp(now_timestamp: i64, hours: i64) -> i64 {
+    now_timestamp
+        .saturating_sub(hours.saturating_mul(3_600))
+        .div_euclid(3_600)
+        .saturating_mul(3_600)
 }
 
 /// Get hourly aggregated stats for a time range
 pub fn get_hourly_stats(hours: i64) -> Result<Vec<TokenStatsAggregated>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now() - chrono::Duration::hours(hours);
-    let cutoff_bucket = cutoff.format("%Y-%m-%d %H:00").to_string();
+    let cutoff_bucket = hourly_window_start(hours)
+        .format("%Y-%m-%d %H:00")
+        .to_string();
 
     let mut stmt = conn
         .prepare(
@@ -227,22 +283,26 @@ pub fn get_hourly_stats(hours: i64) -> Result<Vec<TokenStatsAggregated>, String>
     Ok(result)
 }
 
-/// Get daily aggregated stats for a time range
+/// Get daily aggregated stats for a time range.
+///
+/// Daily groups retain the partial first local day when the selected range
+/// begins mid-day, so their totals match the corresponding summary and trends.
 pub fn get_daily_stats(days: i64) -> Result<Vec<TokenStatsAggregated>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now() - chrono::Duration::days(days);
-    let cutoff_bucket = cutoff.format("%Y-%m-%d").to_string();
+    let cutoff_bucket = hourly_window_start(days.saturating_mul(24))
+        .format("%Y-%m-%d %H:00")
+        .to_string();
 
     let mut stmt = conn
         .prepare(
-            "SELECT substr(hour_bucket, 1, 10) as day_bucket, 
-                SUM(total_input_tokens) as input, 
+            "SELECT substr(hour_bucket, 1, 10) as day_bucket,
+                SUM(total_input_tokens) as input,
                 SUM(total_output_tokens) as output,
                 SUM(total_cached_tokens) as cached,
                 SUM(total_tokens) as total,
                 SUM(request_count) as count
-         FROM token_stats_hourly 
-         WHERE substr(hour_bucket, 1, 10) >= ?1
+         FROM token_stats_hourly
+         WHERE hour_bucket >= ?1
          GROUP BY day_bucket
          ORDER BY day_bucket ASC",
         )
@@ -268,11 +328,11 @@ pub fn get_daily_stats(days: i64) -> Result<Vec<TokenStatsAggregated>, String> {
     Ok(result)
 }
 
-/// Get weekly aggregated stats
+/// Get weekly aggregated stats. The weekly grouping uses the same elapsed-hour
+/// cutoff as the dashboard's other views for this range.
 pub fn get_weekly_stats(weeks: i64) -> Result<Vec<TokenStatsAggregated>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now() - chrono::Duration::weeks(weeks);
-    let cutoff_timestamp = cutoff.timestamp();
+    let cutoff_timestamp = hourly_window_start(weeks.saturating_mul(7 * 24)).timestamp();
 
     let mut stmt = conn
         .prepare(
@@ -312,8 +372,9 @@ pub fn get_weekly_stats(weeks: i64) -> Result<Vec<TokenStatsAggregated>, String>
 /// Get per-account statistics for a time range
 pub fn get_account_stats(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now() - chrono::Duration::hours(hours);
-    let cutoff_bucket = cutoff.format("%Y-%m-%d %H:00").to_string();
+    let cutoff_bucket = hourly_window_start(hours)
+        .format("%Y-%m-%d %H:00")
+        .to_string();
 
     let mut stmt = conn
         .prepare(
@@ -353,8 +414,9 @@ pub fn get_account_stats(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
 /// Get summary statistics for a time range
 pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now() - chrono::Duration::hours(hours);
-    let cutoff_bucket = cutoff.format("%Y-%m-%d %H:00").to_string();
+    let cutoff_bucket = hourly_window_start(hours)
+        .format("%Y-%m-%d %H:00")
+        .to_string();
 
     let (total_input, total_output, total_cached, total, requests): (u64, u64, u64, u64, u64) =
         conn.query_row(
@@ -398,7 +460,7 @@ pub fn get_summary_stats(hours: i64) -> Result<TokenStatsSummary, String> {
 
 pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now().timestamp() - (hours * 3600);
+    let cutoff = hourly_window_start(hours).timestamp();
 
     let mut stmt = conn
         .prepare(
@@ -437,7 +499,7 @@ pub fn get_model_stats(hours: i64) -> Result<Vec<ModelTokenStats>, String> {
 
 pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now().timestamp() - (hours * 3600);
+    let cutoff = hourly_window_start(hours).timestamp();
 
     let mut stmt = conn
         .prepare(
@@ -477,7 +539,7 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
 
 pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now().timestamp() - (days * 24 * 3600);
+    let cutoff = hourly_window_start(days.saturating_mul(24)).timestamp();
 
     let mut stmt = conn
         .prepare(
@@ -517,7 +579,7 @@ pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> 
 
 pub fn get_account_trend_hourly(hours: i64) -> Result<Vec<AccountTrendPoint>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now().timestamp() - (hours * 3600);
+    let cutoff = hourly_window_start(hours).timestamp();
 
     let mut stmt = conn
         .prepare(
@@ -560,7 +622,7 @@ pub fn get_account_trend_hourly(hours: i64) -> Result<Vec<AccountTrendPoint>, St
 
 pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now().timestamp() - (days * 24 * 3600);
+    let cutoff = hourly_window_start(days.saturating_mul(24)).timestamp();
 
     let mut stmt = conn
         .prepare(
@@ -605,10 +667,133 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
 mod tests {
     use super::*;
 
+    fn test_connection() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                account_email TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cached_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL
+            );
+            CREATE TABLE token_stats_hourly (
+                hour_bucket TEXT NOT NULL,
+                account_email TEXT NOT NULL,
+                total_input_tokens INTEGER NOT NULL,
+                total_output_tokens INTEGER NOT NULL,
+                total_cached_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                request_count INTEGER NOT NULL,
+                PRIMARY KEY (hour_bucket, account_email)
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
     #[test]
-    fn test_record_and_query() {
-        // This would need a test database setup
-        // For now, just verify the module compiles
-        assert!(true);
+    fn record_usage_rolls_back_raw_event_when_hourly_rollup_fails() {
+        let mut conn = test_connection();
+        conn.execute_batch(
+            "CREATE TRIGGER abort_hourly_insert BEFORE INSERT ON token_stats_hourly
+             BEGIN SELECT RAISE(ABORT, 'hourly failure'); END;",
+        )
+        .unwrap();
+
+        assert!(
+            record_usage_at(&mut conn, "a@example.com", "model", 3, 5, 1, Local::now()).is_err()
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_stats_hourly", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+
+        conn.execute_batch("DROP TRIGGER abort_hourly_insert;")
+            .unwrap();
+        record_usage_at(&mut conn, "a@example.com", "model", 3, 5, 1, Local::now()).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_stats_hourly", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn range_cutoff_is_hour_aligned_and_independent_of_local_dst_boundaries() {
+        // This is 01:30 in America/New_York's repeated fall-back hour. The
+        // calculation works from the instant, not from an ambiguous local time.
+        let now = DateTime::parse_from_rfc3339("2026-11-01T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected = DateTime::parse_from_rfc3339("2026-10-31T06:00:00Z")
+            .unwrap()
+            .timestamp();
+
+        assert_eq!(hourly_window_timestamp(now.timestamp(), 24), expected);
+        assert_eq!(
+            hourly_window_start_at(now.with_timezone(&Local), 24).timestamp(),
+            expected
+        );
+    }
+
+    #[test]
+    fn daily_rollup_and_raw_views_use_the_same_range_cutoff() {
+        let mut conn = test_connection();
+        let now = DateTime::parse_from_rfc3339("2026-03-15T15:30:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+        let cutoff = hourly_window_start_at(now, 7 * 24);
+        let excluded = cutoff - chrono::Duration::seconds(1);
+        let included = cutoff + chrono::Duration::minutes(15);
+
+        record_usage_at(&mut conn, "a@example.com", "old", 2, 0, 0, excluded).unwrap();
+        record_usage_at(&mut conn, "a@example.com", "new", 3, 0, 0, cutoff).unwrap();
+        record_usage_at(&mut conn, "b@example.com", "new", 5, 0, 0, included).unwrap();
+
+        let raw_total: u64 = conn
+            .query_row(
+                "SELECT SUM(total_tokens) FROM token_usage WHERE timestamp >= ?1",
+                [cutoff.timestamp()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cutoff_bucket = cutoff.format("%Y-%m-%d %H:00").to_string();
+        let rollup_total: u64 = conn
+            .query_row(
+                "SELECT SUM(total_tokens) FROM token_stats_hourly WHERE hour_bucket >= ?1",
+                [&cutoff_bucket],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let daily_rollup_total: u64 = conn
+            .query_row(
+                "SELECT SUM(total_tokens) FROM token_stats_hourly WHERE hour_bucket >= ?1 GROUP BY substr(hour_bucket, 1, 10)",
+                [&cutoff_bucket],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(raw_total, 8);
+        assert_eq!(rollup_total, raw_total);
+        assert_eq!(daily_rollup_total, raw_total);
     }
 }

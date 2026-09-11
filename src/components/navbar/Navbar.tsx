@@ -12,7 +12,7 @@ import './ConsoleShell.css';
 
 function Navbar({ children }: { children: ReactNode }) {
     const { t, i18n } = useTranslation();
-    const { config, saveConfig } = useConfigStore();
+    const { config, updateConfig } = useConfigStore();
     const location = useLocation();
     const [collapsed, setCollapsed] = useState(false);
     const [mobileOpen, setMobileOpen] = useState(false);
@@ -80,7 +80,7 @@ function Navbar({ children }: { children: ReactNode }) {
             const endRadius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
             // @ts-ignore -- supported browsers expose this progressive enhancement.
             const transition = document.startViewTransition(async () => {
-                await saveConfig({ ...config, theme: newTheme, language: config.language }, true);
+                await updateConfig(config => ({ ...config, theme: newTheme }), true);
             });
             transition.ready.then(() => {
                 const isDarkMode = newTheme === 'dark';
@@ -95,13 +95,13 @@ function Navbar({ children }: { children: ReactNode }) {
                 });
             });
         } else {
-            await saveConfig({ ...config, theme: newTheme, language: config.language }, true);
+            await updateConfig(config => ({ ...config, theme: newTheme }), true);
         }
     };
 
     const handleLanguageChange = async (langCode: string) => {
         if (!config) return;
-        await saveConfig({ ...config, language: langCode, theme: config.theme }, true);
+        await updateConfig(config => ({ ...config, language: langCode }), true);
     };
 
     return (

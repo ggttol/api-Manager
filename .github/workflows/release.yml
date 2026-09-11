@@ -67,7 +67,7 @@ jobs:
 
           $configPath = "src-tauri/tauri.conf.json"
           $config = Get-Content -Raw $configPath | ConvertFrom-Json
-          $config.bundle.createUpdaterArtifacts = $false
+          $config.bundle | Add-Member -NotePropertyName createUpdaterArtifacts -NotePropertyValue $false -Force
           $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
           Write-Host "No updater signing key configured; disabled updater artifacts for this build."
 

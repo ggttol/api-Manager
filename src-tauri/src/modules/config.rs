@@ -1,21 +1,30 @@
 use serde_json;
 use std::fs;
+use std::sync::{LazyLock, Mutex};
 
 use super::account::get_data_dir;
 use crate::models::AppConfig;
-use tracing::warn;
 
 const CONFIG_FILE: &str = "gui_config.json";
 
-/// Load application configuration
+/// Serializes complete config read-modify-write transactions in this process.
+static CONFIG_UPDATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Load application configuration.
 pub fn load_app_config() -> Result<AppConfig, String> {
+    let _lock = CONFIG_UPDATE_LOCK
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_config_lock: {}", e))?;
+    load_app_config_unlocked()
+}
+
+fn load_app_config_unlocked() -> Result<AppConfig, String> {
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
 
     if !config_path.exists() {
         let config = AppConfig::new();
-        // [FIX #1460] Persist initial config to prevent new API Key on every refresh
-        let _ = save_app_config(&config);
+        save_app_config_locked(&config)?;
         return Ok(config);
     }
 
@@ -39,6 +48,7 @@ pub fn load_app_config() -> Result<AppConfig, String> {
                     "Invalid custom_mapping type (expected object, got {:?}), resetting to empty",
                     m
                 );
+                modified = true;
                 serde_json::Map::new()
             }
             None => serde_json::Map::new(),
@@ -90,21 +100,41 @@ pub fn load_app_config() -> Result<AppConfig, String> {
     let config: AppConfig = serde_json::from_value(v)
         .map_err(|e| format!("failed_to_convert_config_after_migration: {}", e))?;
 
-    // If migration occurred, auto-save once to clean up the file
+    // If migration occurred, auto-save once to clean up the file.
     if modified {
-        let _ = save_app_config(&config);
+        save_app_config_locked(&config)?;
     }
 
     Ok(config)
 }
 
-/// Save application configuration
+/// Save application configuration atomically.
 pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
+    let _lock = CONFIG_UPDATE_LOCK
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_config_lock: {}", e))?;
+    save_app_config_locked(config)
+}
+
+fn save_app_config_locked(config: &AppConfig) -> Result<(), String> {
     let data_dir = get_data_dir()?;
     let config_path = data_dir.join(CONFIG_FILE);
-
-    let content = serde_json::to_string_pretty(config)
+    let content = serde_json::to_vec_pretty(config)
         .map_err(|e| format!("failed_to_serialize_config: {}", e))?;
 
-    fs::write(&config_path, content).map_err(|e| format!("failed_to_save_config: {}", e))
+    crate::utils::atomic_file::write_atomic(&config_path, &content)
+        .map_err(|e| format!("failed_to_save_config: {}", e))
+}
+
+/// Atomically reads, updates, and persists the complete application configuration.
+pub fn update_app_config(
+    update: impl FnOnce(&mut AppConfig) -> Result<(), String>,
+) -> Result<AppConfig, String> {
+    let _lock = CONFIG_UPDATE_LOCK
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_config_lock: {}", e))?;
+    let mut config = load_app_config_unlocked()?;
+    update(&mut config)?;
+    save_app_config_locked(&config)?;
+    Ok(config)
 }

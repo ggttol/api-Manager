@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { RefreshCw, X, CodeXml } from 'lucide-react';
 import {
@@ -31,6 +31,11 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
     const [syncing, setSyncing] = useState(false);
     const [hasAuthPlugin, setHasAuthPlugin] = useState(false);
     const [customBaseUrl, setCustomBaseUrl] = useState(proxyUrl);
+    const [configError, setConfigError] = useState<string | null>(null);
+    const [configState, setConfigState] = useState<'loading' | 'ready' | 'error'>('loading');
+    const [loadedConfig, setLoadedConfig] = useState<Record<string, any> | null>(null);
+    const configRequest = useRef<Promise<Record<string, any>> | null>(null);
+    const initialized = useRef(false);
 
     const sensors = useSensors(
         useSensor(PointerSensor, { activationConstraint: { distance: 3 } }),
@@ -54,76 +59,78 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
         setPreviewModels(newEntries);
     }, [antigravityModels, apiKey]);
 
-    // 初始加载 opencode 配置（json 或 jsonc，由后端探测决定实际文件）
+    // Keep the request alive across dependency changes and StrictMode's
+    // setup/cleanup/setup cycle. The response is applied only once, after the
+    // canonical catalog needed to normalize existing IDs is available.
     useEffect(() => {
+        if (!configRequest.current) {
+            configRequest.current = invoke<string>('get_opencode_config_content', {
+                request: { fileName: 'opencode.json', parsed: true },
+            }).then(content => {
+                const parsed: unknown = JSON.parse(content);
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    throw new Error('OpenCode configuration must be a JSON object');
+                }
+                return parsed as Record<string, any>;
+            });
+        }
+
         let cancelled = false;
-        invoke<string>('get_opencode_config_content', { request: { fileName: 'opencode.json' } })
-            .then(content => {
-                if (cancelled) return;
-                const parsed = JSON.parse(content);
-                const existingModelIds = new Set<string>();
-
-                const addModelId = (k: string) => {
-                    let canonicalId = k;
-                    if (canonicalFamilies && canonicalFamilies.length > 0) {
-                        for (const family of canonicalFamilies) {
-                            if (family.match_ids.includes(k.toLowerCase())) {
-                                canonicalId = family.canonical_id;
-                                break;
-                            }
-                        }
-                    }
-                    existingModelIds.add(canonicalId);
-                };
-
-                // Priority 1: Read from antigravity-manager provider
-                if (parsed.provider?.['antigravity-manager']?.models) {
-                    for (const k of Object.keys(parsed.provider['antigravity-manager'].models)) {
-                        addModelId(k);
-                    }
-                }
-
-                // Fallback: legacy anthropic/google providers
-                if (existingModelIds.size === 0) {
-                    if (parsed.provider?.anthropic?.models) {
-                        for (const k of Object.keys(parsed.provider.anthropic.models)) {
-                            addModelId(k);
-                        }
-                    }
-                    if (parsed.provider?.google?.models) {
-                        for (const k of Object.keys(parsed.provider.google.models)) {
-                            addModelId(k);
-                        }
-                    }
-                }
-
-                // Detect auth plugin conflict
-                const plugins = parsed.plugin || [];
-                const hasAuth = plugins.some((p: string) => p.includes('opencode-antigravity-auth'));
-                setHasAuthPlugin(hasAuth);
-
-                // Try to extract existing baseURL from antigravity-manager provider
-                if (parsed.provider?.['antigravity-manager']?.options?.baseURL) {
-                    setCustomBaseUrl(parsed.provider['antigravity-manager'].options.baseURL);
-                }
-
-                setSelectedModels(existingModelIds);
-                rebuildPreview(existingModelIds);
+        configRequest.current
+            .then(config => {
+                if (!cancelled) setLoadedConfig(config);
             })
-            .catch(() => {
-                if (!cancelled) rebuildPreview(new Set());
+            .catch(error => {
+                if (cancelled) return;
+                setConfigError(error instanceof Error ? error.message : String(error));
+                setConfigState('error');
             });
         return () => { cancelled = true; };
-    }, [rebuildPreview, canonicalFamilies]);
+    }, []);
+
+    useEffect(() => {
+        if (initialized.current || !loadedConfig || antigravityModels.length === 0 || canonicalFamilies.length === 0) return;
+        initialized.current = true;
+
+        const existingModelIds = new Set<string>();
+        const addModelId = (id: string) => {
+            const family = canonicalFamilies.find(candidate =>
+                candidate.match_ids.includes(id.toLowerCase()),
+            );
+            existingModelIds.add(family?.canonical_id ?? id);
+        };
+        const provider = loadedConfig.provider as Record<string, any> | undefined;
+        const managedModels = provider?.['antigravity-manager']?.models;
+        if (managedModels && typeof managedModels === 'object') {
+            Object.keys(managedModels).forEach(addModelId);
+        }
+        if (existingModelIds.size === 0) {
+            for (const name of ['anthropic', 'google']) {
+                const models = provider?.[name]?.models;
+                if (models && typeof models === 'object') Object.keys(models).forEach(addModelId);
+            }
+        }
+        const plugins = Array.isArray(loadedConfig.plugin) ? loadedConfig.plugin : [];
+        setHasAuthPlugin(plugins.some((plugin: unknown) =>
+            typeof plugin === 'string' && plugin.includes('opencode-antigravity-auth'),
+        ));
+        const baseUrl = provider?.['antigravity-manager']?.options?.baseURL;
+        if (typeof baseUrl === 'string') setCustomBaseUrl(baseUrl);
+        setSelectedModels(existingModelIds);
+        rebuildPreview(existingModelIds);
+        setConfigState('ready');
+    }, [antigravityModels, canonicalFamilies, loadedConfig, rebuildPreview]);
 
     const allSelected = antigravityModels.length > 0 && antigravityModels.every(m => selectedModels.has(m.id));
     const toggleAll = () => {
+        if (configState !== 'ready') return;
         const next = allSelected ? new Set<string>() : new Set(antigravityModels.map(m => m.id));
         setSelectedModels(next);
         rebuildPreview(next);
     };
 
     const toggleModel = (modelId: string) => {
+        if (configState !== 'ready') return;
         const next = new Set(selectedModels);
         if (next.has(modelId)) next.delete(modelId); else next.add(modelId);
         setSelectedModels(next);
@@ -149,6 +156,7 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
     };
 
     const executeOpenCodeSync = async () => {
+        if (configState !== 'ready') return;
         setSyncing(true);
         try {
             // Send both the model id and its display name so the backend can write a
@@ -200,7 +208,16 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
                     </div>
                 </div>
 
-                {/* Custom BaseURL Input */}
+                {configState === 'loading' && (
+                    <div className="px-5 py-2 text-xs text-gray-400 border-b border-gray-100 dark:border-base-200">
+                        {t('common.loading', { defaultValue: 'Loading configuration…' })}
+                    </div>
+                )}
+                {configState === 'error' && (
+                    <div className="px-5 py-2 text-xs text-red-600 bg-red-50 dark:bg-red-900/20 border-b border-red-100 dark:border-red-900/30">
+                        {t('proxy.config.opencode_sync.config_read_error', { defaultValue: 'Unable to read OpenCode configuration: {{error}}', error: configError })}
+                    </div>
+                )}
                 <div className="px-5 py-2 shrink-0 border-b border-gray-100 dark:border-base-200 bg-gray-50/50 dark:bg-base-200">
                     <div className="flex flex-col gap-1.5">
                         <div className="flex items-center justify-between">
@@ -216,15 +233,17 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
                                 id="customBaseUrl"
                                 type="text"
                                 value={customBaseUrl}
-                                onChange={(e) => setCustomBaseUrl(e.target.value)}
+                                onChange={(event) => setCustomBaseUrl(event.target.value)}
                                 placeholder="e.g. http://antigravity-manager:8045/v1"
+                                disabled={configState !== 'ready'}
                                 className="w-full px-3 py-1.5 text-xs bg-white dark:bg-base-100 border border-gray-200 dark:border-base-300 rounded-lg focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
                             />
                             {customBaseUrl !== proxyUrl && (
                                 <button
                                     type="button"
+                                    disabled={configState !== 'ready'}
                                     onClick={() => setCustomBaseUrl(proxyUrl)}
-                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] text-blue-500 hover:text-blue-600 font-medium"
+                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] text-blue-500 hover:text-blue-600 font-medium disabled:text-gray-300"
                                 >
                                     {t('proxy.config.opencode_sync.custom_base_url_reset', { defaultValue: 'Reset' })}
                                 </button>
@@ -240,32 +259,33 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
                             {t('proxy.config.opencode_sync.select_models', { defaultValue: '选择要同步的模型' })}
                             <span className="ml-2 text-gray-300">{selectedModels.size}/{antigravityModels.length}</span>
                         </span>
-                        <button type="button" onClick={toggleAll} className="text-[10px] text-blue-500 hover:text-blue-600 font-medium transition-colors">
+                        <button type="button" disabled={configState !== 'ready'} onClick={toggleAll} className="text-[10px] text-blue-500 hover:text-blue-600 font-medium transition-colors disabled:text-gray-300 disabled:cursor-not-allowed">
                             {allSelected ? t('common.deselect_all', { defaultValue: '取消全选' }) : t('common.select_all', { defaultValue: '全选' })}
                         </button>
                     </div>
                     <div className="space-y-2 max-h-[25vh] overflow-auto">
                         {groups.map(group => {
-                            const groupModels = antigravityModels.filter(m => m.group === group);
+                            const groupModels = antigravityModels.filter(model => model.group === group);
                             return (
                                 <div key={group}>
                                     <div className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mb-1">{group}</div>
                                     <div className="flex flex-wrap gap-1.5">
-                                        {groupModels.map(m => {
-                                            const selected = selectedModels.has(m.id);
+                                        {groupModels.map(model => {
+                                            const selected = selectedModels.has(model.id);
                                             return (
                                                 <button
                                                     type="button"
-                                                    key={m.id}
-                                                    onClick={() => toggleModel(m.id)}
+                                                    key={model.id}
+                                                    disabled={configState !== 'ready'}
+                                                    onClick={() => toggleModel(model.id)}
                                                     className={cn(
                                                         "px-2.5 py-1 rounded-md text-[11px] font-medium transition-all duration-150 border",
                                                         selected
                                                             ? "bg-blue-500 text-white border-blue-500"
-                                                            : "bg-gray-50 dark:bg-base-200 text-gray-500 dark:text-gray-400 border-gray-200 dark:border-base-300 hover:border-blue-300"
+                                                            : "bg-gray-50 dark:bg-base-200 text-gray-500 dark:text-gray-400 border-gray-200 dark:border-base-300 hover:border-blue-300",
                                                     )}
                                                 >
-                                                    {m.name}
+                                                    {model.name}
                                                 </button>
                                             );
                                         })}
@@ -323,11 +343,11 @@ export function OpenCodeSyncModal({ proxyUrl, apiKey, getFormattedProxyUrl, sync
                         type="button"
                         className={cn(
                             "px-4 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5",
-                            previewModels.length > 0
+                            configState === 'ready' && previewModels.length > 0
                                 ? "bg-blue-500 hover:bg-blue-600 active:bg-blue-700 text-white shadow-sm"
-                                : "bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed"
+                                : "bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed",
                         )}
-                        disabled={previewModels.length === 0 || syncing}
+                        disabled={configState !== 'ready' || previewModels.length === 0 || syncing}
                         onClick={executeOpenCodeSync}
                     >
                         <RefreshCw size={12} className={syncing ? 'animate-spin' : ''} />

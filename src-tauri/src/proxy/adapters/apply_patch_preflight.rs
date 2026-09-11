@@ -447,53 +447,114 @@ fn normalized_diff_path(path: &str) -> Option<String> {
 }
 
 /// Gemini 在非原生 OpenAI apply_patch tool 上常把补丁写成 unified diff:
-/// `--- path` / `+++ path` / `@@ -a,+b`。Codex V4A 需要文件操作头
-/// `*** Update File: path`,所以这里只做无语义损失的头部转换。
+/// `--- path` / `+++ path` / `@@ -a,+b`。Codex V4A 需要文件操作头。
+///
+/// V4A Update hunk 中的 `---` / `+++` 是删除/新增的字面内容（例如删掉
+/// `-- option`），不能误认成 unified 文件头；因此只在任何 V4A 文件 section
+/// 之外转换。`/dev/null` 代表真实的创建/删除语义，分别映射为 Add/Delete。
 fn convert_unified_file_headers(v4a: &str) -> (String, Vec<Repair>) {
     let lines: Vec<&str> = v4a.lines().collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut repairs = Vec::new();
     let mut i = 0usize;
     let mut converted = 0usize;
+    let mut in_v4a_section = false;
+    let mut skip_unified_delete_body = false;
+    let mut skip_unified_add_range = false;
 
     while i < lines.len() {
         let line = lines[i];
-        let trimmed = line.trim();
 
-        if let Some(old_path) = line.strip_prefix("--- ") {
-            if let Some(next) = lines.get(i + 1) {
-                if let Some(new_path) = next.strip_prefix("+++ ") {
-                    if let Some(path) =
-                        normalized_diff_path(new_path).or_else(|| normalized_diff_path(old_path))
-                    {
-                        out.push(format!("*** Update File: {path}"));
+        if line == "*** End Patch" {
+            in_v4a_section = false;
+            skip_unified_delete_body = false;
+            skip_unified_add_range = false;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if line.starts_with("*** Add File:")
+            || line.starts_with("*** Update File:")
+            || line.starts_with("*** Delete File:")
+        {
+            in_v4a_section = true;
+            skip_unified_delete_body = false;
+            skip_unified_add_range = false;
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        if !in_v4a_section {
+            if let Some(old_path) = line.strip_prefix("--- ") {
+                if let Some(next) = lines.get(i + 1) {
+                    if let Some(new_path) = next.strip_prefix("+++ ") {
+                        let old_path = normalized_diff_path(old_path);
+                        let new_path = normalized_diff_path(new_path);
+                        let (operation, path, detail) = match (old_path, new_path) {
+                            (Some(old), Some(new)) => (
+                                "Update File",
+                                new,
+                                "unified diff file headers -> V4A Update File",
+                            ),
+                            (None, Some(new)) => (
+                                "Add File",
+                                new,
+                                "unified diff /dev/null header -> V4A Add File",
+                            ),
+                            (Some(old), None) => (
+                                "Delete File",
+                                old,
+                                "unified diff /dev/null header -> V4A Delete File",
+                            ),
+                            (None, None) => {
+                                out.push(line.to_string());
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        out.push(format!("*** {operation}: {path}"));
                         repairs.push(Repair {
                             file: path,
                             kind: "repaired".to_string(),
-                            detail: "unified diff file headers -> V4A Update File".to_string(),
+                            detail: detail.to_string(),
                         });
                         converted += 1;
+                        skip_unified_delete_body = operation == "Delete File";
+                        skip_unified_add_range = operation == "Add File";
+                        in_v4a_section = operation == "Update File";
                         i += 2;
                         continue;
                     }
                 }
             }
-        }
 
-        if let Some(path) = trimmed
-            .strip_prefix("file: ")
-            .or_else(|| trimmed.strip_prefix("File: "))
-            .and_then(normalized_diff_path)
-        {
-            out.push(format!("*** Update File: {path}"));
-            repairs.push(Repair {
-                file: path,
-                kind: "repaired".to_string(),
-                detail: "file: header -> V4A Update File".to_string(),
-            });
-            converted += 1;
-            i += 1;
-            continue;
+            if skip_unified_delete_body {
+                i += 1;
+                continue;
+            }
+            if skip_unified_add_range && is_unified_hunk_range_header(line) {
+                i += 1;
+                continue;
+            }
+
+            if let Some(path) = line
+                .strip_prefix("file: ")
+                .or_else(|| line.strip_prefix("File: "))
+                .and_then(normalized_diff_path)
+            {
+                out.push(format!("*** Update File: {path}"));
+                repairs.push(Repair {
+                    file: path,
+                    kind: "repaired".to_string(),
+                    detail: "file: header -> V4A Update File".to_string(),
+                });
+                converted += 1;
+                in_v4a_section = true;
+                i += 1;
+                continue;
+            }
         }
 
         out.push(line.to_string());
@@ -592,7 +653,7 @@ pub fn validate_v4a_for_codex(v4a: &str) -> Option<(usize, String)> {
     let Some((first_line_no, first)) = meaningful.first() else {
         return Some((1, "empty apply_patch input".to_string()));
     };
-    if first.trim() != "*** Begin Patch" {
+    if *first != "*** Begin Patch" {
         return Some((
             first_line_no + 1,
             "apply_patch input must start with *** Begin Patch".to_string(),
@@ -601,7 +662,7 @@ pub fn validate_v4a_for_codex(v4a: &str) -> Option<(usize, String)> {
     let Some((last_line_no, last)) = meaningful.last() else {
         return Some((1, "empty apply_patch input".to_string()));
     };
-    if last.trim() != "*** End Patch" {
+    if *last != "*** End Patch" {
         return Some((
             last_line_no + 1,
             "apply_patch input must end with *** End Patch".to_string(),
@@ -609,27 +670,29 @@ pub fn validate_v4a_for_codex(v4a: &str) -> Option<(usize, String)> {
     }
 
     let mut has_hunk = false;
+    let mut in_v4a_section = false;
     for (idx, line) in v4a.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "*** Begin Patch" && idx != *first_line_no {
+        if line == "*** Begin Patch" && idx != *first_line_no {
             return Some((
                 idx + 1,
                 "apply_patch input contains a nested or repeated *** Begin Patch".to_string(),
             ));
         }
-        if trimmed == "*** End Patch" && idx != *last_line_no {
+        if line == "*** End Patch" && idx != *last_line_no {
             return Some((
                 idx + 1,
                 "apply_patch input contains an early or repeated *** End Patch".to_string(),
             ));
         }
-        if trimmed.starts_with("*** Add File:")
-            || trimmed.starts_with("*** Update File:")
-            || trimmed.starts_with("*** Delete File:")
+        if line.starts_with("*** Add File:")
+            || line.starts_with("*** Update File:")
+            || line.starts_with("*** Delete File:")
         {
             has_hunk = true;
+            in_v4a_section = true;
         }
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
+        if !in_v4a_section && (line.starts_with("--- ") || line.starts_with("+++ ")) {
             return Some((
                 idx + 1,
                 "V4A apply_patch does not accept unified diff file header lines (---/+++)"
@@ -646,13 +709,13 @@ pub fn validate_v4a_for_codex(v4a: &str) -> Option<(usize, String)> {
         if idx != *first_line_no && idx != *last_line_no && !trimmed.is_empty() {
             match line.chars().next() {
                 Some('+') | Some('-') | Some(' ') => {}
-                _ if trimmed.starts_with("@@") => {}
-                _ if trimmed.starts_with("*** Add File:")
-                    || trimmed.starts_with("*** Update File:")
-                    || trimmed.starts_with("*** Delete File:")
-                    || trimmed.starts_with("*** Move to:")
-                    || trimmed == "*** End of File" => {}
-                _ if trimmed.starts_with("***") => {
+                _ if line.starts_with("@@") => {}
+                _ if line.starts_with("*** Add File:")
+                    || line.starts_with("*** Update File:")
+                    || line.starts_with("*** Delete File:")
+                    || line.starts_with("*** Move to:")
+                    || line == "*** End of File" => {}
+                _ if line.starts_with("***") => {
                     return Some((
                         idx + 1,
                         format!(
@@ -1967,6 +2030,37 @@ mod tests {
     }
 
     #[test]
+    fn unified_dev_null_headers_preserve_create_and_delete_semantics() {
+        let add = "*** Begin Patch\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+first\n+second\n*** End Patch\n";
+        let (added, add_repairs) = optimize_patch(add, None, true);
+        assert_eq!(
+            added,
+            "*** Begin Patch\n*** Add File: new.txt\n+first\n+second\n*** End Patch\n"
+        );
+        assert!(
+            add_repairs
+                .iter()
+                .any(|repair| repair.detail.contains("Add File")),
+            "{add_repairs:?}"
+        );
+        assert!(validate_v4a_for_codex(&added).is_none(), "{added}");
+
+        let delete = "*** Begin Patch\n--- a/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-old\n-content\n*** End Patch\n";
+        let (deleted, delete_repairs) = optimize_patch(delete, None, true);
+        assert_eq!(
+            deleted,
+            "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch\n"
+        );
+        assert!(
+            delete_repairs
+                .iter()
+                .any(|repair| repair.detail.contains("Delete File")),
+            "{delete_repairs:?}"
+        );
+        assert!(validate_v4a_for_codex(&deleted).is_none(), "{deleted}");
+    }
+
+    #[test]
     fn optimize_patch_converts_file_header_to_v4a_update() {
         let v4a = "*** Begin Patch\nfile: C:\\Users\\32057\\Documents\\Codex\\2026-07-05\\zai\\data_summary.md\n@@\n-old\n+new\n*** End Patch\n";
         let (out, reps) = optimize_patch(v4a, None, true);
@@ -1981,10 +2075,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_v4a_rejects_unified_headers() {
-        let v4a = "*** Begin Patch\n*** Update File: x\n--- a/x\n+++ b/x\n@@ -1 +1\n-a\n+b\n*** End Patch\n";
-        let err = validate_v4a_for_codex(v4a).expect("unified diff should be rejected");
-        assert!(err.1.contains("unified diff file header"));
+    fn v4a_sections_preserve_header_like_hunk_lines() {
+        let v4a = "*** Begin Patch\n*** Update File: source.txt\n--- target.txt\n+++ target.txt\n-old\n+new\n*** End Patch\n";
+        let (out, _) = optimize_patch(v4a, None, true);
+        assert_eq!(
+            out, v4a,
+            "hunk bytes must not become another file operation"
+        );
+        assert!(validate_v4a_for_codex(&out).is_none(), "{out}");
+
+        let malformed = "*** Begin Patch\n--- a/x\n+++ b/x\n*** End Patch\n";
+        assert!(validate_v4a_for_codex(malformed).is_some());
     }
 
     #[test]
@@ -2011,6 +2112,32 @@ mod tests {
         assert!(out.contains("*** Update File: x\n@@\n-a\n+b"));
         assert!(validate_v4a_for_codex(&out).is_none(), "{out}");
         assert!(reps.iter().any(|r| r.file == "(@@ range header)"));
+    }
+
+    #[test]
+    fn optimize_patch_preserves_header_like_v4a_context() {
+        let v4a = "*** Begin Patch\n*** Update File: source.txt\n-a\n+A\n file: target.txt\n-old\n+new\n*** End Patch\n";
+        let (out, _) = optimize_patch(v4a, None, true);
+
+        assert_eq!(out, v4a);
+        assert!(validate_v4a_for_codex(&out).is_none(), "{out}");
+    }
+
+    #[test]
+    fn validate_v4a_allows_envelope_text_in_context_but_rejects_envelopes() {
+        for marker in ["*** Begin Patch", "*** End Patch"] {
+            let v4a = format!(
+                "*** Begin Patch\n*** Update File: fixture.txt\n {marker}\n-old\n+new\n*** End Patch\n"
+            );
+            assert!(
+                validate_v4a_for_codex(&v4a).is_none(),
+                "context marker must not be treated as an envelope: {v4a}"
+            );
+        }
+
+        let nested =
+            "*** Begin Patch\n*** Update File: x\n*** Begin Patch\n-old\n+new\n*** End Patch\n";
+        assert!(validate_v4a_for_codex(nested).is_some());
     }
 
     #[test]

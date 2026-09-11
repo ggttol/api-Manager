@@ -35,13 +35,47 @@ fn copy_passthrough_headers(incoming: &HeaderMap) -> HeaderMap {
     for (k, v) in incoming.iter() {
         let key = k.as_str().to_ascii_lowercase();
         match key.as_str() {
-            "content-type" | "accept" | "user-agent" => {
+            "content-type"
+            | "accept"
+            | "user-agent"
+            | "mcp-session-id"
+            | "mcp-protocol-version"
+            | "last-event-id"
+            | "mcp-resume-token" => {
+                out.insert(k.clone(), v.clone());
+            }
+            // Authorization is deliberately excluded. forward_mcp installs the configured z.ai
+            // credential below, so a caller credential can never reach the upstream.
+            _ => {}
+        }
+    }
+    out
+}
+
+fn copy_mcp_response_headers(upstream: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (k, v) in upstream.iter() {
+        match k.as_str().to_ascii_lowercase().as_str() {
+            "content-type"
+            | "content-encoding"
+            | "mcp-session-id"
+            | "mcp-protocol-version"
+            | "last-event-id"
+            | "mcp-resume-token" => {
                 out.insert(k.clone(), v.clone());
             }
             _ => {}
         }
     }
     out
+}
+
+fn upstream_body<S, E>(stream: S) -> Body
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Body::from_stream(stream.map(|chunk| chunk.map_err(std::io::Error::other)))
 }
 
 async fn forward_mcp(
@@ -100,16 +134,15 @@ async fn forward_mcp(
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut out = Response::builder().status(status);
-    if let Some(ct) = resp.headers().get(header::CONTENT_TYPE) {
-        out = out.header(header::CONTENT_TYPE, ct.clone());
+    for (name, value) in copy_mcp_response_headers(resp.headers()).iter() {
+        out = out.header(name, value);
     }
 
-    let stream = resp.bytes_stream().map(|chunk| match chunk {
-        Ok(b) => Ok::<Bytes, std::io::Error>(b),
-        Err(e) => Ok(Bytes::from(format!("Upstream stream error: {}", e))),
-    });
+    // Do not turn a truncated upstream body into successful plain-text bytes: that corrupts
+    // JSON-RPC and SSE payloads and hides the body failure from the downstream client.
+    let stream = upstream_body(resp.bytes_stream());
 
-    out.body(Body::from_stream(stream)).unwrap_or_else(|_| {
+    out.body(stream).unwrap_or_else(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to build response",
@@ -327,6 +360,7 @@ async fn handle_vision_post(state: AppState, headers: HeaderMap, body: Body) -> 
     }
 
     match method {
+        "ping" => (StatusCode::OK, axum::Json(jsonrpc_result(id, json!({})))).into_response(),
         "tools/list" => {
             let result = json!({ "tools": crate::proxy::zai_vision_tools::tool_specs() });
             (StatusCode::OK, axum::Json(jsonrpc_result(id, result))).into_response()
@@ -415,5 +449,70 @@ pub async fn handle_zai_mcp_server(
         Method::DELETE => handle_vision_delete(state, headers).await,
         Method::POST => handle_vision_post(state, headers, body).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    #[tokio::test]
+    async fn stateful_mcp_session_headers_and_ping_are_preserved() {
+        let sessions = crate::proxy::zai_vision_mcp::ZaiVisionMcpState::new();
+        let session_id = sessions.create_session().await;
+        assert!(sessions.has_session(&session_id).await);
+
+        let mut request = HeaderMap::new();
+        request.insert(
+            "mcp-session-id",
+            HeaderValue::from_str(&session_id).unwrap(),
+        );
+        request.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2025-06-18"),
+        );
+        request.insert("last-event-id", HeaderValue::from_static("event-9"));
+        request.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        let forwarded = copy_passthrough_headers(&request);
+        assert_eq!(
+            forwarded.get("mcp-session-id").unwrap(),
+            session_id.as_str()
+        );
+        assert_eq!(forwarded.get("mcp-protocol-version").unwrap(), "2025-06-18");
+        assert_eq!(forwarded.get("last-event-id").unwrap(), "event-9");
+        assert!(!forwarded.contains_key(header::AUTHORIZATION));
+
+        let mut upstream = HeaderMap::new();
+        upstream.insert(
+            "mcp-session-id",
+            HeaderValue::from_str(&session_id).unwrap(),
+        );
+        upstream.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2025-06-18"),
+        );
+        let returned = copy_mcp_response_headers(&upstream);
+        assert_eq!(returned.get("mcp-session-id").unwrap(), session_id.as_str());
+        assert_eq!(returned.get("mcp-protocol-version").unwrap(), "2025-06-18");
+        assert_eq!(
+            jsonrpc_result(json!(2), json!({})),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_body_failure_remains_a_body_failure() {
+        let body = upstream_body(stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
+            "truncated upstream",
+        ))]));
+        assert!(axum::body::to_bytes(body, 1024).await.is_err());
     }
 }

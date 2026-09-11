@@ -12,48 +12,48 @@ pub fn encode_varint(mut value: u64) -> Vec<u8> {
 /// Read Protobuf Varint
 pub fn read_varint(data: &[u8], offset: usize) -> Result<(u64, usize), String> {
     let mut result = 0u64;
-    let mut shift = 0;
     let mut pos = offset;
 
-    loop {
-        if pos >= data.len() {
-            return Err("incomplete_data".to_string());
+    for byte_index in 0..10 {
+        let byte = *data.get(pos).ok_or_else(|| "incomplete_data".to_string())?;
+        let value = (byte & 0x7f) as u64;
+        if byte_index == 9 && value > 1 {
+            return Err("varint_overflow".to_string());
         }
-        let byte = data[pos];
-        result |= ((byte & 0x7F) as u64) << shift;
+        result |= value << (byte_index * 7);
         pos += 1;
         if byte & 0x80 == 0 {
-            break;
+            return Ok((result, pos));
         }
-        shift += 7;
     }
 
-    Ok((result, pos))
+    Err("varint_overflow".to_string())
 }
 
 /// Skip Protobuf Field
 pub fn skip_field(data: &[u8], offset: usize, wire_type: u8) -> Result<usize, String> {
-    match wire_type {
-        0 => {
-            // Varint
-            let (_, new_offset) = read_varint(data, offset)?;
-            Ok(new_offset)
-        }
-        1 => {
-            // 64-bit
-            Ok(offset + 8)
-        }
+    let end = match wire_type {
+        0 => read_varint(data, offset)?.1,
+        1 => offset
+            .checked_add(8)
+            .ok_or_else(|| "field_length_overflow".to_string())?,
         2 => {
-            // Length-delimited
             let (length, content_offset) = read_varint(data, offset)?;
-            Ok(content_offset + length as usize)
+            let length =
+                usize::try_from(length).map_err(|_| "field_length_overflow".to_string())?;
+            content_offset
+                .checked_add(length)
+                .ok_or_else(|| "field_length_overflow".to_string())?
         }
-        5 => {
-            // 32-bit
-            Ok(offset + 4)
-        }
-        _ => Err(format!("unknown_wire_type: {}", wire_type)),
+        5 => offset
+            .checked_add(4)
+            .ok_or_else(|| "field_length_overflow".to_string())?,
+        _ => return Err(format!("unknown_wire_type: {}", wire_type)),
+    };
+    if end > data.len() {
+        return Err("incomplete_field".to_string());
     }
+    Ok(end)
 }
 
 /// Remove specified Protobuf field
@@ -96,9 +96,15 @@ pub fn find_field(data: &[u8], target_field: u32) -> Result<Option<Vec<u8>>, Str
 
         if field_num == target_field && wire_type == 2 {
             let (length, content_offset) = read_varint(data, new_offset)?;
-            return Ok(Some(
-                data[content_offset..content_offset + length as usize].to_vec(),
-            ));
+            let length =
+                usize::try_from(length).map_err(|_| "field_length_overflow".to_string())?;
+            let end = content_offset
+                .checked_add(length)
+                .ok_or_else(|| "field_length_overflow".to_string())?;
+            let content = data
+                .get(content_offset..end)
+                .ok_or_else(|| "incomplete_field".to_string())?;
+            return Ok(Some(content.to_vec()));
         }
 
         // Skip field
@@ -420,11 +426,14 @@ pub fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u
 
         let should_remove = if field_num == 1 && wire_type == 2 {
             let (length, content_offset) = read_varint(data, new_offset)?;
-            let length = length as usize;
-            if content_offset + length > data.len() {
-                return Err("Topic.data entry 数据不完整".to_string());
-            }
-            let entry = &data[content_offset..content_offset + length];
+            let length = usize::try_from(length)
+                .map_err(|_| "Topic.data entry length overflow".to_string())?;
+            let end = content_offset
+                .checked_add(length)
+                .ok_or_else(|| "Topic.data entry length overflow".to_string())?;
+            let entry = data
+                .get(content_offset..end)
+                .ok_or_else(|| "Topic.data entry 数据不完整".to_string())?;
             unified_topic_entry_key(entry) == Some(target_key)
         } else {
             false
@@ -459,4 +468,16 @@ fn unified_topic_entry_key(data: &[u8]) -> Option<&str> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_field, read_varint, remove_field};
+
+    #[test]
+    fn malformed_lengths_and_varints_return_errors() {
+        assert!(find_field(&[0x0a, 0x7f], 1).is_err());
+        assert!(remove_field(&[0x0a, 0x7f], 2).is_err());
+        assert!(read_varint(&[0x80; 11], 0).is_err());
+    }
 }

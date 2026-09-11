@@ -5,6 +5,7 @@ import { useTranslation, Trans } from 'react-i18next';
 import ModalDialog from '../common/ModalDialog';
 import { useState } from 'react';
 import { showToast } from '../common/ToastContainer';
+import { copyToClipboard } from '../../utils/clipboard';
 
 interface AccountErrorDialogProps {
     account: Account | null;
@@ -96,14 +97,19 @@ export default function AccountErrorDialog({ account, onClose }: AccountErrorDia
     const isVerificationNeeded = !isViolation && (rawReason.toLowerCase().includes('verify your account') || !!account.validation_url);
 
     // 复制功能
-    const handleCopyUrl = (url: string) => {
-        navigator.clipboard.writeText(url);
-        showToast(t('accounts.validation_url_copied', '验证链接已复制到剪贴板'), 'success');
+    const handleCopyUrl = async (url: string) => {
+        const copied = await copyToClipboard(url);
+        showToast(
+            copied
+                ? t('accounts.validation_url_copied', '验证链接已复制到剪贴板')
+                : t('common.copy_failed', 'Failed to copy'),
+            copied ? 'success' : 'error',
+        );
     };
 
-    const handleCopyText = (text: string, msg: string) => {
-        navigator.clipboard.writeText(text);
-        showToast(msg, 'success');
+    const handleCopyText = async (text: string, msg: string) => {
+        const copied = await copyToClipboard(text);
+        showToast(copied ? msg : t('common.copy_failed', 'Failed to copy'), copied ? 'success' : 'error');
     };
 
     const renderMessageWithLinks = (text: string) => {

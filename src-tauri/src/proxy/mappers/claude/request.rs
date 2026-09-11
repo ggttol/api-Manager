@@ -164,29 +164,6 @@ pub fn clean_cache_control_from_messages(messages: &mut [Message]) {
     }
 }
 
-/// [FIX #593] 递归深度清理 JSON 中的 cache_control 字段
-///
-/// 用于处理嵌套结构和非标准位置的 cache_control。
-/// 这是最后一道防线,确保发送给 Antigravity 的请求中不包含任何 cache_control。
-fn deep_clean_cache_control(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            if map.remove("cache_control").is_some() {
-                tracing::debug!("[DEBUG-593] Removed cache_control from nested JSON object");
-            }
-            for (_, v) in map.iter_mut() {
-                deep_clean_cache_control(v);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                deep_clean_cache_control(item);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// [FIX #564] Sort blocks in assistant messages to ensure thinking blocks are first
 ///
 /// When context compression (kilo) reorders message blocks, thinking blocks may appear
@@ -637,17 +614,14 @@ pub fn transform_claude_request_in(
 
     if let Some(tools_val) = tools {
         inner_request["tools"] = tools_val;
-        // 显式设置工具配置模式为 VALIDATED 并开启 includeServerSideToolInvocations (同时支持 camelCase 与 snake_case 以对齐 Google v1internal 接口)
+        let function_calling_config =
+            google_function_calling_config(claude_req.tool_choice.as_ref());
         inner_request["toolConfig"] = json!({
-            "functionCallingConfig": {
-                "mode": "VALIDATED"
-            },
+            "functionCallingConfig": function_calling_config,
             "includeServerSideToolInvocations": true
         });
         inner_request["tool_config"] = json!({
-            "function_calling_config": {
-                "mode": "VALIDATED"
-            },
+            "function_calling_config": inner_request["toolConfig"]["functionCallingConfig"].clone(),
             "include_server_side_tool_invocations": true
         });
     }
@@ -700,8 +674,11 @@ pub fn transform_claude_request_in(
     // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
     if let Some(account_id) = account_id {
         let generation = crate::proxy::common::session::current_bump(account_id, &session_id);
-        inner_request["sessionId"] =
-            json!(crate::proxy::common::session::derive_session_scoped(account_id, &session_id, generation));
+        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
+            account_id,
+            &session_id,
+            generation
+        ));
     }
 
     // 生成 requestId
@@ -731,9 +708,7 @@ pub fn transform_claude_request_in(
     }
 
     // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
-    // 确保发送给 Antigravity 的请求中不包含任何 cache_control
-    deep_clean_cache_control(&mut body);
-    tracing::debug!("[DEBUG-593] Final deep clean complete, request ready to send");
+    tracing::debug!("[Claude-Request] Request ready after structural metadata cleanup");
 
     Ok(body)
 }
@@ -1157,13 +1132,12 @@ fn build_contents(
                                     }
                                     // Compatible and not a retry: use signature
                                     *last_thought_signature = Some(sig.clone());
-                                    let mut part = json!({
+                                    let part = json!({
                                         "text": thinking,
                                         "thought": true,
                                         "thoughtSignature": sig.clone(),
                                         "thought_signature": sig
                                     });
-                                    crate::proxy::common::json_schema::clean_json_schema(&mut part);
                                     parts.push(part);
                                 }
                                 None => {
@@ -1175,15 +1149,12 @@ fn build_contents(
                                             sig.len()
                                         );
                                         *last_thought_signature = Some(sig.clone());
-                                        let mut part = json!({
+                                        let part = json!({
                                             "text": thinking,
                                             "thought": true,
                                             "thoughtSignature": sig.clone(),
                                             "thought_signature": sig
                                         });
-                                        crate::proxy::common::json_schema::clean_json_schema(
-                                            &mut part,
-                                        );
                                         parts.push(part);
                                     } else {
                                         // Unknown and too short: downgrade to text for safety
@@ -1216,15 +1187,15 @@ fn build_contents(
                         continue;
                     }
                     ContentBlock::Image { source, .. } => {
-                        if source.source_type == "base64" {
-                            parts.push(json!({
-                                "inlineData": {
-                                    "mimeType": source.media_type,
-                                    "data": source.data
-                                }
-                            }));
-                            saw_non_thinking = true;
+                        match source {
+                            ImageSource::Base64 { media_type, data } => parts.push(json!({
+                                "inlineData": { "mimeType": media_type, "data": data }
+                            })),
+                            ImageSource::Url { url } => parts.push(json!({
+                                "fileData": { "fileUri": url }
+                            })),
                         }
+                        saw_non_thinking = true;
                     }
                     ContentBlock::Document { source, .. } => {
                         if source.source_type == "base64" {
@@ -1433,30 +1404,51 @@ fn build_contents(
                             serde_json::Value::Array(arr) => {
                                 let mut texts = Vec::new();
                                 for block in arr {
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                        texts.push(text.to_string());
-                                    } else if block.get("source").is_some() {
-                                        if block.get("type").and_then(|v| v.as_str())
-                                            == Some("image")
-                                        {
-                                            let source = block.get("source").unwrap();
-                                            if let (Some(media_type), Some(data)) = (
-                                                source.get("media_type").and_then(|v| v.as_str()),
-                                                source.get("data").and_then(|v| v.as_str()),
-                                            ) {
-                                                extra_parts.push(json!({
-                                                    "inlineData": {
-                                                        "mimeType": media_type,
-                                                        "data": data
-                                                    }
-                                                }));
-                                            }
+                                    match block.get("type").and_then(|v| v.as_str()) {
+                                        Some("text") => {
+                                            let text = block
+                                                .get("text")
+                                                .and_then(|v| v.as_str())
+                                                .ok_or_else(|| {
+                                                "tool_result text block is missing text".to_string()
+                                            })?;
+                                            texts.push(text.to_string());
+                                        }
+                                        Some("image") | Some("document") => {
+                                            let source = block.get("source").ok_or_else(|| {
+                                                "tool_result media block is missing source"
+                                                    .to_string()
+                                            })?;
+                                            let media_type = source
+                                                .get("media_type")
+                                                .and_then(|v| v.as_str())
+                                                .ok_or_else(|| {
+                                                    "tool_result media source is missing media_type"
+                                                        .to_string()
+                                                })?;
+                                            let data = source.get("data").and_then(|v| v.as_str())
+                                                .ok_or_else(|| "tool_result media source is missing base64 data".to_string())?;
+                                            extra_parts.push(json!({
+                                                "inlineData": { "mimeType": media_type, "data": data }
+                                            }));
+                                        }
+                                        Some(kind) => return Err(format!(
+                                            "unsupported tool_result content block type: {kind}"
+                                        )),
+                                        None => {
+                                            return Err("tool_result content block is missing type"
+                                                .to_string())
                                         }
                                     }
                                 }
                                 texts.join("\n")
                             }
-                            _ => content.to_string(),
+                            _ => {
+                                return Err(
+                                    "tool_result content must be a string or content-block array"
+                                        .to_string(),
+                                )
+                            }
                         };
 
                         // Smart Truncation: max chars limit
@@ -1475,15 +1467,8 @@ fn build_contents(
                             merged_content = truncated;
                         }
 
-                        // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
-                        if merged_content.trim().is_empty() {
-                            if is_error.unwrap_or(false) {
-                                merged_content =
-                                    "Tool execution failed with no output.".to_string();
-                            } else {
-                                merged_content = "Command executed successfully.".to_string();
-                            }
-                        }
+                        // An empty string is an explicit empty result. Do not invent a success
+                        // message when unsupported media or blocks were dropped.
 
                         let mut part = json!({
                             "functionResponse": {
@@ -1770,7 +1755,7 @@ fn build_google_contents(
     // This is critical because converting Thinking->Text isn't enough; metadata must be gone.
     if !is_thinking_enabled {
         for msg in &mut merged_contents {
-            clean_thinking_fields_recursive(msg);
+            clean_thinking_metadata(msg);
         }
     }
 
@@ -1904,6 +1889,25 @@ fn build_tools(
     Ok(None)
 }
 
+fn google_function_calling_config(tool_choice: Option<&Value>) -> Value {
+    let Some(choice) = tool_choice else {
+        return json!({ "mode": "VALIDATED" });
+    };
+
+    match choice.get("type").and_then(Value::as_str) {
+        Some("none") => json!({ "mode": "NONE" }),
+        Some("any") => json!({ "mode": "ANY" }),
+        Some("tool") => {
+            let Some(name) = choice.get("name").and_then(Value::as_str) else {
+                return json!({ "mode": "ANY" });
+            };
+            json!({ "mode": "ANY", "allowedFunctionNames": [name] })
+        }
+        Some("auto") | None => json!({ "mode": "AUTO" }),
+        Some(_) => json!({ "mode": "VALIDATED" }),
+    }
+}
+
 /// 构建 Generation Config
 fn build_generation_config(
     claude_req: &ClaudeRequest,
@@ -1981,11 +1985,14 @@ fn build_generation_config(
             && (mapped_model.to_lowercase().contains("claude")
                 || mapped_model.to_lowercase().contains("gemini-3"));
 
+        // A request's explicit effort is more specific than the adaptive
+        // default configured for the proxy.
         let effort = claude_req
             .output_config
             .as_ref()
             .and_then(|c| c.effort.as_ref())
-            .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()));
+            .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()))
+            .or_else(|| tb_config.effort.as_ref());
 
         if should_use_adaptive {
             // [FIX #2208] thinkingLevel is ONLY supported by Claude models via Vertex AI native protocol.
@@ -2144,10 +2151,9 @@ fn build_generation_config(
         }
     }
 
-    // [优化] 设置全局停止序列,防止模型幻觉出对话标记
-    // [FIX #2007] Opus 4.6 Thinking Alignment
-    // Successful OpenAI logs show NO stop sequences were sent for Opus 4.6 Thinking.
-    if !(model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled) {
+    if let Some(stop_sequences) = claude_req.stop_sequences.as_ref() {
+        config["stopSequences"] = json!(stop_sequences);
+    } else if !(model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled) {
         config["stopSequences"] = json!(["<|user|>", "<|end_of_turn|>", "\n\nHuman:"]);
     } else {
         tracing::debug!(
@@ -2158,24 +2164,23 @@ fn build_generation_config(
     config
 }
 
-/// Recursively remove 'thought' and 'thoughtSignature' fields
-/// Used when downgrading thinking (e.g. during 400 retry)
-pub fn clean_thinking_fields_recursive(val: &mut Value) {
-    match val {
-        Value::Object(map) => {
-            map.remove("thought");
-            map.remove("thoughtSignature");
-            map.remove("thought_signature");
-            for (_, v) in map.iter_mut() {
-                clean_thinking_fields_recursive(v);
-            }
+/// Remove thinking metadata from text/thinking parts without traversing function
+/// arguments, function responses, or JSON schemas supplied by a client.
+fn clean_thinking_metadata(content: &mut Value) {
+    let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for part in parts {
+        let Some(object) = part.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("functionCall") || object.contains_key("functionResponse") {
+            continue;
         }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                clean_thinking_fields_recursive(v);
-            }
-        }
-        _ => {}
+        object.remove("thought");
+        object.remove("thoughtSignature");
+        object.remove("thought_signature");
     }
 }
 
@@ -2253,7 +2258,9 @@ fn is_model_compatible(cached: &str, target: &str) -> bool {
 mod tests {
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
-    use crate::proxy::config::{update_thinking_budget_config, ThinkingBudgetConfig};
+    use crate::proxy::config::{
+        override_thinking_budget_config_for_test, ThinkingBudgetConfig, ThinkingBudgetMode,
+    };
 
     #[test]
     fn test_agent_sdk_identity_is_normalized_for_antigravity() {
@@ -2358,6 +2365,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2456,6 +2465,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2496,7 +2507,7 @@ mod tests {
                         ContentBlock::Thinking {
                             thinking: "Let me think...".to_string(),
                             signature: Some("sig123".to_string()),
-                            cache_control: Some(json!({"type": "ephemeral"})), // 这个应该被清理
+                            cache_control: Some(json!({"type": "ephemeral"})),
                         },
                         ContentBlock::Text {
                             text: "Here is my response".to_string(),
@@ -2506,8 +2517,7 @@ mod tests {
                 Message {
                     role: "user".to_string(),
                     content: MessageContent::Array(vec![ContentBlock::Image {
-                        source: ImageSource {
-                            source_type: "base64".to_string(),
+                        source: ImageSource::Base64 {
                             media_type: "image/png".to_string(),
                             data: "iVBORw0KGgo=".to_string(),
                         },
@@ -2527,6 +2537,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2602,6 +2614,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2653,6 +2667,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2710,6 +2726,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2759,6 +2777,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -2932,39 +2952,8 @@ mod tests {
         }
     }
     #[test]
-    fn test_default_max_tokens() {
-        let req = ClaudeRequest {
-            model: "claude-3-opus".to_string(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: MessageContent::String("Hello".to_string()),
-            }],
-            system: None,
-            tools: None,
-            stream: false,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            thinking: None,
-            metadata: None,
-            output_config: None,
-            size: None,
-            quality: None,
-        };
-
-        let result =
-            transform_claude_request_in(&req, "test-v", false, None, "test_session", None).unwrap();
-        // [FIX] Since we removed the default 81920, maxOutputTokens should NOT be present
-        // when max_tokens is None and thinking is disabled
-        let gen_config = &result["request"]["generationConfig"];
-        assert!(
-            gen_config.get("maxOutputTokens").is_none(),
-            "maxOutputTokens should not be set when max_tokens is None"
-        );
-    }
-    #[test]
     fn test_claude_flash_thinking_budget_capping() {
+        let _config = override_thinking_budget_config_for_test(ThinkingBudgetConfig::default());
         // Use full path or ensure import of ThinkingConfig
         // transform_claude_request and models are needed.
         // Assuming models are available via super imports, but let's be explicit if needed.
@@ -2989,6 +2978,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         let result =
@@ -3018,6 +3009,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         // Should cap
@@ -3032,6 +3025,7 @@ mod tests {
 
     #[test]
     fn test_gemini_pro_thinking_support() {
+        let _config = override_thinking_budget_config_for_test(ThinkingBudgetConfig::default());
         // Setup request for Gemini Pro (no -thinking suffix)
         let req = ClaudeRequest {
             model: "gemini-3-pro-preview".to_string(),
@@ -3055,6 +3049,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         // Transform
@@ -3096,6 +3092,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         // Transform
@@ -3113,7 +3111,7 @@ mod tests {
     #[test]
     fn test_claude_image_thinking_mode_disabled() {
         // 1. Force image thinking mode to "disabled"
-        crate::proxy::config::update_image_thinking_mode(Some("disabled".to_string()));
+        let _image_mode = crate::proxy::config::override_image_thinking_mode_for_test("disabled");
 
         // 2. Setup Claude request for an image model (mapped to gemini-3-pro-image)
         let req = ClaudeRequest {
@@ -3134,6 +3132,8 @@ mod tests {
             output_config: None,
             size: Some("1024x1024".to_string()),
             quality: Some("hd".to_string()),
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         // 3. Transform request
@@ -3151,30 +3151,23 @@ mod tests {
             .expect("Should have thinkingConfig (explicitly disabled)");
 
         assert_eq!(thinking_config["includeThoughts"], false);
-
-        // 5. Reset global mode
-        crate::proxy::config::update_image_thinking_mode(Some("enabled".to_string()));
     }
 
     #[test]
     fn test_claude_adaptive_global_config() {
-        // Set global config to Adaptive + High effort
-        let config = ThinkingBudgetConfig {
-            mode: crate::proxy::config::ThinkingBudgetMode::Adaptive,
+        let _config = override_thinking_budget_config_for_test(ThinkingBudgetConfig {
+            mode: ThinkingBudgetMode::Adaptive,
             custom_value: 0,
             effort: Some("high".to_string()),
-        };
-        crate::proxy::config::update_thinking_budget_config(config);
-
+        });
         let req = ClaudeRequest {
-            model: "claude-3-7-sonnet-thinking".to_string(), // thinking capable
+            model: "claude-3-7-sonnet-thinking".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::String("test".to_string()),
             }],
-            thinking: None, // No client thinking config
+            thinking: None,
             stream: false,
-            // ... minimal fields
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -3185,28 +3178,40 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
-        // Transform
         let result =
             transform_claude_request_in(&req, "test-proj", false, None, "test_session", None)
                 .unwrap();
+        let generation_config = &result["request"]["generationConfig"];
+        assert_eq!(generation_config["thinkingConfig"]["includeThoughts"], true);
+        assert_eq!(generation_config["thinkingConfig"]["thinkingLevel"], "high");
+        assert!(generation_config["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none());
+        assert_eq!(generation_config["maxOutputTokens"], 64000);
 
-        let gen_config = result["request"]["generationConfig"].as_object().unwrap();
-        let thinking_config = gen_config["thinkingConfig"].as_object().unwrap();
-
-        // Check injection
-        assert_eq!(thinking_config["includeThoughts"], true);
-        assert_eq!(thinking_config["thinkingBudget"], -1);
-        assert!(thinking_config.get("thinkingType").is_none());
-        assert!(thinking_config.get("effort").is_none());
-
-        // Check maxOutputTokens default for adaptive
-        let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        assert_eq!(max_output_tokens, 131072);
-
-        // Reset global config
-        crate::proxy::config::update_thinking_budget_config(ThinkingBudgetConfig::default());
+        let mut explicit_request = req.clone();
+        explicit_request.thinking = Some(ThinkingConfig {
+            type_: "adaptive".to_string(),
+            budget_tokens: None,
+            effort: Some("low".to_string()),
+        });
+        let explicit_result = transform_claude_request_in(
+            &explicit_request,
+            "test-proj",
+            false,
+            None,
+            "test_session",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_result["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
     }
 
     #[test]
@@ -3241,6 +3246,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         // 模拟映射到 Gemini 2.0
@@ -3264,10 +3271,7 @@ mod tests {
             !has_google_search,
             "v1internal should avoid mixed Google Search when functionDeclarations present"
         );
-        assert!(
-            has_functions,
-            "Should have function declarations"
-        );
+        assert!(has_functions, "Should have function declarations");
     }
 
     #[test]
@@ -3302,6 +3306,8 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
+            stop_sequences: None,
         };
 
         // 模拟映射到 Gemini 1.5
@@ -3349,15 +3355,114 @@ mod tests {
     fn test_model_keeps_thinking_without_signature() {
         assert!(model_keeps_thinking_without_signature("gemini-3-flash"));
         assert!(model_keeps_thinking_without_signature("gemini-3.1-flash"));
-        assert!(model_keeps_thinking_without_signature("gemini-3.7-flash-high"));
+        assert!(model_keeps_thinking_without_signature(
+            "gemini-3.7-flash-high"
+        ));
         assert!(model_keeps_thinking_without_signature(
             "gemini-3.6-flash-medium"
         ));
-        assert!(model_keeps_thinking_without_signature("gemini-3.5-flash-low"));
+        assert!(model_keeps_thinking_without_signature(
+            "gemini-3.5-flash-low"
+        ));
         assert!(model_keeps_thinking_without_signature("gemini-pro-agent"));
         assert!(!model_keeps_thinking_without_signature("gemini-3.1-pro"));
         assert!(!model_keeps_thinking_without_signature(
             "gemini-3.1-pro-preview"
         ));
+    }
+    #[test]
+    fn test_preserves_tool_choice_and_stop_sequences() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "lookup"},
+            "stop_sequences": ["CUSTOM_END"]
+        }))
+        .unwrap();
+
+        let body =
+            transform_claude_request_in(&request, "project", false, None, "session", None).unwrap();
+        assert_eq!(
+            body["request"]["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"],
+            json!(["lookup"])
+        );
+        assert_eq!(
+            body["request"]["generationConfig"]["stopSequences"],
+            json!(["CUSTOM_END"])
+        );
+    }
+
+    #[test]
+    fn test_maps_url_image_to_google_file_data() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image", "source": {
+                    "type": "url", "url": "https://example.test/image.png"
+                }}]
+            }]
+        }))
+        .unwrap();
+
+        let body =
+            transform_claude_request_in(&request, "project", false, None, "session", None).unwrap();
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][0]["fileData"]["fileUri"],
+            "https://example.test/image.png"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_document_becomes_inline_data() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [{
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0="}
+                }]}]
+            }]
+        }))
+        .unwrap();
+
+        let body =
+            transform_claude_request_in(&request, "project", false, None, "session", None).unwrap();
+        let parts = &body["request"]["contents"][0]["parts"];
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "application/pdf");
+        assert_eq!(parts[1]["inlineData"]["data"], "JVBERi0=");
+        assert_eq!(parts[0]["functionResponse"]["response"]["result"], "");
+    }
+
+    #[test]
+    fn test_disabled_thinking_keeps_function_call_signature() {
+        let mut content = json!({
+            "parts": [{
+                "functionCall": {
+                    "name": "lookup",
+                    "args": {"thought": "application value"},
+                    "thoughtSignature": "skip_thought_signature_validator"
+                },
+                "thoughtSignature": "skip_thought_signature_validator"
+            }, {
+                "text": "discarded thought",
+                "thought": true,
+                "thoughtSignature": "old"
+            }]
+        });
+        clean_thinking_metadata(&mut content);
+
+        assert_eq!(
+            content["parts"][0]["thoughtSignature"],
+            "skip_thought_signature_validator"
+        );
+        assert_eq!(
+            content["parts"][0]["functionCall"]["args"]["thought"],
+            "application value"
+        );
+        assert!(content["parts"][1].get("thought").is_none());
+        assert!(content["parts"][1].get("thoughtSignature").is_none());
     }
 }

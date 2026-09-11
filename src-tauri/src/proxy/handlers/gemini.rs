@@ -11,8 +11,9 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, build_token_error_headers, next_rotation_attempt, should_rotate_account,
-    FailureStatusTracker, RequestRetryState, RetryStrategy,
+    apply_retry_strategy, build_token_error_headers, is_invalid_signature_error,
+    next_rotation_attempt, should_rotate_account, FailureStatusTracker, RequestRetryState,
+    RetryStrategy,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
@@ -46,6 +47,58 @@ fn response_has_inline_image_data(value: &Value) -> bool {
         })
 }
 
+fn validate_generate_body(body: &Value) -> Result<(), String> {
+    let request = body
+        .as_object()
+        .ok_or_else(|| "Gemini request body must be a JSON object".to_string())?;
+
+    for field in ["generationConfig", "toolConfig", "systemInstruction"] {
+        if request.get(field).is_some_and(|value| !value.is_object()) {
+            return Err(format!("Gemini request field `{field}` must be an object"));
+        }
+    }
+    if request
+        .get("contents")
+        .is_some_and(|value| !value.is_array())
+    {
+        return Err("Gemini request field `contents` must be an array".to_string());
+    }
+    if request.get("tools").is_some_and(|value| !value.is_array()) {
+        return Err("Gemini request field `tools` must be an array".to_string());
+    }
+
+    for (content_index, content) in request
+        .get("contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let content = content
+            .as_object()
+            .ok_or_else(|| format!("Gemini contents[{content_index}] must be an object"))?;
+        let Some(parts) = content.get("parts") else {
+            continue;
+        };
+        let parts = parts
+            .as_array()
+            .ok_or_else(|| format!("Gemini contents[{content_index}].parts must be an array"))?;
+        for (part_index, part) in parts.iter().enumerate() {
+            let part = part.as_object().ok_or_else(|| {
+                format!("Gemini contents[{content_index}].parts[{part_index}] must be an object")
+            })?;
+            for field in ["functionCall", "functionResponse"] {
+                if part.get(field).is_some_and(|value| !value.is_object()) {
+                    return Err(format!(
+                        "Gemini contents[{content_index}].parts[{part_index}].{field} must be an object"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod image_success_tests {
     use super::response_has_inline_image_data;
@@ -61,6 +114,39 @@ mod image_success_tests {
         });
         assert!(!response_has_inline_image_data(&empty));
         assert!(response_has_inline_image_data(&image));
+    }
+}
+
+#[cfg(test)]
+mod request_validation_tests {
+    use super::{is_invalid_signature_error, validate_generate_body};
+    use serde_json::json;
+
+    #[test]
+    fn task_rejects_nonobject_client_control_shapes_before_mapping() {
+        for body in [
+            json!(["not", "an", "object"]),
+            json!({"generationConfig": []}),
+            json!({"contents": [{"parts": [{"functionCall": null}]}]}),
+            json!({"contents": [{"parts": [{"functionResponse": []}]}]}),
+        ] {
+            assert!(validate_generate_body(&body).is_err(), "{body}");
+        }
+        assert!(validate_generate_body(&json!({
+            "generationConfig": {},
+            "contents": [{"parts": [{"functionCall": {"name": "weather", "args": {}}}]}]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn task_signature_repair_is_limited_to_invalid_signature_responses() {
+        assert!(is_invalid_signature_error(400, "Invalid `signature`"));
+        assert!(!is_invalid_signature_error(500, "Invalid `signature`"));
+        assert!(!is_invalid_signature_error(
+            400,
+            "unrelated invalid request"
+        ));
     }
 }
 
@@ -107,6 +193,7 @@ pub async fn handle_generate(
             format!("Unsupported method: {}", method),
         ));
     }
+    validate_generate_body(&body).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     if debug_logger::is_enabled(&debug_cfg) {
         let original_payload = json!({
             "kind": "original_request",
@@ -149,6 +236,7 @@ pub async fn handle_generate(
     let mut image_permit = None;
     let mut failure_statuses = FailureStatusTracker::default();
     let mut used_attempts = 0;
+    let mut retried_without_thinking = false;
 
     let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,
@@ -253,11 +341,11 @@ pub async fn handle_generate(
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
-        // 5. 包装请求 (project injection)
-        // [FIX #765] Pass session_id to wrap_request for signature injection
-        // [NEW] 获取完整 Token 对象以注入动态规格 (dynamic > static default > 65535)
+        // Run synchronous L1/L2 shaping first, then decide whether the remaining
+        // pressure actually warrants the awaited L3 fork.  The forked raw request
+        // replaces the dispatch input rather than becoming discarded background work.
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let wrapped_body = wrap_request_v2(
+        let mut wrapped_body = wrap_request_v2(
             &body,
             &project_id,
             &mapped_model,
@@ -266,6 +354,48 @@ pub async fn handle_generate(
             token_obj.as_ref(),
             Some(&token_manager),
         );
+        if crate::proxy::config::get_global_compression_level() == "high" {
+            let request_after_l1_l2 = wrapped_body
+                .get("request")
+                .cloned()
+                .unwrap_or_else(|| body.clone());
+            let context_limit = if mapped_model.contains("flash") {
+                1_000_000
+            } else {
+                2_000_000
+            };
+            let estimated =
+                crate::proxy::mappers::context_manager::ContextManager::estimate_gemini_token_usage(
+                    &request_after_l1_l2,
+                );
+            let calibrated =
+                crate::proxy::mappers::estimation_calibrator::get_calibrator().calibrate(estimated);
+            if (calibrated as f32 / context_limit as f32)
+                > crate::proxy::config::get_global_threshold_l3()
+            {
+                let forked_body =
+                    crate::proxy::mappers::gemini::wrapper::compress_gemini_request_with_summary(
+                        &request_after_l1_l2,
+                        &trace_id,
+                        &upstream,
+                        &token_manager,
+                        &session_id,
+                        &project_id,
+                        &account_id,
+                    )
+                    .await
+                    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+                wrapped_body = wrap_request_v2(
+                    &forked_body,
+                    &project_id,
+                    &mapped_model,
+                    Some(account_id.as_str()),
+                    Some(&session_id),
+                    token_obj.as_ref(),
+                    Some(&token_manager),
+                );
+            }
+        }
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -451,12 +581,16 @@ pub async fn handle_generate(
                 let image_success_manager = token_manager.clone();
                 let image_success_account = account_id.clone();
                 let image_success_model = mapped_model.clone();
+                let stream_signature_response_id =
+                    format!("gemini-stream-{}", uuid::Uuid::new_v4());
                 let stream = async_stream::stream! {
                     let _image_permit = image_permit_for_stream;
                     let mut first_data = first_chunk;
                     let mut meta_sent = false;
                     let mut saw_image_data = false;
                     let mut stream_failed = false;
+                    let mut observed_candidates = std::collections::BTreeSet::new();
+                    let mut completed_candidates = std::collections::BTreeSet::new();
 
                     loop {
                         // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
@@ -476,12 +610,29 @@ pub async fn handle_generate(
                         let item = if let Some(fd) = first_data.take() {
                             Some(Ok(fd))
                         } else {
-                            // [NEW] 第二阶段为 StreamIdleTimeout (300s / 5min)
-                            match tokio::time::timeout(std::time::Duration::from_secs(300), response_stream.next()).await {
+                            // Treat an idle upstream as a protocol failure, including
+                            // when this stream is being collected for generateContent.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(300),
+                                response_stream.next(),
+                            )
+                            .await
+                            {
                                 Ok(next_item) => next_item,
                                 Err(_) => {
                                     error!("[Gemini-SSE] Idle timeout after 300s, terminating stream");
                                     stream_failed = true;
+                                    let error_json = serde_json::json!({
+                                        "error": {
+                                            "code": StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                                            "message": "Upstream stream idle timeout",
+                                            "status": "UPSTREAM_ERROR"
+                                        }
+                                    });
+                                    yield Ok::<Bytes, String>(Bytes::from(format!(
+                                        "data: {}\n\n",
+                                        serde_json::to_string(&error_json).unwrap_or_default()
+                                    )));
                                     None
                                 }
                             }
@@ -493,24 +644,30 @@ pub async fn handle_generate(
                                 error!("[Gemini-SSE] Stream error: {}", e);
                                 stream_failed = true;
                                 let error_json = serde_json::json!({
-                                    "id": &s_id_for_stream,
-                                    "object": "chat.completion.chunk",
-                                    "model": &model_name_for_stream,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": format!("\n[Stream Error] {}", e)
-                                            },
-                                            "finish_reason": "error"
-                                        }
-                                    ]
+                                    "error": {
+                                        "code": StatusCode::BAD_GATEWAY.as_u16(),
+                                        "message": format!("Upstream stream error: {}", e),
+                                        "status": "UPSTREAM_ERROR"
+                                    }
                                 });
-                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
-                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+                                yield Ok::<Bytes, String>(Bytes::from(format!(
+                                    "data: {}\n\n",
+                                    serde_json::to_string(&error_json).unwrap_or_default()
+                                )));
                                 break;
                             }
-                            None => break,
+                            None => {
+                                if observed_candidates.iter().any(|index| !completed_candidates.contains(index)) {
+                                    stream_failed = true;
+                                    let error_json = serde_json::json!({"error": {
+                                        "code": StatusCode::BAD_GATEWAY.as_u16(),
+                                        "message": "Upstream stream ended before every candidate reached a terminal response frame",
+                                        "status": "UPSTREAM_ERROR"
+                                    }});
+                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
+                                }
+                                break;
+                            }
                         };
 
                         debug!("[Gemini-SSE] Received chunk: {} bytes", bytes.len());
@@ -530,47 +687,74 @@ pub async fn handle_generate(
 
                                     match serde_json::from_str::<Value>(json_part) {
                                         Ok(mut json) => {
+                                            let inner_val = json.get("response").unwrap_or(&json);
+                                            if inner_val.get("error").is_some() {
+                                                stream_failed = true;
+                                            }
                                             if track_image_success && response_has_inline_image_data(&json) {
                                                 saw_image_data = true;
                                             }
-                                            // [FIX #765] Extract thoughtSignature from stream
-                                            let inner_val = if json.get("response").is_some() {
-                                                json.get("response")
-                                            } else {
-                                                Some(&json)
-                                            };
-
-                                            if let Some(resp) = inner_val {
-                                                if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
-                                                    for cand in candidates {
-                                                        if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
-                                                            for part in parts {
-                                                                if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                                                    crate::proxy::SignatureCache::global()
-                                                                        .cache_session_signature(&s_id_for_stream, sig.to_string(), 1);
-                                                                    debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id_for_stream);
-                                                                }
+                                            // Track each candidate independently: a clean EOF is
+                                            // successful only after every observed candidate finishes.
+                                            if let Some(candidates) = inner_val.get("candidates").and_then(Value::as_array) {
+                                                for (position, cand) in candidates.iter().enumerate() {
+                                                    let index = cand.get("index").and_then(Value::as_i64).unwrap_or(position as i64);
+                                                    observed_candidates.insert(index);
+                                                    if cand.get("finishReason").is_some() {
+                                                        completed_candidates.insert(index);
+                                                    }
+                                                    if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(Value::as_array) {
+                                                        for part in parts {
+                                                            if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+                                                                let response_id = inner_val
+                                                                    .get("responseId")
+                                                                    .and_then(Value::as_str)
+                                                                    .unwrap_or(&stream_signature_response_id);
+                                                                crate::proxy::SignatureCache::global()
+                                                                    .cache_gemini_session_signature(
+                                                                        &s_id_for_stream,
+                                                                        sig.to_string(),
+                                                                        response_id,
+                                                                    );
+                                                                debug!("[Gemini-SSE] Cached signature (len: {}) for session: {}", sig.len(), s_id_for_stream);
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
 
-                                            // [FIX #1522] Inject Tool ID into Stream Response
-                                            crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &model_name_for_stream);
-
-                                            // Unwrap v1internal response wrapper
-                                            if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
+                                            // Apply compatibility transforms to the actual Gemini
+                                            // payload rather than the v1internal envelope.
+                                            if let Some(mut inner) = json.get_mut("response").map(|v| v.take()) {
+                                                crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
+                                                    &mut inner,
+                                                    &model_name_for_stream,
+                                                );
                                                 let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
                                                 yield Ok::<Bytes, String>(Bytes::from(new_line));
                                             } else {
+                                                crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
+                                                    &mut json,
+                                                    &model_name_for_stream,
+                                                );
                                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&json).unwrap_or_default())));
                                             }
                                         }
                                         Err(e) => {
-                                            debug!("[Gemini-SSE] JSON parse error: {}, passing raw line", e);
+                                            debug!("[Gemini-SSE] JSON parse error: {}", e);
                                             stream_failed = true;
-                                            yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
+                                            let error_json = serde_json::json!({
+                                                "error": {
+                                                    "code": StatusCode::BAD_GATEWAY.as_u16(),
+                                                    "message": format!("Invalid upstream SSE payload: {}", e),
+                                                    "status": "UPSTREAM_ERROR"
+                                                }
+                                            });
+                                            yield Ok::<Bytes, String>(Bytes::from(format!(
+                                                "data: {}\n\n",
+                                                serde_json::to_string(&error_json).unwrap_or_default()
+                                            )));
+                                            break;
                                         }
                                     }
                                 } else {
@@ -644,12 +828,6 @@ pub async fn handle_generate(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
-            // [FIX #1522] Inject Tool ID into Non-streaming Response
-            crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
-                &mut gemini_resp,
-                &mapped_model,
-            );
-
             // [FIX #765] Extract thoughtSignature from non-streaming response
             let inner_val = if gemini_resp.get("response").is_some() {
                 gemini_resp.get("response")
@@ -658,6 +836,11 @@ pub async fn handle_generate(
             };
 
             if let Some(resp) = inner_val {
+                let fallback_response_id = format!("gemini-response-{}", uuid::Uuid::new_v4());
+                let response_id = resp
+                    .get("responseId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&fallback_response_id);
                 if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
                     for cand in candidates {
                         if let Some(parts) = cand
@@ -669,11 +852,12 @@ pub async fn handle_generate(
                                 if let Some(sig) =
                                     part.get("thoughtSignature").and_then(|s| s.as_str())
                                 {
-                                    crate::proxy::SignatureCache::global().cache_session_signature(
-                                        &session_id,
-                                        sig.to_string(),
-                                        1,
-                                    );
+                                    crate::proxy::SignatureCache::global()
+                                        .cache_gemini_session_signature(
+                                            &session_id,
+                                            sig.to_string(),
+                                            response_id,
+                                        );
                                     debug!("[Gemini-Response] Cached signature (len: {}) for session: {}", sig.len(), session_id);
                                 }
                             }
@@ -682,7 +866,11 @@ pub async fn handle_generate(
                 }
             }
 
-            let unwrapped = unwrap_response(&gemini_resp);
+            let mut unwrapped = unwrap_response(&gemini_resp);
+            crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
+                &mut unwrapped,
+                &mapped_model,
+            );
             return Ok((
                 StatusCode::OK,
                 [
@@ -763,7 +951,35 @@ pub async fn handle_generate(
         // [FIX] 429 时立即解绑当前会话，确保换号重试与后续请求不会死锁在受限账号上
         if status_code == 429 || status_code == 529 {
             token_manager.clear_session_binding(&session_id);
-            tracing::debug!("[Gemini] Unbound session {} from account {} due to status {}", session_id, email, status_code);
+            tracing::debug!(
+                "[Gemini] Unbound session {} from account {} due to status {}",
+                session_id,
+                email,
+                status_code
+            );
+        }
+
+        // Repair corrupt thought signatures before generic retry classification.
+        // The transition is bounded, so a persistently bad request does not loop.
+        if is_invalid_signature_error(status_code, &error_text) && !retried_without_thinking {
+            tracing::warn!(
+                "[Gemini] Invalid thought signature detected on account {}, retrying with signature fields removed",
+                email
+            );
+            crate::proxy::mappers::gemini::wrapper::remove_history_thought_signatures(&mut body);
+            crate::proxy::SignatureCache::global().delete_session_signature(&session_id);
+            retried_without_thinking = true;
+            // This one bounded repair is explicitly admitted with the credentials
+            // that received the rejection; it is not a rotation attempt.
+            retry_credentials = Some((
+                access_token.clone(),
+                project_id.clone(),
+                email.clone(),
+                account_id.clone(),
+                0,
+            ));
+            force_rotate = false;
+            continue;
         }
 
         // 确定重试策略
@@ -772,7 +988,7 @@ pub async fn handle_generate(
             status_code,
             &error_text,
             retry_after.as_deref(),
-            false,
+            retried_without_thinking,
         );
         let needs_quota_refresh = if config.request_type == "image_gen" && status_code == 429 {
             token_manager
@@ -841,34 +1057,8 @@ pub async fn handle_generate(
             continue;
         }
 
-        // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
-            && (error_text.contains("Invalid `signature`")
-                || error_text.contains("thinking.signature")
-                || error_text.contains("Invalid signature")
-                || error_text.contains("Corrupted thought signature"))
-        {
-            tracing::warn!(
-                "[Gemini] Signature error detected on account {}, retrying without thinking",
-                email
-            );
-
-            // 追加修复提示词到请求体的最后一条内容
-            if let Some(contents) = body.get_mut("contents").and_then(|v| v.as_array_mut()) {
-                if let Some(last_content) = contents.last_mut() {
-                    if let Some(parts) =
-                        last_content.get_mut("parts").and_then(|v| v.as_array_mut())
-                    {
-                        parts.push(json!({
-                            "text": "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block."
-                        }));
-                        tracing::debug!("[Gemini] Appended repair prompt to last content");
-                    }
-                }
-            }
-
-            continue; // 重试
-        }
+        // Invalid-signature retries have already been sanitized once above. A
+        // subsequent failure is handled by the normal bounded retry/error path.
 
         // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
         error!(
@@ -960,11 +1150,7 @@ pub async fn handle_count_tokens(
 ///
 /// 获取有效 OAuth Token，将标准 Gemini 请求体包装为 v1internal 格式后转发，
 /// 返回真实的 token 计数，而不是硬编码的 0
-pub async fn execute_count_tokens(
-    state: AppState,
-    model_name: String,
-    body: Value,
-) -> Response {
+pub async fn execute_count_tokens(state: AppState, model_name: String, body: Value) -> Response {
     // 1. 模型路由解析
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,
@@ -996,11 +1182,7 @@ pub async fn execute_count_tokens(
     {
         Ok(t) => t,
         Err(e) => {
-            let headers = build_token_error_headers(
-                Some(mapped_model.as_str()),
-                None,
-                &e,
-            );
+            let headers = build_token_error_headers(Some(mapped_model.as_str()), None, &e);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 headers,
