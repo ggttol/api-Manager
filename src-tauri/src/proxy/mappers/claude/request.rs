@@ -879,7 +879,7 @@ fn has_valid_signature_for_function_calls(
 /// 构建 System Instruction (支持动态身份映射与 Prompt 隔离)
 fn build_system_instruction(
     system: &Option<SystemPrompt>,
-    _model_name: &str,
+    model_name: &str,
     has_mcp_tools: bool,
     extra_system_messages: &[String],
 ) -> Option<Value> {
@@ -928,14 +928,20 @@ fn build_system_instruction(
             SystemPrompt::String(text) => {
                 // [MODIFIED] No longer filter "You are an interactive CLI tool"
                 // We pass everything through to ensure Flash/Lite models get full instructions
-                parts.push(json!({"text": normalize_claude_client_identity(text)}));
+                parts.push(
+                    json!({"text": crate::proxy::common::system_prompt::normalize_system_envelope(
+                        normalize_claude_client_identity(text), model_name
+                    )}),
+                );
             }
             SystemPrompt::Array(blocks) => {
                 for block in blocks {
                     if block.block_type == "text" {
                         // [MODIFIED] No longer filter "You are an interactive CLI tool"
                         parts.push(json!({
-                            "text": normalize_claude_client_identity(&block.text)
+                            "text": crate::proxy::common::system_prompt::normalize_system_envelope(
+                                normalize_claude_client_identity(&block.text), model_name
+                            )
                         }));
                     }
                 }
@@ -946,7 +952,7 @@ fn build_system_instruction(
     // 添加提取出来的 role == "system" 消息
     for extra_text in extra_system_messages {
         if !extra_text.trim().is_empty() {
-            parts.push(json!({"text": format!("\n{}", extra_text)}));
+            parts.push(json!({"text": format!("\n{}", crate::proxy::common::system_prompt::normalize_system_envelope(extra_text, model_name))}));
         }
     }
 
@@ -1432,9 +1438,11 @@ fn build_contents(
                                                 "inlineData": { "mimeType": media_type, "data": data }
                                             }));
                                         }
-                                        Some(kind) => return Err(format!(
+                                        Some(kind) => {
+                                            return Err(format!(
                                             "unsupported tool_result content block type: {kind}"
-                                        )),
+                                        ))
+                                        }
                                         None => {
                                             return Err("tool_result content block is missing type"
                                                 .to_string())

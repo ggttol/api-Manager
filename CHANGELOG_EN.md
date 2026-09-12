@@ -2,6 +2,10 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Gemini client system-envelope compatibility
+
+Fixed generic upstream `429 RESOURCE_EXHAUSTED` responses triggered by client `system-conventions` envelopes through Anthropic Messages and OpenAI Chat Completions. For Gemini only, a complete envelope at the start of a system text uses plain bracket delimiters; its instructions, code examples, and trailing text remain intact. Other models, ordinary mentions, and incomplete envelopes are unchanged. Clients keep sending their original requests. Two boundary regressions and 27 Claude request-mapping regressions passed; live upstream acceptance covered Gemini 3.8 Flash medium/high/tiered and both compatibility protocols.
+
 ## Two-pass functional audit repairs
 
 Request-log account options now combine Google, Codex, and historical accounts independently of the current page, including Codex identifiers without email addresses. Account, text, and error filtering share database predicates and matching totals; semantic errors inside HTTP 200 responses remain visible. Fixed stale log details, statistics and configuration responses, plus concurrent configuration saves and failed-write rollback.

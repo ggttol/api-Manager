@@ -241,6 +241,8 @@ HTTP 代理不是托管 Codex 执行器：终端工具、工作目录、沙箱�
     *   **用途**: 支持 Claude CLI (`claude`), Cursor, Cherry Studio 等客户端。
     *   **特性**: 完整支持 Tool Use (工具调用) 和 Thinking (思维链) 模式。
 
+**Gemini 系统提示兼容**：经 `/v1/messages` 或 `/v1/chat/completions` 调用 Gemini 时，系统文本开头带独立闭合标签的完整 `<system-conventions>…</system-conventions>` 封套会使用 `[system-conventions]…[/system-conventions]` 分隔符转发。内部规则、代码示例和后续正文保留；客户端无需改写请求。非 Gemini 模型、普通文字中的引用和不完整封套不改。这是已复现的上游输入兼容处理，不会吞掉其他 `429` 或伪造成功；Google 原生 `/v1beta/models/*` 与 Codex 专用入口不经过此转换。
+
 ### Gemini Native
 *   **Google AI Studio**
     *   **GET/POST** `/v1beta/models/*`

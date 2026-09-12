@@ -36,7 +36,13 @@ pub fn build_official_style_system_instruction(
     }
 
     for instruction in system_instructions {
-        classify_instruction(instruction, &mut sections);
+        classify_instruction(
+            &crate::proxy::common::system_prompt::normalize_system_envelope(
+                instruction,
+                mapped_model,
+            ),
+            &mut sections,
+        );
     }
 
     if sections.identity.is_empty()
