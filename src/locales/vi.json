@@ -559,6 +559,13 @@
     },
     "config": {
       "title": "Cấu hình Dịch vụ",
+      "log_retention": {
+        "title": "Lưu giữ nhật ký yêu cầu",
+        "zero_disables": "Đặt giá trị thành 0 để tắt giới hạn tương ứng.",
+        "body_hours": "Lưu nội dung yêu cầu và phản hồi (giờ)",
+        "metadata_days": "Lưu siêu dữ liệu nhật ký (ngày)",
+        "max_rows": "Số bản ghi tối đa"
+      },
       "request": {
         "user_agent": "User-Agent Override",
         "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",

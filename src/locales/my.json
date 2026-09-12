@@ -560,6 +560,13 @@
     },
     "config": {
       "title": "Konfigurasi Perkhidmatan",
+      "log_retention": {
+        "title": "Penyimpanan log permintaan",
+        "zero_disables": "Tetapkan mana-mana nilai kepada 0 untuk melumpuhkan had tersebut.",
+        "body_hours": "Simpan kandungan permintaan dan respons (jam)",
+        "metadata_days": "Simpan metadata log (hari)",
+        "max_rows": "Bilangan maksimum log"
+      },
       "port": "Port Dengar",
       "port_tooltip": "Port TCP yang didengari Proksi API tempatan. Hentikan perkhidmatan untuk menukarnya, kemudian mulakan semula untuk digunakan.",
       "port_hint": "Lalai 8045, mulakan semula diperlukan untuk menggunakan perubahan",

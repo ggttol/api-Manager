@@ -524,6 +524,85 @@ mod tests {
         assert!(!updated.live_limited_models.contains_key("gemini-2.5-pro"));
     }
 
+    #[tokio::test]
+    async fn shared_quota_aliases_keep_protection_until_the_whole_family_recovers() {
+        let dir = TestDataDir::new();
+        let account_id = "shared-quota-account";
+        create_account_file(dir.path(), account_id, "shared-quota@example.com");
+        let mut config = crate::modules::config::load_app_config().unwrap();
+        config.quota_protection.enabled = true;
+        config.quota_protection.threshold_percentage = 10;
+        config.quota_protection.monitored_models = vec!["gemini-3.7-flash".to_string()];
+        crate::modules::config::save_app_config(&config).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let mut account = load_account(account_id).unwrap();
+        account.live_limited_models.insert(
+            "gemini-3-flash".to_string(),
+            crate::models::account::LiveLimitStatus {
+                model: "gemini-3-flash".to_string(),
+                status: 429,
+                reason: "QuotaExhausted".to_string(),
+                until: now + 3600,
+                detected_at: now,
+                message: Some("QUOTA_EXHAUSTED".to_string()),
+            },
+        );
+        save_account(&account).unwrap();
+        let mut quota: QuotaData = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"name": "gemini-3.7-flash-low", "percentage": 0, "reset_time": ""},
+                {"name": "gemini-3.7-flash-high", "percentage": 100, "reset_time": ""},
+                {"name": "claude-sonnet-4-6", "percentage": 100, "reset_time": ""}
+            ],
+            "last_updated": now
+        }))
+        .unwrap();
+
+        update_account_quota(account_id, quota.clone()).unwrap();
+        let updated = load_account(account_id).unwrap();
+        assert!(updated.protected_models.contains("gemini-3-flash"));
+        assert!(updated.live_limited_models.contains_key("gemini-3-flash"));
+
+        let manager = crate::proxy::TokenManager::new(dir.path().clone());
+        manager.load_accounts().await.unwrap();
+        assert!(
+            !manager
+                .has_available_account("gemini", "gemini-3.7-flash-high")
+                .await
+        );
+        assert!(
+            manager
+                .has_available_account("claude", "claude-sonnet-4-6")
+                .await
+        );
+
+        let mut legacy_account = load_account(account_id).unwrap();
+        legacy_account.protected_models.clear();
+        legacy_account.proxy_disabled = true;
+        legacy_account.proxy_disabled_reason = Some("quota_protection".to_string());
+        save_account(&legacy_account).unwrap();
+        manager.load_accounts().await.unwrap();
+        assert!(!load_account(account_id).unwrap().proxy_disabled);
+        assert!(
+            !manager
+                .has_available_account("gemini", "gemini-3.7-flash-high")
+                .await
+        );
+
+        quota.models[0].percentage = 10;
+        update_account_quota(account_id, quota).unwrap();
+        manager.load_accounts().await.unwrap();
+        assert!(
+            manager
+                .has_available_account("gemini", "gemini-3.7-flash-high")
+                .await
+        );
+        let recovered = load_account(account_id).unwrap();
+        assert!(!recovered.protected_models.contains("gemini-3-flash"));
+        assert!(!recovered.live_limited_models.contains_key("gemini-3-flash"));
+    }
+
     #[test]
     fn update_existing_account_preserves_other_fields_and_never_recreates_deleted_file() {
         let _guard = TEST_MUTEX.lock().unwrap();
@@ -688,28 +767,11 @@ fn load_account_index_in_dir(data_dir: &PathBuf) -> Result<AccountIndex, String>
 /// Save account index to a specific directory (internal helper)
 fn save_account_index_in_dir(data_dir: &PathBuf, index: &AccountIndex) -> Result<(), String> {
     let index_path = data_dir.join(ACCOUNTS_INDEX);
-    // Use unique temp file name per write to avoid collision
-    let temp_filename = format!("{}.tmp.{}", ACCOUNTS_INDEX, Uuid::new_v4());
-    let temp_path = data_dir.join(&temp_filename);
-
     let content = serde_json::to_string_pretty(index)
         .map_err(|e| format!("failed_to_serialize_account_index: {}", e))?;
 
-    // Write to temporary file
-    if let Err(e) = fs::write(&temp_path, content) {
-        // Clean up temp file on failure
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("failed_to_write_temp_index_file: {}", e));
-    }
-
-    // Atomic rename with platform-specific handling
-    if let Err(e) = atomic_replace_file(&temp_path, &index_path) {
-        // Clean up temp file on failure
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("failed_to_replace_index_file: {}", e));
-    }
-
-    Ok(())
+    crate::utils::atomic_file::write_atomic(&index_path, content.as_bytes())
+        .map_err(|e| format!("failed_to_write_account_index: {}", e))
 }
 
 /// Rebuild AccountIndex by scanning accounts/*.json files in specific directory
@@ -837,7 +899,7 @@ fn try_save_recovered_index(
         let timestamp = chrono::Utc::now().timestamp();
         let backup_name = format!("accounts.json.corrupt-{}-{}", timestamp, Uuid::new_v4());
         let backup_path = data_dir.join(&backup_name);
-        if let Err(e) = fs::write(&backup_path, content) {
+        if let Err(e) = crate::utils::atomic_file::write_atomic(&backup_path, content) {
             crate::modules::logger::log_warn(&format!(
                 "Failed to backup corrupt index to {}: {}",
                 backup_name, e
@@ -880,57 +942,6 @@ pub fn save_account_index(index: &AccountIndex) -> Result<(), String> {
     save_account_index_in_dir(&data_dir, index)
 }
 
-/// Platform-specific atomic file replacement
-#[cfg(target_os = "windows")]
-fn atomic_replace_file(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-
-    type Bool = i32;
-    type Dword = u32;
-
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn MoveFileExW(
-            lp_existing_file_name: *const u16,
-            lp_new_file_name: *const u16,
-            dw_flags: Dword,
-        ) -> Bool;
-    }
-
-    let src_wide: Vec<u16> = src
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let dst_wide: Vec<u16> = dst
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    // MOVEFILE_REPLACE_EXISTING = 0x1
-    // MOVEFILE_WRITE_THROUGH = 0x8
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-
-    let result = unsafe { MoveFileExW(src_wide.as_ptr(), dst_wide.as_ptr(), flags) };
-    if result == 0 {
-        let err = std::io::Error::last_os_error();
-        // Clean up source file on failure
-        let _ = fs::remove_file(src);
-        return Err(format!("MoveFileExW failed: {}", err));
-    }
-
-    Ok(())
-}
-
-/// Non-Windows: use standard rename
-#[cfg(not(target_os = "windows"))]
-fn atomic_replace_file(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
-    fs::rename(src, dst).map_err(|e| format!("rename failed: {}", e))
-}
-
 /// Load account data
 pub fn load_account(account_id: &str) -> Result<Account, String> {
     let accounts_dir = get_accounts_dir()?;
@@ -943,28 +954,11 @@ fn save_account_at_path(account_path: &PathBuf, account: &Account) -> Result<(),
     let _lock = get_account_lock(&account.id);
     let _guard = _lock.lock().unwrap();
 
-    let parent_dir = account_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| "invalid_account_path".to_string())?;
-
-    let temp_filename = format!("{}.tmp.{}", account.id, Uuid::new_v4());
-    let temp_path = parent_dir.join(&temp_filename);
-
     let content = serde_json::to_string_pretty(account)
         .map_err(|e| format!("failed_to_serialize_account_data: {}", e))?;
 
-    if let Err(e) = std::fs::write(&temp_path, content) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("failed_to_write_temp_account_file: {}", e));
-    }
-
-    if let Err(e) = atomic_replace_file(&temp_path, account_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("failed_to_replace_account_file: {}", e));
-    }
-
-    Ok(())
+    crate::utils::atomic_file::write_atomic(account_path, content.as_bytes())
+        .map_err(|e| format!("failed_to_write_account_file: {}", e))
 }
 
 /// Save account data (thread-safe and atomic)
@@ -1763,16 +1757,16 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
             if let Some(ref q) = account.quota {
                 let threshold = config.quota_protection.threshold_percentage as i32;
 
-                let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
+                let mut group_min_percentage: HashMap<String, i32> = HashMap::new();
 
                 for model in &q.models {
                     if let Some(std_id) =
                         crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
                     {
-                        let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                        if model.percentage > *entry {
-                            *entry = model.percentage;
-                        }
+                        group_min_percentage
+                            .entry(std_id)
+                            .and_modify(|minimum| *minimum = (*minimum).min(model.percentage))
+                            .or_insert(model.percentage);
                     }
                 }
                 let monitored_models: std::collections::HashSet<String> = config
@@ -1792,24 +1786,24 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                     let lookup_key =
                         crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
                             .unwrap_or_else(|| std_id.clone());
-                    let max_pct = group_max_percentage
+                    let min_pct = group_min_percentage
                         .get(&lookup_key)
                         .cloned()
                         .unwrap_or(100);
 
-                    if max_pct < threshold {
+                    if min_pct < threshold {
                         if !account.protected_models.contains(&lookup_key) {
                             crate::modules::logger::log_info(&format!(
-                                "[Quota] Triggering model protection: {} (Group: {} Max: {}% < Thres: {}%)",
-                                account.email, lookup_key, max_pct, threshold
+                                "[Quota] Triggering model protection: {} (Group: {} Min: {}% < Thres: {}%)",
+                                account.email, lookup_key, min_pct, threshold
                             ));
                             account.protected_models.insert(lookup_key.clone());
                         }
                     } else {
                         if account.protected_models.contains(&lookup_key) {
                             crate::modules::logger::log_info(&format!(
-                                "[Quota] Model protection recovered: {} (Group: {} Max: {}% >= Thres: {}%)",
-                                account.email, lookup_key, max_pct, threshold
+                                "[Quota] Model protection recovered: {} (Group: {} Min: {}% >= Thres: {}%)",
+                                account.email, lookup_key, min_pct, threshold
                             ));
                             account.protected_models.remove(&lookup_key);
                         }
@@ -1845,8 +1839,8 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     }
     // --- Quota protection logic end ---
 
-    // Quota snapshots may recover before an explicit long image lock expires. Other live
-    // records retain the baseline percentage-based cleanup behavior.
+    // Preserve explicit long image locks; other live records recover only when every
+    // observed alias sharing that quota family has positive remaining quota.
     if let Some(ref q) = account.quota {
         let now = chrono::Utc::now().timestamp();
         account.live_limited_models.retain(|model_key, status| {
@@ -1855,12 +1849,19 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
             ) {
                 return true;
             }
-            let recovered = q.models.iter().any(|model| {
-                let is_matching = model.name == *model_key
-                    || crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
-                        .is_some_and(|standard| standard == *model_key);
-                is_matching && model.percentage > 0
-            });
+            let recovered = q
+                .models
+                .iter()
+                .filter(|model| {
+                    model.name == *model_key
+                        || crate::proxy::common::model_mapping::normalize_to_standard_id(
+                            &model.name,
+                        )
+                        .is_some_and(|standard| standard == *model_key)
+                })
+                .map(|model| model.percentage)
+                .min()
+                .is_some_and(|minimum| minimum > 0);
             !recovered
         });
     }
@@ -2079,14 +2080,15 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
         }
     }
 
-    let result = modules::fetch_quota(
+    let result = modules::fetch_quota_with_cache(
         &account.token.access_token,
         &account.email,
+        account.token.project_id.as_deref(),
         Some(&account.id),
     )
     .await;
     if let Ok((_, project_id)) = &result {
-        if project_id.is_some() && *project_id != account.token.project_id {
+        if *project_id != account.token.project_id {
             account.token.project_id = project_id.clone();
             let project_id = project_id.clone();
             let _ = update_existing_account(&account.id, |latest| {
@@ -2166,10 +2168,15 @@ pub async fn fetch_quota_with_retry(account: &mut Account) -> crate::error::AppR
         })
         .map_err(AppError::Account)?;
 
-        let retry =
-            modules::fetch_quota(&retry_access_token, &account.email, Some(&account.id)).await;
+        let retry = modules::fetch_quota_with_cache(
+            &retry_access_token,
+            &account.email,
+            account.token.project_id.as_deref(),
+            Some(&account.id),
+        )
+        .await;
         if let Ok((_, project_id)) = &retry {
-            if project_id.is_some() && *project_id != account.token.project_id {
+            if *project_id != account.token.project_id {
                 account.token.project_id = project_id.clone();
                 let project_id = project_id.clone();
                 let _ = update_existing_account(&account.id, |latest| {
@@ -2192,7 +2199,13 @@ fn finish_quota_result(
     result: crate::error::AppResult<(QuotaData, Option<String>)>,
 ) -> crate::error::AppResult<QuotaData> {
     match result {
-        Ok((quota, _)) => {
+        Ok((mut quota, _)) => {
+            if quota.subscription_tier.is_none() {
+                quota.subscription_tier = account
+                    .quota
+                    .as_ref()
+                    .and_then(|previous| previous.subscription_tier.clone());
+            }
             clear_validation_blocked(account);
             Ok(quota)
         }

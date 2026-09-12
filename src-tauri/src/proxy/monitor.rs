@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
@@ -33,37 +34,35 @@ pub struct ProxyStats {
     pub error_count: u64,
 }
 
+struct RetentionTaskControl {
+    stopped: AtomicBool,
+    wake: Notify,
+}
+
 pub struct ProxyMonitor {
     pub logs: RwLock<VecDeque<ProxyRequestLog>>,
     pub stats: RwLock<ProxyStats>,
     pub max_logs: usize,
     pub enabled: AtomicBool,
     app_handle: Option<tauri::AppHandle>,
-    /// Serializes persistence with clear so an acknowledged clear cannot be
-    /// followed by a write that began before it.
-    operation_lock: Mutex<()>,
+    /// Serializes persistence and retention with clear so an acknowledged clear
+    /// cannot be followed by a write or cleanup that began before it.
+    operation_lock: Arc<Mutex<()>>,
+    retention_task: Arc<RetentionTaskControl>,
 }
 
 impl ProxyMonitor {
     pub fn new(max_logs: usize, app_handle: Option<tauri::AppHandle>) -> Self {
-        // Initialize DB
         if let Err(e) = crate::modules::proxy_db::init_db() {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        // Auto cleanup old logs (keep last 30 days)
-        tokio::task::spawn_blocking(
-            move || match crate::modules::proxy_db::cleanup_old_logs(30) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        tracing::info!("Auto cleanup: removed {} old logs (>30 days)", deleted);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to cleanup old logs: {}", e);
-                }
-            },
-        );
+        let operation_lock = Arc::new(Mutex::new(()));
+        let retention_task = Arc::new(RetentionTaskControl {
+            stopped: AtomicBool::new(false),
+            wake: Notify::new(),
+        });
+        spawn_retention_task(operation_lock.clone(), retention_task.clone());
 
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),
@@ -71,7 +70,8 @@ impl ProxyMonitor {
             max_logs,
             enabled: AtomicBool::new(false), // Default to disabled
             app_handle,
-            operation_lock: Mutex::new(()),
+            operation_lock,
+            retention_task,
         }
     }
 
@@ -264,4 +264,64 @@ impl ProxyMonitor {
         *stats = ProxyStats::default();
         Ok(())
     }
+}
+
+impl Drop for ProxyMonitor {
+    fn drop(&mut self) {
+        self.retention_task.stopped.store(true, Ordering::Release);
+        self.retention_task.wake.notify_one();
+    }
+}
+
+fn spawn_retention_task(operation_lock: Arc<Mutex<()>>, retention_task: Arc<RetentionTaskControl>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.tick().await;
+
+        loop {
+            if retention_task.stopped.load(Ordering::Acquire) {
+                break;
+            }
+
+            let _operation = operation_lock.lock().await;
+            if retention_task.stopped.load(Ordering::Acquire) {
+                break;
+            }
+
+            // Reload the persisted policy each run so UI changes take effect
+            // without restarting the proxy.
+            match tokio::task::spawn_blocking(move || {
+                let retention = crate::modules::config::load_app_config()?
+                    .proxy
+                    .log_retention;
+                crate::modules::proxy_db::apply_retention(&retention)
+            })
+            .await
+            {
+                Ok(Ok((cleared, deleted))) if cleared > 0 || deleted > 0 => {
+                    tracing::info!(
+                        "Proxy log retention: cleared {} bodies, deleted {} rows",
+                        cleared,
+                        deleted
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::error!("Failed to apply proxy log retention: {}", error)
+                }
+                Err(error) => tracing::error!("Proxy log retention task failed: {}", error),
+            }
+            drop(_operation);
+
+            let shutdown = retention_task.wake.notified();
+            tokio::pin!(shutdown);
+            if retention_task.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut shutdown => break,
+            }
+        }
+    });
 }

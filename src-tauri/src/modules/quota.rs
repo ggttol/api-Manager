@@ -129,25 +129,19 @@ struct Tier {
 }
 
 /// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
-async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
+async fn create_standard_client(account_id: Option<&str>) -> Result<rquest::Client, String> {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
         pool.get_effective_standard_client(account_id, 15).await
     } else {
-        crate::utils::http::get_standard_client()
+        Ok(crate::utils::http::get_standard_client())
     }
 }
 
-/// Get shared HTTP Client (60s timeout) for pure info fetching (No JA3)
-#[allow(dead_code)] // 预留给预热/后台任务调用
-async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client {
-    if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 60).await
-    } else {
-        crate::utils::http::get_long_standard_client()
-    }
-}
-
-const CLOUD_CODE_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+const LOAD_CODE_ASSIST_ENDPOINTS: [&str; 3] = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+];
 
 /// Fetch project ID and subscription tier
 async fn fetch_project_id(
@@ -155,88 +149,88 @@ async fn fetch_project_id(
     email: &str,
     account_id: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let client = create_standard_client(account_id).await;
+    let client = match create_standard_client(account_id).await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!("Cannot query project through configured proxy: {}", error);
+            return (None, None);
+        }
+    };
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
-    let res = client
-        .post(format!("{}/v1internal:loadCodeAssist", CLOUD_CODE_BASE_URL))
-        .header(
-            rquest::header::AUTHORIZATION,
-            format!("Bearer {}", access_token),
-        )
-        .header(rquest::header::CONTENT_TYPE, "application/json")
-        .header(
-            rquest::header::USER_AGENT,
-            crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
-        )
-        .json(&meta)
-        .send()
-        .await;
+    for endpoint in LOAD_CODE_ASSIST_ENDPOINTS {
+        let res = client
+            .post(endpoint)
+            .header(
+                rquest::header::AUTHORIZATION,
+                format!("Bearer {}", access_token),
+            )
+            .header(rquest::header::CONTENT_TYPE, "application/json")
+            .header(
+                rquest::header::USER_AGENT,
+                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+            )
+            .json(&meta)
+            .send()
+            .await;
 
-    match res {
-        Ok(res) => {
-            if res.status().is_success() {
-                if let Ok(data) = res.json::<LoadProjectResponse>().await {
+        match res {
+            Ok(res) if res.status().is_success() => match res.json::<LoadProjectResponse>().await {
+                Ok(data) => {
                     let project_id = data.project_id.clone();
-
-                    // Core logic: Multi-level fallback for tier extraction
-                    // 1. Paid Tier (Google One AI Premium etc.)
-                    // 2. Current Tier (If not ineligible)
-                    // 3. Allowed Tiers (Restricted/Default proxy access)
                     let mut subscription_tier = data
                         .paid_tier
                         .as_ref()
-                        .and_then(|t| t.name.clone())
-                        .or_else(|| data.paid_tier.as_ref().and_then(|t| t.id.clone()));
+                        .and_then(|tier| tier.name.clone())
+                        .or_else(|| data.paid_tier.as_ref().and_then(|tier| tier.id.clone()));
+                    let is_ineligible = data
+                        .ineligible_tiers
+                        .as_ref()
+                        .is_some_and(|tiers| !tiers.is_empty());
 
-                    let is_ineligible = data.ineligible_tiers.is_some()
-                        && !data.ineligible_tiers.as_ref().unwrap().is_empty();
-
-                    if subscription_tier.is_none() {
-                        if !is_ineligible {
-                            subscription_tier = data
-                                .current_tier
+                    if subscription_tier.is_none() && !is_ineligible {
+                        subscription_tier = data
+                            .current_tier
+                            .as_ref()
+                            .and_then(|tier| tier.name.clone())
+                            .or_else(|| {
+                                data.current_tier.as_ref().and_then(|tier| tier.id.clone())
+                            });
+                    } else if subscription_tier.is_none() {
+                        if let Some(default_tier) = data.allowed_tiers.as_ref().and_then(|tiers| {
+                            tiers.iter().find(|tier| tier.is_default == Some(true))
+                        }) {
+                            subscription_tier = default_tier
+                                .name
                                 .as_ref()
-                                .and_then(|t| t.name.clone())
-                                .or_else(|| data.current_tier.as_ref().and_then(|t| t.id.clone()));
-                        } else {
-                            // If account is marked as INELIGIBLE, drop to allowedTiers and extract default
-                            if let Some(mut allowed) = data.allowed_tiers {
-                                if let Some(default_tier) =
-                                    allowed.iter_mut().find(|t| t.is_default == Some(true))
-                                {
-                                    if let Some(name) = &default_tier.name {
-                                        subscription_tier = Some(format!("{} (Restricted)", name));
-                                    } else if let Some(id) = &default_tier.id {
-                                        subscription_tier = Some(format!("{} (Restricted)", id));
-                                    }
-                                }
-                            }
+                                .or(default_tier.id.as_ref())
+                                .map(|tier| format!("{} (Restricted)", tier));
                         }
                     }
 
-                    if let Some(ref tier) = subscription_tier {
+                    if let Some(tier) = &subscription_tier {
                         crate::modules::logger::log_info(&format!(
                             "📊 [{}] Subscription identified successfully: {}",
                             email, tier
                         ));
                     }
-
                     return (project_id, subscription_tier);
                 }
-            } else {
-                crate::modules::logger::log_warn(&format!(
-                    "⚠️  [{}] loadCodeAssist failed: Status: {}",
-                    email,
-                    res.status()
-                ));
-            }
-        }
-        Err(e) => {
-            crate::modules::logger::log_error(&format!(
-                "❌ [{}] loadCodeAssist network error: {}",
-                email, e
-            ));
+                Err(error) => crate::modules::logger::log_warn(&format!(
+                    "⚠️ [{}] loadCodeAssist response from {} could not be parsed: {}",
+                    email, endpoint, error
+                )),
+            },
+            Ok(res) => crate::modules::logger::log_warn(&format!(
+                "⚠️ [{}] loadCodeAssist at {} failed: Status: {}",
+                email,
+                endpoint,
+                res.status()
+            )),
+            Err(error) => crate::modules::logger::log_warn(&format!(
+                "⚠️ [{}] loadCodeAssist request to {} failed: {}",
+                email, endpoint, error
+            )),
         }
     }
 
@@ -270,7 +264,9 @@ pub async fn fetch_quota_with_cache(
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
-    let client = create_standard_client(account_id).await;
+    let client = create_standard_client(account_id)
+        .await
+        .map_err(|error| AppError::Network(error, None))?;
     let payload = if let Some(ref pid) = project_id {
         json!({ "project": pid })
     } else {
@@ -409,13 +405,22 @@ pub async fn fetch_quota_with_cache(
                     // Set subscription tier
                     quota_data.subscription_tier = subscription_tier.clone();
 
-                    // Best-effort: fetch grouped quota summary (weekly + 5h windows).
-                    // Failure here must not block the primary quota result.
+                    // Grouped buckets describe the real shared limits. Merge every
+                    // explicitly applicable window so a synthetic per-model 100% does
+                    // not hide an exhausted family.
                     quota_data.quota_groups =
                         fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
                             .await;
+                    if let Some(groups) = quota_data.quota_groups.as_ref() {
+                        merge_grouped_quota_into_models(&mut quota_data.models, groups);
+                    }
 
-                    return Ok((quota_data, project_id.clone()));
+                    // A cached project that was rejected but succeeded after its removal
+                    // must be cleared rather than persisted again.
+                    let project_to_persist = (!retry_without_project)
+                        .then(|| project_id.clone())
+                        .flatten();
+                    return Ok((quota_data, project_to_persist));
                 }
                 Err(e) => {
                     crate::modules::logger::log_warn(&format!(
@@ -436,6 +441,71 @@ pub async fn fetch_quota_with_cache(
         AppError::Unknown("Quota fetch failed: all endpoints exhausted".to_string())
     }))
 }
+fn quota_group_metadata(group: &crate::models::quota::QuotaGroup) -> String {
+    let mut metadata = format!(
+        "{} {}",
+        group.display_name,
+        group.description.as_deref().unwrap_or_default()
+    );
+    for bucket in &group.buckets {
+        metadata.push_str(&format!(
+            " {} {} {} {}",
+            bucket.bucket_id,
+            bucket.window,
+            bucket.display_name.as_deref().unwrap_or_default(),
+            bucket.description.as_deref().unwrap_or_default()
+        ));
+    }
+    metadata
+}
+
+fn merge_grouped_quota_into_models(
+    models: &mut [crate::models::quota::ModelQuota],
+    groups: &[crate::models::quota::QuotaGroup],
+) {
+    for model in models {
+        let Some(model_key) =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
+        else {
+            continue;
+        };
+
+        let mut strictest: Option<(f64, String)> = None;
+        for group in groups.iter().filter(|group| {
+            crate::proxy::common::model_mapping::quota_group_standard_ids(&quota_group_metadata(
+                group,
+            ))
+            .contains(&model_key.as_str())
+        }) {
+            for bucket in &group.buckets {
+                let remaining = bucket.remaining_fraction.clamp(0.0, 1.0);
+                match &mut strictest {
+                    None => strictest = Some((remaining, bucket.reset_time.clone())),
+                    Some((current, reset_time)) if remaining < *current => {
+                        *current = remaining;
+                        *reset_time = bucket.reset_time.clone();
+                    }
+                    // Matching minimum windows are all constraints. Use the latest
+                    // reset among known equal minima; an absent reset stays unknown
+                    // instead of advertising an earlier availability time.
+                    Some((current, reset_time)) if remaining == *current => {
+                        if reset_time.is_empty() || bucket.reset_time.is_empty() {
+                            reset_time.clear();
+                        } else if bucket.reset_time > *reset_time {
+                            *reset_time = bucket.reset_time.clone();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some((remaining, reset_time)) = strictest {
+            model.percentage = (remaining * 100.0) as i32;
+            model.reset_time = reset_time;
+        }
+    }
+}
 
 /// Fetch grouped quota summary (weekly + 5h windows) via retrieveUserQuotaSummary.
 ///
@@ -447,7 +517,7 @@ async fn fetch_quota_summary(
     project_id: Option<&str>,
     account_id: Option<&str>,
 ) -> Option<Vec<crate::models::quota::QuotaGroup>> {
-    let client = create_standard_client(account_id).await;
+    let client = create_standard_client(account_id).await.ok()?;
     let payload = if let Some(pid) = project_id {
         json!({ "project": pid })
     } else {
@@ -474,13 +544,10 @@ async fn fetch_quota_summary(
                         "QuotaSummary API {} returned {}, trying next endpoint",
                         ep_url, status
                     ));
-                    // 4xx (非 429) 通常所有端点行为一致,直接退出避免无谓重试
-                    if status.is_client_error() && status != rquest::StatusCode::TOO_MANY_REQUESTS {
-                        return None;
-                    }
+                    // Different deployments can reject the same account differently;
+                    // exhaust every endpoint before giving up the best-effort summary.
                     continue;
                 }
-
                 let summary: QuotaSummaryResponse = match response.json().await {
                     Ok(s) => s,
                     Err(e) => {
@@ -919,4 +986,75 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         "Successfully triggered warmup for {} model series",
         warmed_count
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(name: &str, percentage: i32) -> crate::models::quota::ModelQuota {
+        crate::models::quota::ModelQuota {
+            name: name.to_string(),
+            percentage,
+            reset_time: String::new(),
+            display_name: None,
+            supports_images: None,
+            supports_thinking: None,
+            thinking_budget: None,
+            recommended: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            supported_mime_types: None,
+        }
+    }
+
+    #[test]
+    fn grouped_quota_uses_the_strictest_applicable_window_without_touching_unknown_groups() {
+        let mut models = vec![
+            model("gemini-3-flash", 100),
+            model("claude-sonnet-4-6", 100),
+        ];
+        let groups = vec![
+            crate::models::quota::QuotaGroup {
+                display_name: "Gemini Flash".to_string(),
+                description: None,
+                buckets: vec![
+                    crate::models::quota::QuotaBucket {
+                        bucket_id: "flash-5h".to_string(),
+                        window: "5h".to_string(),
+                        remaining_fraction: 0.5,
+                        reset_time: "2026-01-01T01:00:00Z".to_string(),
+                        display_name: None,
+                        description: None,
+                    },
+                    crate::models::quota::QuotaBucket {
+                        bucket_id: "flash-weekly".to_string(),
+                        window: "weekly".to_string(),
+                        remaining_fraction: 0.2,
+                        reset_time: "2026-01-02T01:00:00Z".to_string(),
+                        display_name: None,
+                        description: None,
+                    },
+                ],
+            },
+            crate::models::quota::QuotaGroup {
+                display_name: "Experimental quota".to_string(),
+                description: None,
+                buckets: vec![crate::models::quota::QuotaBucket {
+                    bucket_id: "unknown".to_string(),
+                    window: "5h".to_string(),
+                    remaining_fraction: 0.0,
+                    reset_time: "2026-01-03T01:00:00Z".to_string(),
+                    display_name: None,
+                    description: None,
+                }],
+            },
+        ];
+
+        merge_grouped_quota_into_models(&mut models, &groups);
+
+        assert_eq!(models[0].percentage, 20);
+        assert_eq!(models[0].reset_time, "2026-01-02T01:00:00Z");
+        assert_eq!(models[1].percentage, 100);
+    }
 }

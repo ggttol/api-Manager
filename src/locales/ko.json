@@ -633,6 +633,13 @@
     },
     "config": {
       "title": "서비스 구성",
+      "log_retention": {
+        "title": "요청 로그 보관",
+        "zero_disables": "값을 0으로 설정하면 해당 제한이 비활성화됩니다.",
+        "body_hours": "요청 및 응답 본문 보관 시간",
+        "metadata_days": "로그 메타데이터 보관 일수",
+        "max_rows": "최대 로그 수"
+      },
       "request": {
         "user_agent": "User-Agent 재정의",
         "user_agent_tooltip": "업스트림 API로 전송되는 User-Agent 헤더를 재정의합니다. 비워 두면 기본값이 사용됩니다.",

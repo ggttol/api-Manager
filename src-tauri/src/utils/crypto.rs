@@ -11,6 +11,10 @@ const LEGACY_FIXED_NONCE: &[u8; 12] = b"antigravsalt";
 const ENCRYPTED_PREFIX: &str = "ag_enc_";
 const ENCRYPTED_V2_PREFIX: &str = "ag_enc_v2_";
 
+pub(crate) fn is_encrypted_password(value: &str) -> bool {
+    value.starts_with(ENCRYPTED_PREFIX)
+}
+
 fn get_encryption_key() -> [u8; 32] {
     let device_id = machine_uid::get().unwrap_or_else(|_| "default".to_string());
     let mut key = [0u8; 32];
@@ -23,7 +27,7 @@ pub fn serialize_password<S>(password: &str, serializer: S) -> Result<S::Ok, S::
 where
     S: Serializer,
 {
-    if password.starts_with(ENCRYPTED_PREFIX) || password.starts_with(ENCRYPTED_V2_PREFIX) {
+    if is_encrypted_password(password) {
         return serializer.serialize_str(password);
     }
 
@@ -43,12 +47,22 @@ where
     if raw.starts_with(ENCRYPTED_V2_PREFIX) {
         match decrypt_string_v2(&raw[ENCRYPTED_V2_PREFIX.len()..]) {
             Ok(plaintext) => Ok(plaintext),
-            Err(_) => Ok(raw),
+            Err(_) => {
+                tracing::warn!(
+                    "Proxy password decryption failed; restore the original machine key or re-enter the password"
+                );
+                Ok(raw)
+            }
         }
     } else if raw.starts_with(ENCRYPTED_PREFIX) {
         match decrypt_legacy(&raw[ENCRYPTED_PREFIX.len()..]) {
             Ok(plaintext) => Ok(plaintext),
-            Err(_) => Ok(raw),
+            Err(_) => {
+                tracing::warn!(
+                    "Legacy proxy password decryption failed; restore the original machine key or re-enter the password"
+                );
+                Ok(raw)
+            }
         }
     } else {
         match decrypt_legacy(&raw) {

@@ -633,6 +633,13 @@
     },
     "config": {
       "title": "サービス構成",
+      "log_retention": {
+        "title": "リクエストログの保持",
+        "zero_disables": "各値を 0 にすると、その制限が無効になります。",
+        "body_hours": "リクエスト・レスポンス本文の保持時間",
+        "metadata_days": "ログメタデータの保持日数",
+        "max_rows": "ログの最大件数"
+      },
       "request": {
         "user_agent": "User-Agent オーバーライド",
         "user_agent_tooltip": "アップストリームAPIに送信するUser-Agentヘッダーを上書きします。空欄の場合はデフォルトを使用します。",

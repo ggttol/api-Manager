@@ -106,64 +106,14 @@ impl ProxyPoolManager {
         &self,
         account_id: Option<&str>,
         timeout_secs: u64,
-    ) -> Client {
-        let mut builder = Client::builder()
-            .emulation(Emulation::Chrome123)
-            .timeout(Duration::from_secs(timeout_secs));
-
-        // 尝试获取代理配置
-        let proxy_opt = if let Some(acc_id) = account_id {
-            self.get_proxy_for_account(acc_id).await.ok().flatten()
-        } else {
-            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
-            let (config, bindings) = self.routing_snapshot().await;
-            if config.enabled {
-                let res = self
-                    .select_proxy_from_pool(&config, &bindings)
-                    .ok()
-                    .flatten();
-                if let Some(p) = &res {
-                    tracing::info!(
-                        "[Proxy] Route: Generic Request -> Proxy {} (Pool)",
-                        p.entry_id
-                    );
-                } else {
-                    // [FIX #1583] 明确记录池中无可用代理的情况
-                    tracing::warn!("[Proxy] Route: Generic Request -> No available proxy in pool, falling back to upstream or direct");
-                }
-                res
-            } else {
-                tracing::debug!("[Proxy] Route: Generic Request -> Proxy pool disabled");
-                None
-            }
-        };
-
-        if let Some(proxy_cfg) = proxy_opt {
-            builder = builder.proxy(proxy_cfg.proxy);
-            // Already logged more detail in get_proxy_for_account or pool selection
-        } else {
-            // Fallback 到应用配置的单上游代理
-            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
-                let up = app_cfg.proxy.upstream_proxy;
-                if up.enabled && !up.url.is_empty() {
-                    if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!(
-                            "[Proxy] Route: {:?} -> Upstream: {} (AppConfig)",
-                            account_id.unwrap_or("Generic"),
-                            redact_proxy_url(&up.url)
-                        );
-                        builder = builder.proxy(p);
-                    }
-                } else {
-                    tracing::info!(
-                        "[Proxy] Route: {:?} -> Direct",
-                        account_id.unwrap_or("Generic")
-                    );
-                }
-            }
-        }
-
-        builder.build().unwrap_or_else(|_| Client::new())
+    ) -> Result<Client, String> {
+        self.build_effective_client(
+            Client::builder()
+                .emulation(Emulation::Chrome123)
+                .timeout(Duration::from_secs(timeout_secs)),
+            account_id,
+        )
+        .await
     }
 
     /// [NEW] 为指定账号获取“最终生效”的无特征 Standard HttpClient (专门用于纯净场景，如 OAuth 退还)
@@ -171,64 +121,44 @@ impl ProxyPoolManager {
         &self,
         account_id: Option<&str>,
         timeout_secs: u64,
-    ) -> Client {
-        let mut builder = Client::builder()
-            // 无 Emulation 设置，走纯正的基础 TLS 指纹
-            .timeout(Duration::from_secs(timeout_secs));
+    ) -> Result<Client, String> {
+        self.build_effective_client(
+            Client::builder().timeout(Duration::from_secs(timeout_secs)),
+            account_id,
+        )
+        .await
+    }
 
-        // 尝试获取代理配置
-        let proxy_opt = if let Some(acc_id) = account_id {
-            self.get_proxy_for_account(acc_id).await.ok().flatten()
+    async fn build_effective_client(
+        &self,
+        mut builder: rquest::ClientBuilder,
+        account_id: Option<&str>,
+    ) -> Result<Client, String> {
+        let proxy = if let Some(account_id) = account_id {
+            self.get_proxy_for_account(account_id).await?
         } else {
-            // 没有 account_id 的通用请求，如果代理池启用，则默认从中选择节点作为出口
             let (config, bindings) = self.routing_snapshot().await;
             if config.enabled {
-                let res = self
-                    .select_proxy_from_pool(&config, &bindings)
-                    .ok()
-                    .flatten();
-                if let Some(p) = &res {
-                    tracing::info!(
-                        "[Proxy] Route: Generic Request (Standard Client) -> Proxy {} (Pool)",
-                        p.entry_id
-                    );
-                } else {
-                    tracing::warn!("[Proxy] Route: Generic Request (Standard Client) -> No available proxy in pool, falling back to upstream or direct");
-                }
-                res
+                self.select_proxy_from_pool(&config, &bindings)?
             } else {
-                tracing::debug!(
-                    "[Proxy] Route: Generic Request (Standard Client) -> Proxy pool disabled"
-                );
                 None
             }
         };
-
-        if let Some(proxy_cfg) = proxy_opt {
-            builder = builder.proxy(proxy_cfg.proxy);
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy.proxy);
         } else {
-            // Fallback 到应用配置的单上游代理
-            if let Ok(app_cfg) = crate::modules::config::load_app_config() {
-                let up = app_cfg.proxy.upstream_proxy;
-                if up.enabled && !up.url.is_empty() {
-                    if let Ok(p) = rquest::Proxy::all(&up.url) {
-                        tracing::info!(
-                            "[Proxy] Route: {:?} (Standard Client) -> Upstream: {} (AppConfig)",
-                            account_id.unwrap_or("Generic"),
-                            redact_proxy_url(&up.url)
-                        );
-                        builder = builder.proxy(p);
-                    }
-                } else {
-                    tracing::info!(
-                        "[Proxy] Route: {:?} (Standard Client) -> Direct",
-                        account_id.unwrap_or("Generic")
-                    );
-                }
+            let upstream = crate::modules::config::load_app_config()?
+                .proxy
+                .upstream_proxy;
+            if upstream.enabled && !upstream.url.is_empty() {
+                let proxy = rquest::Proxy::all(&upstream.url)
+                    .map_err(|_| "Invalid configured upstream proxy URL".to_string())?;
+                builder = builder.proxy(proxy);
             }
         }
-
-        builder.build().unwrap_or_else(|_| Client::new())
+        builder
+            .build()
+            .map_err(|error| format!("Failed to construct configured proxy client: {}", error))
     }
 
     /// 为账号获取代理
@@ -378,12 +308,23 @@ impl ProxyPoolManager {
         let mut proxy = rquest::Proxy::all(&clean_url)
             .or_else(|_| rquest::Proxy::all(&raw_url))
             .map_err(|e| format!("Invalid proxy URL: {}", e))?;
-        if let Some(auth) = &entry.auth {
-            if !auth.username.is_empty() {
-                proxy = proxy.basic_auth(&auth.username, &auth.password);
+        let explicit_auth = entry.auth.as_ref().filter(|auth| !auth.username.is_empty());
+        let credentials = match explicit_auth {
+            Some(auth) if crate::utils::crypto::is_encrypted_password(&auth.password) => {
+                let fallback = parsed_auth.as_ref().ok_or_else(|| {
+                    "Proxy password cannot be decrypted; re-enter it or provide valid URL credentials"
+                        .to_string()
+                })?;
+                tracing::warn!("Proxy password could not be decrypted; using URL credentials");
+                Some((fallback.0.as_str(), fallback.1.as_str()))
             }
-        } else if let Some((user, password)) = parsed_auth {
-            proxy = proxy.basic_auth(&user, &password);
+            Some(auth) => Some((auth.username.as_str(), auth.password.as_str())),
+            None => parsed_auth
+                .as_ref()
+                .map(|(user, password)| (user.as_str(), password.as_str())),
+        };
+        if let Some((user, password)) = credentials {
+            proxy = proxy.basic_auth(user, password);
         }
         Ok(PoolProxyConfig {
             proxy,
@@ -728,17 +669,12 @@ mod tests {
     use super::*;
     use crate::proxy::config::ProxyAuth;
 
-    #[test]
-    fn test_build_proxy_config_with_explicit_auth() {
-        let pool = ProxyPoolManager::new(Arc::new(RwLock::new(ProxyPoolConfig::default())));
-        let entry = ProxyEntry {
-            id: "p1".to_string(),
+    fn test_proxy_entry(url: String, auth: Option<ProxyAuth>) -> ProxyEntry {
+        ProxyEntry {
+            id: "test-proxy".to_string(),
             name: "test".to_string(),
-            url: "http://127.0.0.1:8080".to_string(),
-            auth: Some(ProxyAuth {
-                username: "user".to_string(),
-                password: "pass".to_string(),
-            }),
+            url,
+            auth,
             enabled: true,
             priority: 1,
             tags: vec![],
@@ -747,34 +683,94 @@ mod tests {
             last_check_time: None,
             is_healthy: true,
             latency: None,
-        };
-
-        let res = pool.build_proxy_config(&entry);
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap().entry_id, "p1");
+        }
     }
 
-    #[test]
-    fn test_build_proxy_config_with_url_auth() {
-        let pool = ProxyPoolManager::new(Arc::new(RwLock::new(ProxyPoolConfig::default())));
-        let entry = ProxyEntry {
-            id: "p2".to_string(),
-            name: "test_url_auth".to_string(),
-            url: "http://user:pass@127.0.0.1:10080".to_string(),
-            auth: None,
-            enabled: true,
-            priority: 1,
-            tags: vec![],
-            max_accounts: None,
-            health_check_url: None,
-            last_check_time: None,
-            is_healthy: true,
-            latency: None,
-        };
+    #[tokio::test]
+    async fn proxy_requests_use_explicit_auth_or_recover_url_auth() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let res = pool.build_proxy_config(&entry);
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap().entry_id, "p2");
+        for (auth, expected_credentials) in [
+            (
+                Some(ProxyAuth {
+                    username: "explicit".to_string(),
+                    password: "plain+pass".to_string(),
+                }),
+                "explicit:plain+pass",
+            ),
+            (
+                Some(ProxyAuth {
+                    username: "unavailable".to_string(),
+                    password: "ag_enc_v2_unrecoverable".to_string(),
+                }),
+                "url+user:url@pass",
+            ),
+            (None, "url+user:url@pass"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let capture = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    assert_ne!(stream.read_buf(&mut request).await.unwrap(), 0);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let entry = test_proxy_entry(format!("http://url%2Buser:url%40pass@{}", address), auth);
+            let pool = ProxyPoolManager::new(Arc::new(RwLock::new(ProxyPoolConfig {
+                enabled: true,
+                proxies: vec![entry],
+                ..ProxyPoolConfig::default()
+            })));
+            let response = pool
+                .get_effective_standard_client(None, 5)
+                .await
+                .unwrap()
+                .get("http://service.invalid/models")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+            let request = capture.await.unwrap();
+            let authorization = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("proxy-authorization")
+                    .then(|| value.trim())
+            });
+            assert_eq!(
+                authorization,
+                Some(format!("Basic {}", STANDARD.encode(expected_credentials)).as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_proxy_credentials_never_fall_back_to_direct() {
+        let entry = test_proxy_entry(
+            "http://127.0.0.1:8080".to_string(),
+            Some(ProxyAuth {
+                username: "user".to_string(),
+                password: "ag_enc_v2_unrecoverable".to_string(),
+            }),
+        );
+        let pool = ProxyPoolManager::new(Arc::new(RwLock::new(ProxyPoolConfig {
+            enabled: true,
+            proxies: vec![entry],
+            ..ProxyPoolConfig::default()
+        })));
+        assert!(pool.get_effective_client(None, 1).await.is_err());
+        assert!(pool
+            .get_effective_standard_client(Some("account"), 1)
+            .await
+            .is_err());
     }
 
     #[test]

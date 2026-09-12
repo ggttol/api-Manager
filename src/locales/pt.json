@@ -665,6 +665,13 @@
     },
     "config": {
       "title": "Configuração do Proxy",
+      "log_retention": {
+        "title": "Retenção de logs de solicitações",
+        "zero_disables": "Defina qualquer valor como 0 para desativar esse limite.",
+        "body_hours": "Manter corpos de solicitações e respostas (horas)",
+        "metadata_days": "Manter metadados dos logs (dias)",
+        "max_rows": "Número máximo de logs"
+      },
       "request": {
         "user_agent": "User-Agent Override",
         "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",

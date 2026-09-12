@@ -38,6 +38,73 @@ pub(crate) fn has_explicit_quota_exhausted(body: &str) -> bool {
     body.to_ascii_uppercase().contains("QUOTA_EXHAUSTED")
 }
 
+/// Classify upstream limit failures consistently for both the tracker and
+/// quota-refresh path. A bare `QUOTA_EXHAUSTED` is often a transient capacity
+/// response; only reset/daily-quota evidence earns the long quota backoff.
+pub(crate) fn classify_rate_limit_reason(error_body: &str) -> RateLimitReason {
+    let body_lower = error_body.to_ascii_lowercase();
+    let quota_has_hard_evidence = [
+        "quotaresetdelay",
+        "quotareset",
+        "quota reset",
+        "quota limit",
+        "per day",
+        "daily quota",
+    ]
+    .iter()
+    .any(|marker| body_lower.contains(marker));
+
+    let parsed = serde_json::from_str::<serde_json::Value>(error_body).ok();
+    let mut structured_reasons = parsed
+        .as_ref()
+        .and_then(|json| json.get("error"))
+        .and_then(|error| error.get("details"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|detail| detail.get("reason").and_then(serde_json::Value::as_str));
+
+    if structured_reasons
+        .clone()
+        .any(|reason| reason == "MODEL_CAPACITY_EXHAUSTED")
+        || body_lower.contains("model_capacity_exhausted")
+    {
+        return RateLimitReason::ModelCapacityExhausted;
+    }
+    if structured_reasons
+        .clone()
+        .any(|reason| reason == "RATE_LIMIT_EXCEEDED")
+        || body_lower.contains("per minute")
+        || body_lower.contains("rate limit")
+        || body_lower.contains("too many requests")
+    {
+        return RateLimitReason::RateLimitExceeded;
+    }
+
+    let has_structured_quota_exhausted =
+        structured_reasons.any(|reason| reason == "QUOTA_EXHAUSTED");
+    if has_structured_quota_exhausted || body_lower.contains("quota_exhausted") {
+        return if quota_has_hard_evidence {
+            RateLimitReason::QuotaExhausted
+        } else {
+            RateLimitReason::RateLimitExceeded
+        };
+    }
+
+    let generic_resource_exhausted = body_lower.contains("resource has been exhausted")
+        || body_lower.contains("resource_exhausted");
+    if quota_has_hard_evidence {
+        RateLimitReason::QuotaExhausted
+    } else if generic_resource_exhausted
+        || body_lower.contains("exhausted")
+        || body_lower.contains("quota")
+    {
+        RateLimitReason::RateLimitExceeded
+    } else {
+        RateLimitReason::Unknown
+    }
+}
+
 pub(crate) fn is_active_persisted_long_image_limit(
     model_key: &str,
     status: &crate::models::account::LiveLimitStatus,
@@ -52,6 +119,12 @@ pub(crate) fn is_active_persisted_long_image_limit(
             has_explicit_quota_exhausted(message)
                 && crate::proxy::upstream::retry::parse_retry_delay(message, None).is_some()
         })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitOrigin {
+    Http429,
+    QuotaObservation,
 }
 
 /// 限流信息
@@ -73,6 +146,7 @@ pub struct RateLimitInfo {
     /// None 表示账号级别限流,Some(model) 表示特定模型限流
     #[allow(dead_code)] // Used for model-level rate limiting
     pub model: Option<String>,
+    origin: LimitOrigin,
 }
 
 /// 失败计数过期时间：1小时（超过此时间未失败则重置计数）
@@ -183,6 +257,7 @@ impl RateLimitTracker {
             detected_at: now,
             reason,
             model: model.clone(), // 🆕 支持模型级别限流
+            origin: LimitOrigin::Http429,
         };
 
         let key = self.get_limit_key(account_id, model.as_deref());
@@ -244,10 +319,123 @@ impl RateLimitTracker {
             detected_at,
             reason: RateLimitReason::QuotaExhausted,
             model: Some(normalized_model.clone()),
+            origin: LimitOrigin::Http429,
         };
         let key = self.get_limit_key(account_id, Some(&normalized_model));
         self.limits.insert(key, info);
         true
+    }
+
+    /// Record a model quota lock derived from a quota snapshot.
+    ///
+    /// Snapshot locks are deliberately distinguishable from direct HTTP 429
+    /// failures, so a later refreshed snapshot cannot erase a newer failure.
+    pub fn lock_quota_model_until(
+        &self,
+        account_id: &str,
+        model: &str,
+        reset_time: SystemTime,
+        observed_at: SystemTime,
+    ) {
+        let normalized_model = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+            .unwrap_or_else(|| model.to_string());
+        let now = SystemTime::now();
+        let Ok(remaining) = reset_time.duration_since(now) else {
+            return;
+        };
+        let key = self.get_limit_key(account_id, Some(&normalized_model));
+
+        self.record_quota_snapshot_lock(
+            key,
+            RateLimitInfo {
+                reset_time,
+                retry_after_sec: remaining.as_secs(),
+                detected_at: observed_at,
+                reason: RateLimitReason::QuotaExhausted,
+                model: Some(normalized_model),
+                origin: LimitOrigin::QuotaObservation,
+            },
+            now,
+        );
+    }
+
+    /// Record an account-wide quota lock from a snapshot when every known
+    /// model is exhausted.
+    pub fn lock_quota_account_until(
+        &self,
+        account_id: &str,
+        reset_time: SystemTime,
+        observed_at: SystemTime,
+    ) {
+        let now = SystemTime::now();
+        let Ok(remaining) = reset_time.duration_since(now) else {
+            return;
+        };
+        self.record_quota_snapshot_lock(
+            account_id.to_string(),
+            RateLimitInfo {
+                reset_time,
+                retry_after_sec: remaining.as_secs(),
+                detected_at: observed_at,
+                reason: RateLimitReason::QuotaExhausted,
+                model: None,
+                origin: LimitOrigin::QuotaObservation,
+            },
+            now,
+        );
+    }
+
+    fn record_quota_snapshot_lock(&self, key: String, info: RateLimitInfo, now: SystemTime) {
+        match self.limits.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if (current.origin == LimitOrigin::Http429 && current.reset_time > now)
+                    || current.detected_at > info.detected_at
+                {
+                    return;
+                }
+                entry.insert(info);
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(info);
+            }
+        }
+    }
+
+    /// Clear only an account-wide lock created by a quota snapshot no newer
+    /// than this observation.
+    pub fn clear_quota_account_lock_before(
+        &self,
+        account_id: &str,
+        observed_at: SystemTime,
+    ) -> bool {
+        self.limits
+            .remove_if(account_id, |_, info| {
+                info.origin == LimitOrigin::QuotaObservation && info.detected_at <= observed_at
+            })
+            .is_some()
+    }
+
+    /// Clear only a quota-snapshot lock that is no newer than this observation.
+    ///
+    /// Direct 429 locks are never cleared here, even though they share the
+    /// `QuotaExhausted` reason.
+    pub fn clear_quota_model_lock_before(
+        &self,
+        account_id: &str,
+        model: &str,
+        observed_at: SystemTime,
+    ) -> bool {
+        let normalized_model = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+            .unwrap_or_else(|| model.to_string());
+        self.limits
+            .remove_if(
+                &self.get_limit_key(account_id, Some(&normalized_model)),
+                |_, info| {
+                    info.origin == LimitOrigin::QuotaObservation && info.detected_at <= observed_at
+                },
+            )
+            .is_some()
     }
 
     pub fn set_lockout_until_iso_with_cap(
@@ -282,7 +470,6 @@ impl RateLimitTracker {
     /// 解析类似 "2026-01-08T17:00:00Z" 格式的时间字符串
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称,用于模型级别限流
     pub fn set_lockout_until_iso(
         &self,
         account_id: &str,
@@ -358,7 +545,7 @@ impl RateLimitTracker {
         // 1. 解析限流原因类型
         let reason = if status == 429 {
             tracing::warn!("Google 429 Error Body: {}", body);
-            self.parse_rate_limit_reason(body)
+            classify_rate_limit_reason(body)
         } else if status == 404 {
             tracing::warn!(
                 "Google 404: model unavailable on this account, short lockout before rotation"
@@ -486,7 +673,6 @@ impl RateLimitTracker {
                         lockout
                     }
                     RateLimitReason::Unknown => {
-                        // 未知原因
                         tracing::debug!("无法解析 429 限流原因, 使用默认值 60秒");
                         60
                     }
@@ -517,17 +703,13 @@ impl RateLimitTracker {
             detected_at: SystemTime::now(),
             reason,
             model: model.clone(),
+            origin: LimitOrigin::Http429,
         };
 
-        // [FIX] 使用复合 Key 存储 (如果是 Quota 且有 Model)
-        // 只有 QuotaExhausted 适合做模型隔离，其他如 RateLimitExceeded 通常是全账号的 TPM
         let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
         let key = if use_model_key {
             self.get_limit_key(account_id, model.as_deref())
         } else {
-            // 其他情况（如 RateLimitExceeded, ServerError）通常影响整个账号
-            // 或者我们也可以根据配置决定是否隔离。
-            // 简单起见，只有 QuotaExhausted 做细粒度隔离。
             account_id.to_string()
         };
 
@@ -542,66 +724,6 @@ impl RateLimitTracker {
         );
 
         Some(info)
-    }
-
-    /// 解析限流原因类型
-    fn parse_rate_limit_reason(&self, body: &str) -> RateLimitReason {
-        // 尝试从 JSON 中提取 reason 字段
-        let trimmed = body.trim();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(reason_str) = json
-                    .get("error")
-                    .and_then(|e| e.get("details"))
-                    .and_then(|d| d.as_array())
-                    .and_then(|a| a.get(0))
-                    .and_then(|o| o.get("reason"))
-                    .and_then(|v| v.as_str())
-                {
-                    return match reason_str {
-                        "QUOTA_EXHAUSTED" => RateLimitReason::QuotaExhausted,
-                        "RATE_LIMIT_EXCEEDED" => RateLimitReason::RateLimitExceeded,
-                        "MODEL_CAPACITY_EXHAUSTED" => RateLimitReason::ModelCapacityExhausted,
-                        _ => RateLimitReason::Unknown,
-                    };
-                }
-                // [NEW] 尝试从 message 字段进行文本匹配（防止 missed reason）
-                if let Some(msg) = json
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|v| v.as_str())
-                {
-                    let msg_lower = msg.to_lowercase();
-                    if msg_lower.contains("per minute") || msg_lower.contains("rate limit") {
-                        return RateLimitReason::RateLimitExceeded;
-                    }
-                }
-            }
-        }
-
-        // 如果无法从 JSON 解析，尝试从消息文本判断
-        let body_lower = body.to_lowercase();
-        // [FIX] 优先判断分钟级限制，避免将 TPM 误判为 Quota
-        let generic_resource_exhausted = body_lower.contains("resource has been exhausted")
-            || body_lower.contains("resource_exhausted");
-        let explicit_quota_exhausted = body_lower.contains("quota_exhausted")
-            || body_lower.contains("quotaresetdelay")
-            || body_lower.contains("quota reset")
-            || body_lower.contains("quota limit")
-            || body_lower.contains("per day")
-            || body_lower.contains("daily quota");
-
-        if body_lower.contains("per minute")
-            || body_lower.contains("rate limit")
-            || body_lower.contains("too many requests")
-            || (generic_resource_exhausted && !explicit_quota_exhausted)
-        {
-            RateLimitReason::RateLimitExceeded
-        } else if body_lower.contains("exhausted") || body_lower.contains("quota") {
-            RateLimitReason::QuotaExhausted
-        } else {
-            RateLimitReason::Unknown
-        }
     }
 
     /// 从错误消息 body 中解析重置时间
@@ -973,17 +1095,15 @@ mod tests {
 
     #[test]
     fn test_tpm_exhausted_is_rate_limit_exceeded() {
-        let tracker = RateLimitTracker::new();
-        // 模拟真实世界的 TPM 错误，同时包含 "Resource exhausted" 和 "per minute"
         let body = "Resource has been exhausted (e.g. check quota). Quota limit 'Tokens per minute' exceeded.";
-        let reason = tracker.parse_rate_limit_reason(body);
-        // 应该被识别为 RateLimitExceeded，而不是 QuotaExhausted
-        assert_eq!(reason, RateLimitReason::RateLimitExceeded);
+        assert_eq!(
+            classify_rate_limit_reason(body),
+            RateLimitReason::RateLimitExceeded
+        );
     }
 
     #[test]
     fn test_generic_resource_exhausted_is_short_rate_limit() {
-        let tracker = RateLimitTracker::new();
         let body = r#"{
             "error": {
                 "code": 429,
@@ -991,8 +1111,10 @@ mod tests {
                 "status": "RESOURCE_EXHAUSTED"
             }
         }"#;
-        let reason = tracker.parse_rate_limit_reason(body);
-        assert_eq!(reason, RateLimitReason::RateLimitExceeded);
+        assert_eq!(
+            classify_rate_limit_reason(body),
+            RateLimitReason::RateLimitExceeded
+        );
     }
 
     #[test]
@@ -1016,40 +1138,68 @@ mod tests {
             assert_eq!(info.retry_after_sec, 8, "5xx 第 {} 次应该锁定 8 秒", i);
         }
 
-        // 现在触发一次 429 QuotaExhausted（没有 quotaResetDelay）
+        // A bare structured QUOTA_EXHAUSTED is a short transient lock.
         let quota_body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
         let info = tracker.parse_from_error("acc1", 429, None, quota_body, None, &backoff_steps);
         assert!(info.is_some());
-        let info = info.unwrap();
+        assert_eq!(info.unwrap().retry_after_sec, 5);
+    }
 
-        // 关键断言：429 应该从第 1 次开始（锁 60 秒），而不是继承 5xx 的计数
+    #[test]
+    fn classifier_requires_quota_evidence_for_structured_exhaustion() {
         assert_eq!(
-            info.retry_after_sec, 60,
-            "429 应该从第 1 次退避开始(60秒),而不是被 5xx 污染"
+            classify_rate_limit_reason(r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#),
+            RateLimitReason::RateLimitExceeded
+        );
+        assert_eq!(
+            classify_rate_limit_reason(
+                r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetDelay":"1h"}}]}}"#
+            ),
+            RateLimitReason::QuotaExhausted
+        );
+        assert_eq!(
+            classify_rate_limit_reason(
+                r#"{"error":{"details":[{"reason":"MODEL_CAPACITY_EXHAUSTED"}]}}"#
+            ),
+            RateLimitReason::ModelCapacityExhausted
         );
     }
 
     #[test]
-    fn test_quota_exhausted_does_accumulate_failure_count() {
+    fn quota_snapshot_clear_preserves_direct_429_lock() {
         let tracker = RateLimitTracker::new();
-        let backoff_steps = vec![60, 300, 1800, 7200];
-        let quota_body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#;
+        let observed_at = SystemTime::now();
+        let reset_time = observed_at + Duration::from_secs(60);
+        tracker.lock_quota_model_until("account", "gemini-3-flash", reset_time, observed_at);
+        assert!(tracker.clear_quota_model_lock_before("account", "gemini-3-flash", observed_at));
 
-        // 第 1 次 429 → 60 秒
-        let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 60);
+        let direct_body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetDelay":"60s"}}]}}"#;
+        tracker.parse_from_error(
+            "account",
+            429,
+            None,
+            direct_body,
+            Some("gemini-3-flash".to_string()),
+            &[60],
+        );
+        assert!(!tracker.clear_quota_model_lock_before(
+            "account",
+            "gemini-3-flash",
+            observed_at + Duration::from_secs(1)
+        ));
+        assert!(tracker.is_rate_limited("account", Some("gemini-3-flash")));
 
-        // 第 2 次 429 → 300 秒
-        let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 300);
-
-        // 第 3 次 429 → 1800 秒
-        let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 1800);
-
-        // 第 4 次 429 → 7200 秒
-        let info = tracker.parse_from_error("acc2", 429, None, quota_body, None, &backoff_steps);
-        assert_eq!(info.unwrap().retry_after_sec, 7200);
+        tracker.lock_quota_account_until("account", reset_time, observed_at);
+        assert!(tracker.clear_quota_account_lock_before("account", observed_at));
+        tracker.set_lockout_until_with_cap(
+            "account",
+            reset_time,
+            RateLimitReason::QuotaExhausted,
+            None,
+            false,
+        );
+        assert!(!tracker
+            .clear_quota_account_lock_before("account", observed_at + Duration::from_secs(1)));
     }
 
     #[test]

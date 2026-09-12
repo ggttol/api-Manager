@@ -15,7 +15,7 @@ Codex 账号池默认开启额度切换：上游返回完整 HTTP `429` 错误�
 ---
 
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.7.0)
+> 专业级 AI 账号管理与协议代理系统 (v4.7.1)
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
 
@@ -24,7 +24,7 @@ Codex 账号池默认开启额度切换：上游返回完整 HTTP `429` 错误�
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.7.0-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.7.1-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -474,7 +474,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.7.0**（2026-09-10）：修复会话级累计 Token 突破 100 万上限导致账号瘫痪与 400 报错、自适应熔断器新增零配额持续锁定与解除 300s 退避硬上限截断、新建配置自动感知操作系统语言、临时限流 503 响应暴露标准 Retry-After 标头。
+> 最新版本 **v4.7.1**（API Manager 整合，2026-09-12）：动态请求模式、真实双窗口配额与模型族保护、可配置日志保留、安全代理凭据回退和 OpenCode JSONC 同步。默认日志正文保留 24 小时、元数据 30 天、最多 10 万行；每项设为 `0` 可禁用。升级前请备份日志数据库，详见更新日志。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

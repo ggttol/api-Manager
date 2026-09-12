@@ -710,6 +710,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub enable_logging: bool,
 
+    /// Request-log retention policy. A zero value disables its corresponding limit.
+    #[serde(default)]
+    pub log_retention: LogRetentionConfig,
+
     /// 调试日志配置 (保存完整链路)
     #[serde(default)]
     pub debug_logging: DebugLoggingConfig,
@@ -777,6 +781,42 @@ pub struct ProxyConfig {
     pub proxy_pool: ProxyPoolConfig,
 }
 
+/// Request-log retention policy.
+///
+/// Body retention clears only request and response bodies. Metadata retention
+/// removes complete rows, while max_rows bounds the newest retained rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRetentionConfig {
+    #[serde(default = "default_body_retention_hours")]
+    pub body_retention_hours: u32,
+    #[serde(default = "default_metadata_retention_days")]
+    pub metadata_retention_days: u32,
+    #[serde(default = "default_max_log_rows")]
+    pub max_rows: u32,
+}
+
+fn default_body_retention_hours() -> u32 {
+    24
+}
+
+fn default_metadata_retention_days() -> u32 {
+    30
+}
+
+fn default_max_log_rows() -> u32 {
+    100_000
+}
+
+impl Default for LogRetentionConfig {
+    fn default() -> Self {
+        Self {
+            body_retention_hours: default_body_retention_hours(),
+            metadata_retention_days: default_metadata_retention_days(),
+            max_rows: default_max_log_rows(),
+        }
+    }
+}
+
 /// 上游代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamProxyConfig {
@@ -800,6 +840,7 @@ impl Default for ProxyConfig {
             custom_mapping: std::collections::HashMap::new(),
             request_timeout: default_request_timeout(),
             enable_logging: true, // 默认开启，支持 token 统计功能
+            log_retention: LogRetentionConfig::default(),
             debug_logging: DebugLoggingConfig::default(),
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,

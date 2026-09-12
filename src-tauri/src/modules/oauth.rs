@@ -373,7 +373,9 @@ async fn exchange_code_once(
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] 对于登录行为，尚未有 account_id，使用全局池阶梯逻辑
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(None, 60).await
+        pool.get_effective_standard_client(None, 60)
+            .await
+            .map_err(|error| (None, error))?
     } else {
         crate::utils::http::get_long_standard_client()
     };
@@ -517,7 +519,9 @@ async fn refresh_access_token_once(
 ) -> Result<TokenResponse, (Option<reqwest::StatusCode>, String)> {
     // [PHASE 2] 根据 account_id 使用对应的代理
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_standard_client(account_id, 60).await
+        pool.get_effective_standard_client(account_id, 60)
+            .await
+            .map_err(|error| (None, error))?
     } else {
         crate::utils::http::get_long_standard_client()
     };
@@ -679,7 +683,7 @@ pub async fn get_user_info(
     account_id: Option<&str>,
 ) -> Result<UserInfo, String> {
     let client = if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
-        pool.get_effective_client(account_id, 15).await
+        pool.get_effective_client(account_id, 15).await?
     } else {
         crate::utils::http::get_client()
     };

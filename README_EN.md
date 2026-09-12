@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional AI Account Management & Protocol Proxy System (v4.7.0)
+> Professional AI Account Management & Protocol Proxy System (v4.7.1)
 
 <div align="center">
   <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
@@ -9,7 +9,7 @@
   
   <p>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.7.0-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.7.1-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -447,7 +447,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.7.0** (2026-09-10): Prevented 400 errors and account freezes from upstream 1M token accumulation, added zero-quota circuit breaker lockout and removed 300s backoff ceiling, auto-detected OS language for new configurations, and exposed standard Retry-After headers on temporary 503 responses.
+> Latest version **v4.7.1** (API Manager integration, 2026-09-12): Dynamic request modes, real quota windows and family-level protection, configurable log retention, safe proxy-credential fallback, and OpenCode JSONC synchronization. Defaults retain bodies for 24 hours, metadata for 30 days, and at most 100,000 rows; zero disables each limit. Back up the log database before upgrading; see the changelog for details.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

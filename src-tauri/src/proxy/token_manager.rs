@@ -24,34 +24,6 @@ enum TrackerParserMode {
     Baseline,
 }
 
-fn classify_rate_limit_reason(error_body: &str) -> crate::proxy::rate_limit::RateLimitReason {
-    use crate::proxy::rate_limit::RateLimitReason;
-
-    let body = error_body.to_lowercase();
-    let generic_resource_exhausted =
-        body.contains("resource has been exhausted") || body.contains("resource_exhausted");
-    let explicit_quota_exhausted = body.contains("quota_exhausted")
-        || body.contains("quotaresetdelay")
-        || body.contains("quota reset")
-        || body.contains("quota limit")
-        || body.contains("per day")
-        || body.contains("daily quota");
-
-    if body.contains("model_capacity") {
-        RateLimitReason::ModelCapacityExhausted
-    } else if body.contains("per minute")
-        || body.contains("rate limit")
-        || body.contains("too many requests")
-        || (generic_resource_exhausted && !explicit_quota_exhausted)
-    {
-        RateLimitReason::RateLimitExceeded
-    } else if explicit_quota_exhausted || body.contains("exhausted") || body.contains("quota") {
-        RateLimitReason::QuotaExhausted
-    } else {
-        RateLimitReason::Unknown
-    }
-}
-
 const IMAGE_ACCOUNT_RESELECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 async fn wait_for_image_account_change(
@@ -654,7 +626,7 @@ impl TokenManager {
         let reset_time = self.extract_earliest_reset_time(&account);
 
         // [OPTIMIZATION] 构建模型配额内存缓存，避免排序时读取磁盘
-        let mut model_quotas = HashMap::new();
+        let mut model_quotas: HashMap<String, i32> = HashMap::new();
         // [NEW] 构建模型输出限额内存缓存 (max_output_tokens)
         let mut model_limits: HashMap<String, u64> = HashMap::new();
         if let Some(models) = account
@@ -667,11 +639,13 @@ impl TokenManager {
                     model.get("name").and_then(|v| v.as_str()),
                     model.get("percentage").and_then(|v| v.as_i64()),
                 ) {
-                    // Normalize name to standard ID
                     let standard_id =
                         crate::proxy::common::model_mapping::normalize_to_standard_id(name)
                             .unwrap_or_else(|| name.to_string());
-                    model_quotas.insert(standard_id, pct as i32);
+                    model_quotas
+                        .entry(standard_id)
+                        .and_modify(|existing| *existing = (*existing).min(pct as i32))
+                        .or_insert(pct as i32);
                 }
                 // [NEW] 解析并缓存 max_output_tokens (按原始 model name，不归一化)
                 if let (Some(name), Some(limit)) = (
@@ -846,8 +820,8 @@ impl TokenManager {
         };
 
         // 5. [重构] 聚合判定逻辑：按 Standard ID 对账号所有型号进行分组
-        // 解决如 Pro-Low (0%) 和 Pro-High (100%) 在同一账号内导致状态冲突的问题
-        let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
+        // 同族别名共享配额，健康别名不能解除余额更低的兄弟型号的保护。
+        let mut group_min_percentage: HashMap<String, i32> = HashMap::new();
 
         for model in models {
             let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -859,14 +833,14 @@ impl TokenManager {
             if let Some(std_id) =
                 crate::proxy::common::model_mapping::normalize_to_standard_id(name)
             {
-                let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                if percentage > *entry {
-                    *entry = percentage;
-                }
+                group_min_percentage
+                    .entry(std_id)
+                    .and_modify(|minimum| *minimum = (*minimum).min(percentage))
+                    .or_insert(percentage);
             }
         }
 
-        // 6. 遍历受监控的 Standard ID，根据组内“最好状态”执行锁定或恢复
+        // 6. 遍历受监控的 Standard ID，根据组内最低余额执行锁定或恢复
         let threshold = config.threshold_percentage as i32;
         let account_id = account_json
             .get("id")
@@ -922,20 +896,20 @@ impl TokenManager {
             let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
                 .unwrap_or_else(|| std_id.clone());
 
-            // 获取该组的最高百分比，如果账号没该组型号则视为 100%
-            let max_pct = group_max_percentage
+            // 获取该组的最低百分比，如果账号没该组型号则视为 100%
+            let min_pct = group_min_percentage
                 .get(&lookup_key)
                 .cloned()
                 .unwrap_or(100);
 
-            if max_pct < threshold {
-                // 只有组内所有模型都不行，才触发全组保护
+            if min_pct < threshold {
+                // 同族任一余额低于阈值时，保护整个共享配额组。
                 if self
                     .trigger_quota_protection(
                         account_json,
                         &account_id,
                         account_path,
-                        max_pct,
+                        min_pct,
                         threshold,
                         &lookup_key,
                     )
@@ -1252,7 +1226,7 @@ impl TokenManager {
         let mut protected_list: Vec<serde_json::Value> = Vec::new();
 
         if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
-            let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
+            let mut group_min_percentage: HashMap<String, i32> = HashMap::new();
 
             for model in models {
                 let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1264,10 +1238,10 @@ impl TokenManager {
                 if let Some(std_id) =
                     crate::proxy::common::model_mapping::normalize_to_standard_id(name)
                 {
-                    let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                    if percentage > *entry {
-                        *entry = percentage;
-                    }
+                    group_min_percentage
+                        .entry(std_id)
+                        .and_modify(|minimum| *minimum = (*minimum).min(percentage))
+                        .or_insert(percentage);
                 }
             }
 
@@ -1275,11 +1249,11 @@ impl TokenManager {
                 let lookup_key =
                     crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
                         .unwrap_or_else(|| std_id.clone());
-                let max_pct = group_max_percentage
+                let min_pct = group_min_percentage
                     .get(&lookup_key)
                     .cloned()
                     .unwrap_or(100);
-                if max_pct < threshold
+                if min_pct < threshold
                     && !protected_list
                         .iter()
                         .any(|v| v.as_str() == Some(lookup_key.as_str()))
@@ -3079,7 +3053,7 @@ impl TokenManager {
             retry_after_header,
             error_body,
         );
-        let reason = classify_rate_limit_reason(error_body);
+        let reason = crate::proxy::rate_limit::classify_rate_limit_reason(error_body);
         let recorded = self.record_rate_limit_atomic(
             &account_id,
             status,
@@ -3188,7 +3162,7 @@ impl TokenManager {
             return;
         }
 
-        let reason = classify_rate_limit_reason(error_body);
+        let reason = crate::proxy::rate_limit::classify_rate_limit_reason(error_body);
         if reason != crate::proxy::rate_limit::RateLimitReason::QuotaExhausted {
             self.record_rate_limit_atomic(
                 &account_id,
@@ -3555,97 +3529,166 @@ impl TokenManager {
         earliest_ts
     }
 
-    /// [NEW] 检查并同步零配额持续熔断（5小时窗口或周配额用光直接持续熔断至重置时间）
+    /// Sync zero-quota snapshot locks by the actual standard model family.
+    /// Snapshot locks are source-tagged in RateLimitTracker, so a recovered
+    /// bucket cannot erase a newer live 429 for the same model.
     fn sync_zero_quota_circuit_breaker(&self, account_id: &str, account: &serde_json::Value) {
-        let lock_on_zero = if let Ok(cfg) = self.circuit_breaker_config.try_read() {
-            cfg.enabled && cfg.lock_on_zero_quota
-        } else {
-            false
-        };
-
+        let lock_on_zero = self
+            .circuit_breaker_config
+            .try_read()
+            .is_ok_and(|config| config.enabled && config.lock_on_zero_quota);
         if !lock_on_zero {
             return;
         }
 
-        let quota = match account.get("quota") {
-            Some(q) => q,
-            None => return,
+        let Some(quota) = account.get("quota") else {
+            return;
+        };
+        let Some(observed_seconds) = quota.get("last_updated").and_then(|value| value.as_i64())
+        else {
+            return;
+        };
+        let Ok(observed_seconds) = u64::try_from(observed_seconds) else {
+            return;
+        };
+        let observed_at =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(observed_seconds);
+        let parse_reset = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .and_then(|time| u64::try_from(time.timestamp()).ok())
+                .map(|seconds| {
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+                })
         };
 
-        // 1. 优先检查 quota_groups 中的 5h 和 weekly buckets
-        if let Some(groups) = quota.get("quota_groups").and_then(|g| g.as_array()) {
+        let mut known_group_keys = HashSet::new();
+        let mut exhausted_until: HashMap<String, std::time::SystemTime> = HashMap::new();
+        if let Some(groups) = quota.get("quota_groups").and_then(|value| value.as_array()) {
             for group in groups {
-                if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                let mut metadata = format!(
+                    "{} {}",
+                    group
+                        .get("display_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    group
+                        .get("description")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                );
+                let buckets = group.get("buckets").and_then(|value| value.as_array());
+                if let Some(buckets) = buckets {
                     for bucket in buckets {
-                        let remaining_fraction = bucket
-                            .get("remaining_fraction")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(1.0);
-
-                        let reset_time = bucket
-                            .get("reset_time")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        // 如果 5h 或 weekly 配额耗尽 (<= 0.001)
-                        if remaining_fraction <= 0.001 && !reset_time.is_empty() {
-                            let bucket_id = bucket
+                        metadata.push_str(&format!(
+                            " {} {} {} {}",
+                            bucket
                                 .get("bucket_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-
-                            tracing::warn!(
-                                "[CircuitBreaker] 账号 {} 的配额桶 {} 已耗尽 (0%), 持续锁定至 {}",
-                                account_id,
-                                bucket_id,
-                                reset_time
-                            );
-
-                            self.rate_limit_tracker.set_lockout_until_iso_with_cap(
-                                account_id,
-                                reset_time,
-                                crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
-                                None,
-                                false, // 不截断为 300s，持续锁定到真实 reset_time
-                            );
-                            return;
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default(),
+                            bucket
+                                .get("window")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default(),
+                            bucket
+                                .get("display_name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default(),
+                            bucket
+                                .get("description")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or_default()
+                        ));
+                    }
+                    let keys =
+                        crate::proxy::common::model_mapping::quota_group_standard_ids(&metadata);
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    for key in &keys {
+                        known_group_keys.insert((*key).to_string());
+                    }
+                    for bucket in buckets {
+                        let remaining = bucket
+                            .get("remaining_fraction")
+                            .and_then(|value| value.as_f64())
+                            .unwrap_or(1.0);
+                        let reset = bucket
+                            .get("reset_time")
+                            .and_then(|value| value.as_str())
+                            .and_then(parse_reset);
+                        if remaining <= 0.001 {
+                            if let Some(reset) = reset {
+                                for key in &keys {
+                                    exhausted_until
+                                        .entry((*key).to_string())
+                                        .and_modify(|until| *until = (*until).max(reset))
+                                        .or_insert(reset);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 2. 回退到 models 配额检查
-        if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
-            // 只要受监控核心模型或全部模型为 0%，且有有效 reset_time
-            let all_zero = models
-                .iter()
-                .all(|m| m.get("percentage").and_then(|p| p.as_i64()).unwrap_or(100) == 0);
-
-            if all_zero && !models.is_empty() {
-                // During cold load this account is not published in `tokens` yet. Derive the
-                // deadline from the account currently being loaded instead of re-reading it
-                // through the not-yet-populated cache.
-                if let Some(reset_time_str) = models
-                    .iter()
-                    .filter_map(|model| model.get("reset_time").and_then(|value| value.as_str()))
-                    .filter(|reset_time| !reset_time.is_empty())
-                    .min()
-                {
-                    tracing::warn!(
-                        "[CircuitBreaker] 账号 {} 的模型配额已全部为 0%, 持续锁定至 {}",
-                        account_id,
-                        reset_time_str
-                    );
-                    self.rate_limit_tracker.set_lockout_until_iso_with_cap(
-                        account_id,
-                        reset_time_str,
-                        crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
-                        None,
-                        false,
-                    );
-                }
+        for key in known_group_keys {
+            if let Some(until) = exhausted_until.get(&key) {
+                self.rate_limit_tracker.lock_quota_model_until(
+                    account_id,
+                    &key,
+                    *until,
+                    observed_at,
+                );
+            } else {
+                self.rate_limit_tracker.clear_quota_model_lock_before(
+                    account_id,
+                    &key,
+                    observed_at,
+                );
             }
+        }
+
+        let mut known_models: HashMap<String, (i64, Option<std::time::SystemTime>)> =
+            HashMap::new();
+        if let Some(models) = quota.get("models").and_then(|value| value.as_array()) {
+            for model in models {
+                let (Some(name), Some(percentage)) = (
+                    model.get("name").and_then(|value| value.as_str()),
+                    model.get("percentage").and_then(|value| value.as_i64()),
+                ) else {
+                    continue;
+                };
+                let Some(key) = crate::proxy::common::model_mapping::normalize_to_standard_id(name)
+                else {
+                    continue;
+                };
+                let reset = model
+                    .get("reset_time")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_reset);
+                known_models
+                    .entry(key)
+                    .and_modify(|current| {
+                        current.0 = current.0.min(percentage);
+                        current.1 = current.1.max(reset);
+                    })
+                    .or_insert((percentage, reset));
+            }
+        }
+
+        if !known_models.is_empty()
+            && known_models
+                .values()
+                .all(|(percentage, _)| *percentage <= 0)
+        {
+            if let Some(until) = known_models.values().filter_map(|(_, reset)| *reset).max() {
+                self.rate_limit_tracker
+                    .lock_quota_account_until(account_id, until, observed_at);
+            }
+        } else {
+            self.rate_limit_tracker
+                .clear_quota_account_lock_before(account_id, observed_at);
         }
     }
 

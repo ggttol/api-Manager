@@ -301,7 +301,7 @@ pub fn wrap_request_v2(
                                             "thought_signature".to_string(),
                                             json!("skip_thought_signature_validator"),
                                         );
-                                        tracing::info!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session cache)", final_model_name);
+                                        tracing::debug!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session cache)", final_model_name);
                                     }
                                 }
                             } else {
@@ -318,7 +318,7 @@ pub fn wrap_request_v2(
                                         "thought_signature".to_string(),
                                         json!("skip_thought_signature_validator"),
                                     );
-                                    tracing::info!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session id)", final_model_name);
+                                    tracing::debug!("[Gemini-Wrap] Injected sentinel signature for flash model {} (no session id)", final_model_name);
                                 }
                             }
                         }
@@ -857,11 +857,8 @@ pub fn wrap_request_v2(
         }
     }
 
-    // [NEW] 3. 条件注入 enabledCreditTypes
-    // 这是官方 Worker 极高权重的一个指纹字段。
-    // 只有在非图像生成请求（即 agent 类型请求）时注入，避免图像生成场景出现 Credit 判定异常。
-    // 特别注意：这是 Google 识别“官方客户端”的重要凭证之一。
-    let is_agent_request = config.request_type != "image_gen";
+    let is_agent_request = config.request_type != "image_gen"
+        && crate::proxy::mappers::common_utils::request_requires_agent(&inner_request);
 
     // [CACHE] 重建 inner_request 字段顺序——稳定前缀在前，动态内容在后
     // 遵循 Google 官方建议："将较大且常见的内容放置在提示的开头"
@@ -909,14 +906,15 @@ pub fn wrap_request_v2(
         "request": reordered_inner,
         "model": config.final_model,
         "userAgent": official_user_agent,
-        "requestType": if is_agent_request { "agent" } else { "image_gen" },
         // [CACHE] requestId 移到末尾避免动态值破坏前缀字节一致性
         "requestId": official_request_id,
     });
 
-    if is_agent_request {
+    if config.request_type == "image_gen" {
+        final_request_obj["requestType"] = json!("image_gen");
+    } else if is_agent_request {
+        final_request_obj["requestType"] = json!("agent");
         if let Some(obj) = final_request_obj.as_object_mut() {
-            // 强制注入 Google One AI 信用额度支持标号
             obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));
         }
     }
@@ -1297,6 +1295,37 @@ mod tests {
         assert_eq!(result["project"], "test-project");
         assert_eq!(result["model"], "gemini-2.5-flash");
         assert!(result["requestId"].as_str().unwrap().starts_with("agent/"));
+        assert!(result.get("requestType").is_none());
+        assert!(result.get("enabledCreditTypes").is_none());
+
+        let tool_request = wrap_request(
+            &json!({
+                "model": "gemini-2.5-flash",
+                "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+                "contents": [{"role": "user", "parts": [{"text": "Hi"}]}]
+            }),
+            "test-project",
+            "gemini-2.5-flash",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(tool_request["requestType"], "agent");
+        assert_eq!(tool_request["enabledCreditTypes"], json!(["GOOGLE_ONE_AI"]));
+
+        let image_request = wrap_request(
+            &json!({
+                "model": "gemini-3-pro-image",
+                "contents": [{"role": "user", "parts": [{"text": "draw"}]}]
+            }),
+            "test-project",
+            "gemini-3-pro-image",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(image_request["requestType"], "image_gen");
+        assert!(image_request.get("enabledCreditTypes").is_none());
     }
 
     #[test]

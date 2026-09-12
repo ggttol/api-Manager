@@ -169,10 +169,7 @@ pub fn try_parse_image_config_with_params(
 ) -> Result<(Value, String), String> {
     let image_size = normalize_image_size(image_size)?;
     Ok(parse_image_config_with_normalized_params(
-        model_name,
-        size,
-        quality,
-        image_size,
+        model_name, size, quality, image_size,
     ))
 }
 
@@ -622,6 +619,41 @@ pub fn contains_non_networking_tool(tools: &Option<Vec<Value>>) -> bool {
     false
 }
 
+/// Whether an upstream request needs the Agent routing pool.
+///
+/// A non-empty current tool declaration or a prior tool turn requires Agent
+/// semantics. Plain conversation deliberately does not.
+pub fn request_requires_agent(request: &Value) -> bool {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || request
+            .get("contents")
+            .and_then(Value::as_array)
+            .is_some_and(|contents| {
+                contents.iter().any(|content| {
+                    content
+                        .get("parts")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.as_object().is_some_and(|part| {
+                                    [
+                                        "functionCall",
+                                        "functionResponse",
+                                        "tool_use",
+                                        "tool_result",
+                                    ]
+                                    .iter()
+                                    .any(|key| part.contains_key(*key))
+                                })
+                            })
+                        })
+                })
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,13 +1033,9 @@ mod tests {
             assert_eq!(fallback["imageSize"], "4K");
         }
 
-        let (upstream_default, _) = try_parse_image_config_with_params(
-            "gemini-3.1-flash-image",
-            None,
-            Some("auto"),
-            None,
-        )
-        .expect("auto without suffix uses upstream default");
+        let (upstream_default, _) =
+            try_parse_image_config_with_params("gemini-3.1-flash-image", None, Some("auto"), None)
+                .expect("auto without suffix uses upstream default");
         assert!(upstream_default.get("imageSize").is_none());
 
         assert!(try_parse_image_config_with_params(
@@ -1017,6 +1045,19 @@ mod tests {
             Some("8K"),
         )
         .is_err());
+    }
+    #[test]
+    fn agent_routing_requires_current_tools_or_tool_history() {
+        assert!(!request_requires_agent(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "plain text"}]}]
+        })));
+        assert!(request_requires_agent(&json!({
+            "tools": [{"functionDeclarations": [{"name": "lookup"}]}],
+            "contents": [{"role": "user", "parts": [{"text": "use it"}]}]
+        })));
+        assert!(request_requires_agent(&json!({
+            "contents": [{"role": "model", "parts": [{"functionCall": {"name": "lookup"}}]}]
+        })));
     }
 }
 

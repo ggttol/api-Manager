@@ -1,5 +1,6 @@
+use crate::proxy::config::LogRetentionConfig;
 use crate::proxy::monitor::ProxyRequestLog;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
@@ -29,6 +30,22 @@ fn connect_db() -> Result<Connection, String> {
 pub fn init_db() -> Result<(), String> {
     // connect_db will initialize WAL mode and other pragmas
     let conn = connect_db()?;
+    // auto_vacuum must be selected before the initial schema is created. Do not
+    // migrate existing databases with VACUUM: that is a disruptive maintenance
+    // operation and must never be forced by a request-log cleanup path.
+    let has_request_logs_table = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'request_logs'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !has_request_logs_table {
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .map_err(|e| e.to_string())?;
+    }
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS request_logs (
@@ -80,6 +97,83 @@ pub fn init_db() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Apply the configured request-log retention policy.
+///
+/// This is intentionally a maintenance operation. New databases use SQLite's
+/// incremental auto-vacuum; existing databases are never rebuilt here.
+pub fn apply_retention(policy: &LogRetentionConfig) -> Result<(usize, usize), String> {
+    let mut conn = connect_db()?;
+    let result = apply_retention_with_connection(&mut conn, policy)?;
+    Ok(result)
+}
+
+fn apply_retention_with_connection(
+    conn: &mut Connection,
+    policy: &LogRetentionConfig,
+) -> Result<(usize, usize), String> {
+    apply_retention_at(conn, policy, chrono::Utc::now().timestamp_millis())
+}
+
+fn apply_retention_at(
+    conn: &mut Connection,
+    policy: &LogRetentionConfig,
+    now: i64,
+) -> Result<(usize, usize), String> {
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    let mut bodies_cleared = 0;
+    let mut rows_deleted = 0;
+
+    if policy.body_retention_hours > 0 {
+        let cutoff = now - i64::from(policy.body_retention_hours) * 3_600_000;
+        bodies_cleared = transaction
+            .execute(
+                "UPDATE request_logs
+                 SET request_body = NULL, response_body = NULL
+                 WHERE timestamp < ?1
+                   AND (request_body IS NOT NULL OR response_body IS NOT NULL)",
+                [cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    if policy.metadata_retention_days > 0 {
+        let cutoff = now - i64::from(policy.metadata_retention_days) * 86_400_000;
+        rows_deleted += transaction
+            .execute("DELETE FROM request_logs WHERE timestamp < ?1", [cutoff])
+            .map_err(|e| e.to_string())?;
+    }
+
+    if policy.max_rows > 0 {
+        rows_deleted += transaction
+            .execute(
+                "DELETE FROM request_logs
+                 WHERE id IN (
+                     SELECT id FROM request_logs
+                     ORDER BY timestamp DESC, id DESC
+                     LIMIT -1 OFFSET ?1
+                 )",
+                [policy.max_rows],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    // Old databases remain untouched. For databases created with incremental
+    // auto-vacuum, reclaim a bounded number of free pages outside request work.
+    if rows_deleted > 0 {
+        let auto_vacuum: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if auto_vacuum == 2 {
+            conn.execute_batch("PRAGMA incremental_vacuum(1000);")
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok((bodies_cleared, rows_deleted))
 }
 
 pub fn save_log(log: &ProxyRequestLog) -> Result<(), String> {
@@ -226,54 +320,6 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
         })
     })
     .map_err(|e| e.to_string())
-}
-
-/// Cleanup old logs (keep last N days)
-pub fn cleanup_old_logs(days: i64) -> Result<usize, String> {
-    let conn = connect_db()?;
-
-    // Note: Request log timestamp is stored in milliseconds (chrono::Utc::now().timestamp_millis())
-    let cutoff_timestamp_ms = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
-
-    let deleted = conn
-        .execute(
-            "DELETE FROM request_logs WHERE timestamp < ?1",
-            [cutoff_timestamp_ms],
-        )
-        .map_err(|e| e.to_string())?;
-
-    // Only execute VACUUM when substantial rows were deleted to avoid saturating disk I/O on startup
-    if deleted >= 500 {
-        if let Err(e) = conn.execute("VACUUM", []) {
-            tracing::warn!("VACUUM failed after log cleanup: {}", e);
-        }
-    }
-
-    Ok(deleted)
-}
-
-/// Limit maximum log count (keep newest N records)
-#[allow(dead_code)]
-pub fn limit_max_logs(max_count: usize) -> Result<usize, String> {
-    let conn = connect_db()?;
-
-    let deleted = conn
-        .execute(
-            "DELETE FROM request_logs WHERE id NOT IN (
-            SELECT id FROM request_logs ORDER BY timestamp DESC LIMIT ?1
-        )",
-            [max_count],
-        )
-        .map_err(|e| e.to_string())?;
-
-    // Only execute VACUUM when substantial rows were deleted
-    if deleted >= 500 {
-        if let Err(e) = conn.execute("VACUUM", []) {
-            tracing::warn!("VACUUM failed after limit_max_logs: {}", e);
-        }
-    }
-
-    Ok(deleted)
 }
 
 pub fn clear_logs() -> Result<(), String> {
@@ -531,6 +577,141 @@ pub fn get_token_usage_by_ip(limit: usize, hours: i64) -> Result<Vec<IpTokenStat
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::{apply_retention_at, apply_retention_with_connection};
+    use crate::proxy::config::LogRetentionConfig;
+    use rusqlite::{params, Connection};
+
+    fn database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE request_logs (
+                id TEXT PRIMARY KEY,
+                timestamp INTEGER NOT NULL,
+                request_body TEXT,
+                response_body TEXT,
+                method TEXT,
+                url TEXT
+            )",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn clears_expired_bodies_without_removing_their_metadata() {
+        let mut conn = database();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO request_logs (id, timestamp, request_body, response_body, method, url)
+             VALUES ('retained', ?1, 'request', 'response', 'POST', '/v1/chat')",
+            [now - 24 * 3_600_000 - 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO request_logs (id, timestamp, request_body, response_body, method, url)
+             VALUES ('body-boundary', ?1, 'request', 'response', 'GET', '/health')",
+            [now - 24 * 3_600_000],
+        )
+        .unwrap();
+
+        let (cleared, deleted) = apply_retention_at(
+            &mut conn,
+            &LogRetentionConfig {
+                body_retention_hours: 24,
+                metadata_retention_days: 30,
+                max_rows: 100,
+            },
+            now,
+        )
+        .unwrap();
+
+        assert_eq!((cleared, deleted), (1, 0));
+        let row: (Option<String>, Option<String>, String, String) = conn
+            .query_row(
+                "SELECT request_body, response_body, method, url FROM request_logs WHERE id = 'retained'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, "POST".into(), "/v1/chat".into()));
+        let boundary_body: Option<String> = conn
+            .query_row(
+                "SELECT request_body FROM request_logs WHERE id = 'body-boundary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(boundary_body.as_deref(), Some("request"));
+    }
+
+    #[test]
+    fn row_limit_uses_id_to_break_timestamp_ties() {
+        let mut conn = database();
+        let now = chrono::Utc::now().timestamp_millis();
+        for id in ["a", "b", "c"] {
+            conn.execute(
+                "INSERT INTO request_logs (id, timestamp) VALUES (?1, ?2)",
+                params![id, now],
+            )
+            .unwrap();
+        }
+
+        let (_, deleted) = apply_retention_with_connection(
+            &mut conn,
+            &LogRetentionConfig {
+                body_retention_hours: 0,
+                metadata_retention_days: 0,
+                max_rows: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(deleted, 1);
+        let retained: Vec<String> = conn
+            .prepare("SELECT id FROM request_logs ORDER BY timestamp DESC, id DESC")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(retained, ["c", "b"]);
+    }
+
+    #[test]
+    fn zero_limits_leave_logs_unchanged() {
+        let mut conn = database();
+        conn.execute(
+            "INSERT INTO request_logs (id, timestamp, request_body, response_body)
+             VALUES ('old', 0, 'request', 'response')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_retention_with_connection(
+                &mut conn,
+                &LogRetentionConfig {
+                    body_retention_hours: 0,
+                    metadata_retention_days: 0,
+                    max_rows: 0,
+                },
+            )
+            .unwrap(),
+            (0, 0)
+        );
+        let retained: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT request_body, response_body FROM request_logs WHERE id = 'old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, (Some("request".into()), Some("response".into())));
+    }
 }
 
 #[cfg(test)]

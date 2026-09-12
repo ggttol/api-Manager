@@ -706,6 +706,13 @@
     },
     "config": {
       "title": "Service Configuration",
+      "log_retention": {
+        "title": "Request log retention",
+        "zero_disables": "Set any value to 0 to disable that limit.",
+        "body_hours": "Keep request and response bodies (hours)",
+        "metadata_days": "Keep log metadata (days)",
+        "max_rows": "Maximum log rows"
+      },
       "request": {
         "user_agent": "User-Agent Override",
         "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",

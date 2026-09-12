@@ -339,67 +339,64 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
 
     #[cfg(target_os = "linux")]
     {
-        // 2.3 Linux Secret Service API
         use std::io::Write;
         use std::sync::mpsc;
 
-        let mut child = Command::new("secret-tool")
-            .args([
-                "store",
-                "--label=gemini",
-                "service",
-                "gemini",
-                "username",
-                "antigravity",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn secret-tool: {}", e))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(payload_json.as_bytes())
-                .map_err(|e| format!("Failed to write to secret-tool stdin: {}", e))?;
-            // stdin is dropped here, closing the pipe and signalling EOF to secret-tool
-        }
-
-        // Protect against indefinite blocking when D-Bus is unavailable (common on Wayland
-        // sessions where DBUS_SESSION_BUS_ADDRESS is not inherited by the Tauri process).
-        let child_pid = child.id();
-        let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
-        std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-
-        let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(result) => result.map_err(|e| format!("Failed to wait for secret-tool: {}", e))?,
-            Err(_) => {
-                // secret-tool has been blocked for more than 10 seconds.
-                // Most likely cause: D-Bus session bus is not reachable from the Tauri process
-                // (typical on Wayland without proper DBUS_SESSION_BUS_ADDRESS propagation).
-                // Kill the hung subprocess before returning the error.
-                let _ = Command::new("kill")
-                    .args(["-9", &child_pid.to_string()])
-                    .output();
-                crate::modules::logger::log_error(
-                    "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable. \
-                     Ensure gnome-keyring/kwallet is running and DBUS_SESSION_BUS_ADDRESS is exported.",
-                );
-                return Err(
-                    "Keyring write timed out (10s). The D-Bus session bus is not reachable from this process, \
-                     which is common on Wayland without proper session setup. \
-                     Please ensure gnome-keyring or kwallet is running."
-                        .to_string(),
-                );
+        let store_to_collection = |collection: Option<&str>| -> Result<(), String> {
+            let mut command = Command::new("secret-tool");
+            command.arg("store");
+            if let Some(collection) = collection {
+                command.args([
+                    format!("--collection={collection}"),
+                    "--label=Password for 'antigravity' on 'gemini'".to_string(),
+                ]);
+            } else {
+                command.arg("--label=gemini");
             }
+            let mut child = command
+                .args(["service", "gemini", "username", "antigravity"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("Failed to spawn secret-tool: {error}"))?;
+
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "secret-tool stdin was unavailable".to_string())?
+                .write_all(payload_json.as_bytes())
+                .map_err(|error| format!("Failed to write to secret-tool stdin: {error}"))?;
+
+            let child_pid = child.id();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait_with_output());
+            });
+            let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(result) => {
+                    result.map_err(|error| format!("Failed to wait for secret-tool: {error}"))?
+                }
+                Err(_) => {
+                    let _ = Command::new("kill")
+                        .args(["-9", &child_pid.to_string()])
+                        .output();
+                    return Err("Keyring write timed out (10s). The D-Bus session bus is not reachable from this process.".to_string());
+                }
+            };
+            if !output.status.success() {
+                return Err(format!(
+                    "Linux secret-tool failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(())
         };
 
-        if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Linux secret-tool failed: {}", err_msg.trim()));
-        }
+        // agy reads the login collection; its write is mandatory and must never be
+        // hidden by a successful default-collection write.
+        store_to_collection(Some("login"))?;
+        store_to_collection(None)?;
     }
 
     crate::modules::logger::log_info(
@@ -408,10 +405,7 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
 
     // 同步写入 ~/.gemini/ 目录下的文件凭据，兼容 SSH 会话、容器环境和无 Keyring/D-Bus 场景
     if let Err(e) = write_to_file_credentials(account) {
-        crate::modules::logger::log_warn(&format!(
-            "[Desktop] File credential sync warning: {}",
-            e
-        ));
+        crate::modules::logger::log_warn(&format!("[Desktop] File credential sync warning: {}", e));
     }
 
     Ok(())
@@ -497,7 +491,8 @@ fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), Str
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&accounts_path, std::fs::Permissions::from_mode(0o600));
+            let _ =
+                std::fs::set_permissions(&accounts_path, std::fs::Permissions::from_mode(0o600));
         }
     }
 
@@ -533,7 +528,9 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         let secret_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let payload_str = if secret_str.starts_with("go-keyring-base64:") {
             let b64_part = &secret_str["go-keyring-base64:".len()..];
-            let decoded = STANDARD.decode(b64_part).map_err(|e| format!("Base64 decode failed: {}", e))?;
+            let decoded = STANDARD
+                .decode(b64_part)
+                .map_err(|e| format!("Base64 decode failed: {}", e))?;
             String::from_utf8(decoded).map_err(|e| format!("UTF-8 decode failed: {}", e))?
         } else {
             secret_str
@@ -608,13 +605,7 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
     #[cfg(target_os = "linux")]
     {
         let output = Command::new("secret-tool")
-            .args([
-                "lookup",
-                "service",
-                "gemini",
-                "username",
-                "antigravity",
-            ])
+            .args(["lookup", "service", "gemini", "username", "antigravity"])
             .output()
             .map_err(|e| format!("Failed to execute secret-tool: {}", e))?;
 
@@ -632,7 +623,9 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
     }
 }
 
-fn parse_keyring_payload(payload_str: &str) -> Result<crate::modules::migration::ImportedOAuthState, String> {
+fn parse_keyring_payload(
+    payload_str: &str,
+) -> Result<crate::modules::migration::ImportedOAuthState, String> {
     let json: serde_json::Value = serde_json::from_str(payload_str)
         .map_err(|e| format!("Failed to parse keyring payload JSON: {}", e))?;
 

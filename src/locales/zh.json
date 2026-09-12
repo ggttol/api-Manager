@@ -699,6 +699,13 @@
     },
     "config": {
       "title": "服务配置",
+      "log_retention": {
+        "title": "请求日志保留",
+        "zero_disables": "设为 0 可分别关闭对应限制。",
+        "body_hours": "请求与响应正文保留（小时）",
+        "metadata_days": "日志元数据保留（天）",
+        "max_rows": "日志条数上限"
+      },
       "request": {
         "user_agent": "User-Agent 覆盖",
         "user_agent_tooltip": "自定义发送给上游 API 的 User-Agent 请求头。留空则使用默认值。",

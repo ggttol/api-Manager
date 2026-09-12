@@ -562,6 +562,13 @@
     },
     "config": {
       "title": "تكوين الخدمة",
+      "log_retention": {
+        "title": "الاحتفاظ بسجلات الطلبات",
+        "zero_disables": "اضبط أي قيمة على 0 لتعطيل الحد المقابل.",
+        "body_hours": "الاحتفاظ بمحتوى الطلب والاستجابة (ساعات)",
+        "metadata_days": "الاحتفاظ ببيانات السجل (أيام)",
+        "max_rows": "الحد الأقصى لعدد السجلات"
+      },
       "request": {
         "user_agent": "User-Agent Override",
         "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",

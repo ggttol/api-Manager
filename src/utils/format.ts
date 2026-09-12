@@ -32,8 +32,20 @@ export function getQuotaColor(percentage: number): string {
     return 'error';
 }
 
+export function parseFlexibleDate(value: string | number | undefined | null): Date | null {
+    if (value === undefined || value === null || value === '') return null;
+    const raw = typeof value === 'number' ? String(value) : value.trim();
+    if (!raw) return null;
+    const numeric = /^-?\d+$/.test(raw) ? Number(raw) : NaN;
+    const date = Number.isFinite(numeric)
+        ? new Date(Math.abs(numeric) < 10_000_000_000 ? numeric * 1000 : numeric)
+        : new Date(raw);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export function formatTimeRemaining(dateStr: string): string {
-    const targetDate = new Date(dateStr);
+    const targetDate = parseFlexibleDate(dateStr);
+    if (!targetDate) return '0h 0m';
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 
@@ -53,7 +65,8 @@ export function formatTimeRemaining(dateStr: string): string {
 
 export function getTimeRemainingColor(dateStr: string | undefined): string {
     if (!dateStr) return 'gray';
-    const targetDate = new Date(dateStr);
+    const targetDate = parseFlexibleDate(dateStr);
+    if (!targetDate) return 'gray';
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 
@@ -67,12 +80,8 @@ export function getTimeRemainingColor(dateStr: string | undefined): string {
 }
 
 export function formatDate(timestamp: string | number | undefined | null): string | null {
-    if (!timestamp) return null;
-    const date = typeof timestamp === 'number'
-        ? new Date(timestamp * 1000)
-        : new Date(timestamp);
-
-    if (isNaN(date.getTime())) return null;
+    const date = parseFlexibleDate(timestamp);
+    if (!date) return null;
 
     return date.toLocaleString(undefined, {
         year: 'numeric',

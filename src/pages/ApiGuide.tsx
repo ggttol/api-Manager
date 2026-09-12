@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ArrowRight, Check, Copy, KeyRound, RefreshCw, ShieldCheck, Terminal, Workflow } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Check, CodeXml, Copy, KeyRound, RefreshCw, ShieldCheck, Terminal, Workflow } from 'lucide-react';
 import { showToast } from '../components/common/ToastContainer';
 import { copyToClipboard } from '../utils/clipboard';
 import { request } from '../utils/request';
@@ -15,7 +15,7 @@ const content = {
         insecure: '当前是非本机 HTTP 连接：请先切换到 HTTPS 或 SSH 隧道。',
         credentialsTitle: '两种凭据，两个用途',
         adminTitle: '管理员密码', admin: '仅用于登录本管理界面及管理 API。不要填入推理客户端，也不要作为下面示例的 API Key。',
-        gatewayTitle: '网关 API Key', gateway: '在 API 反代配置中管理，用于客户端访问推理入口。本页不读取或展示任何密钥；所有示例只引用你在本地设置的 API_MANAGER_KEY 环境变量。',
+        gatewayTitle: '网关 API Key', gateway: '在 API 反代配置中管理，用于客户端访问推理入口。本页不会自动读取或展示服务器保存的密钥；所有命令示例只引用你在本地设置的 API_MANAGER_KEY 环境变量。',
         endpointsTitle: '01 · 选择正确的入口', endpointsHint: '地址自动取自当前浏览器域名与端口。客户端填写 Base URL 时，不要重复追加 /v1。两个账号池相互独立，路径不可混用。',
         google: 'Google 账号 · 兼容接口', googleHint: 'OpenAI 兼容客户端使用此入口，由 Google 账号池处理；这里的模型名称与映射不代表 Codex 原生模型。',
         gemini: 'Google 账号 · Gemini 原生', geminiHint: '使用 Gemini 原生 generateContent 协议。先查询该入口的模型目录，再使用返回的模型名称。',
@@ -58,6 +58,8 @@ const content = {
         compactNote: '让客户端管理压缩上下文；不要将其他账号或旧会话的加密 reasoning / compaction 内容复制到新会话。',
         affinityTitle: '可迁移的文本与不可迁移的账号状态', affinity: '普通文本请求只要携带继续任务所需的完整文本上下文，即使沿用 session_id 或 prompt_cache_key，也可在原账号额度不足或限流后安全重新绑定到其他可用账号，不必手动新建对话。此操作不会迁移旧响应 ID 或工具句柄。previous_response_id、x-codex-turn-state、加密 reasoning / compaction 项和网关工具续接状态始终绑定原账号；原账号冷却时，此类请求会明确报错，而不是把私有状态发送到另一个账号。',
         restart: '账号亲和性与工具续接状态保存在服务器内存中。重启或过期后，旧的账号绑定状态不能可靠续接。只有遇到未知 previous_response_id、丢失的绑定状态或过期工具句柄时，才需要新建对话、使用新会话 ID 并重新提供原始任务文本；不要携带旧响应 ID、turn-state、加密上下文或旧 tool_use / tool_result。普通完整文本请求的额度切换不要求这一步。',
+        opencodeTitle: 'OpenCode · OpenAI 兼容配置', opencodeHint: '先加载真实模型目录，再同步到运行 API Manager 的主机。网页模式不会修改远程浏览器所在电脑的配置。网关 Key 将以明文写入目标 OpenCode 配置；本页不持久化密钥。',
+        opencodeKey: '网关 API Key', opencodeSync: '同步到 OpenCode', opencodeLoadModels: '加载模型目录', opencodeModels: '将同步此网关 Key 可用的模型', opencodeSuccess: 'OpenCode 已同步', opencodeError: 'OpenCode 同步失败',
     },
     en: {
         title: 'Integration guide', subtitle: 'Choose an endpoint, prepare your key, and connect your client.', badge: 'Current server',
@@ -66,7 +68,7 @@ const content = {
         insecure: 'This is a non-local HTTP connection. Switch to HTTPS or an SSH tunnel first.',
         credentialsTitle: 'Two credentials, two purposes',
         adminTitle: 'Administrator password', admin: 'For signing into this management interface and calling management APIs only. Do not put it in an inference client or use it as the API key in these examples.',
-        gatewayTitle: 'Gateway API key', gateway: 'Managed in the API proxy configuration and used by inference clients. This page never reads or displays keys. Every example references the API_MANAGER_KEY environment variable that you set locally.',
+        gatewayTitle: 'Gateway API key', gateway: 'Managed in the API proxy configuration and used by inference clients. This page never automatically reads or displays server-stored keys. Every command example references the API_MANAGER_KEY environment variable that you set locally.',
         endpointsTitle: '01 · Choose the right endpoint', endpointsHint: 'Addresses use the current browser origin, including its port. Do not append /v1 twice in a client Base URL. The two account pools are independent; their routes are not interchangeable.',
         google: 'Google accounts · Compatible API', googleHint: 'Use this endpoint with OpenAI-compatible clients. Requests use the Google account pool; its model names and mappings are not native Codex models.',
         gemini: 'Google accounts · Native Gemini', geminiHint: 'Uses the native Gemini generateContent protocol. Query this endpoint’s model catalog first, then use a returned model name.',
@@ -109,6 +111,8 @@ const content = {
         compactNote: 'Let the client manage compacted context. Do not copy encrypted reasoning or compaction items from another account or an old session into a new conversation.',
         affinityTitle: 'Portable text versus account-bound state', affinity: 'Ordinary text requests that include the complete text context needed to continue can safely rebind to another eligible account after quota exhaustion or rate limiting, even with an existing session_id or prompt_cache_key. There is no need to manually start a new chat. This does not move old response IDs or tool handles. previous_response_id, x-codex-turn-state, encrypted reasoning / compaction items and gateway tool continuation state stay bound to the original account. These requests fail explicitly while that account is cooling down, rather than sending private state to another account.',
         restart: 'Account affinity and tool continuation state are held in server memory. After a restart or expiry, old account-bound state cannot be reliably resumed. For unknown previous_response_id, missing bound state or expired tool handles, start a fresh conversation with a new session ID and restate the original task as text. Do not reuse old response IDs, turn-state, encrypted context or old tool_use / tool_result blocks. Ordinary complete-text quota failover does not require this step.',
+        opencodeTitle: 'OpenCode · OpenAI-compatible setup', opencodeHint: 'Load the live model catalog before syncing to the machine running API Manager. Web mode does not modify the remote browser computer. The gateway key is saved as plaintext in the target OpenCode configuration; this page does not persist it.',
+        opencodeKey: 'Gateway API key', opencodeSync: 'Sync to OpenCode', opencodeLoadModels: 'Load model catalog', opencodeModels: 'Models available to this gateway key will be synchronized', opencodeSuccess: 'OpenCode synced', opencodeError: 'OpenCode sync failed',
     },
 };
 
@@ -193,8 +197,17 @@ export default function ApiGuide() {
     const [loading, setLoading] = useState(false);
     const [loaded, setLoaded] = useState(false);
     const [modelsError, setModelsError] = useState(false);
+    const [openCodeKey, setOpenCodeKey] = useState('');
+    const [syncingOpenCode, setSyncingOpenCode] = useState(false);
+    const [openCodeModels, setOpenCodeModels] = useState<CatalogModel[]>([]);
+    const [openCodeModelsKey, setOpenCodeModelsKey] = useState('');
+    const [loadingOpenCodeModels, setLoadingOpenCodeModels] = useState(false);
     const controller = useRef<AbortController | null>(null);
-    useEffect(() => () => controller.current?.abort(), []);
+    const openCodeController = useRef<AbortController | null>(null);
+    useEffect(() => () => {
+        controller.current?.abort();
+        openCodeController.current?.abort();
+    }, []);
 
     const loadModels = async () => {
         controller.current?.abort();
@@ -221,6 +234,61 @@ export default function ApiGuide() {
             if (!pending.signal.aborted) setModelsError(true);
         } finally {
             if (!pending.signal.aborted) setLoading(false);
+        }
+    };
+    const loadOpenCodeModels = async () => {
+        const apiKey = openCodeKey.trim();
+        if (!apiKey || loadingOpenCodeModels || insecure) return;
+        openCodeController.current?.abort();
+        const pending = new AbortController();
+        openCodeController.current = pending;
+        setLoadingOpenCodeModels(true);
+        setOpenCodeModels([]);
+        setOpenCodeModelsKey('');
+        try {
+            const response = await fetch(`${origin}/v1/models`, {
+                headers: { Authorization: `Bearer ${apiKey}` },
+                signal: pending.signal,
+            });
+            if (!response.ok) throw new Error('model catalog request failed');
+            const payload: unknown = await response.json();
+            if (pending.signal.aborted) return;
+            if (!payload || typeof payload !== 'object' || !('data' in payload) || !Array.isArray(payload.data)) {
+                throw new Error(text.invalidCatalog);
+            }
+            const catalog = payload.data.flatMap((entry): CatalogModel[] => {
+                if (!entry || typeof entry !== 'object' || !('id' in entry) || typeof entry.id !== 'string' || !entry.id) return [];
+                return [{ id: entry.id, name: 'name' in entry && typeof entry.name === 'string' ? entry.name : entry.id }];
+            });
+            setOpenCodeModels(catalog);
+            setOpenCodeModelsKey(apiKey);
+        } catch {
+            if (!pending.signal.aborted) showToast(text.modelsError, 'error');
+        } finally {
+            if (!pending.signal.aborted) setLoadingOpenCodeModels(false);
+        }
+    };
+    const syncOpenCode = async () => {
+        const apiKey = openCodeKey.trim();
+        if (!apiKey || syncingOpenCode || insecure || loadingOpenCodeModels ||
+            openCodeModelsKey !== apiKey || openCodeModels.length === 0) return;
+        setSyncingOpenCode(true);
+        try {
+            await request('execute_opencode_openai_sync', {
+                proxyUrl: `${origin}/v1`,
+                apiKey,
+                providerId: 'api-manager',
+                providerName: 'API Manager',
+                models: openCodeModels.map(({ id, name }) => ({ id, name })),
+            });
+            showToast(text.opencodeSuccess, 'success');
+            setOpenCodeKey('');
+            setOpenCodeModels([]);
+            setOpenCodeModelsKey('');
+        } catch {
+            showToast(text.opencodeError, 'error');
+        } finally {
+            setSyncingOpenCode(false);
         }
     };
     const copy = async (value: string) => {
@@ -318,6 +386,39 @@ export default function ApiGuide() {
                     {loading ? <p role="status" className={paragraph}>{text.loading}</p> : modelsError ? <p role="alert" className="text-sm leading-6 text-red-600 dark:text-red-400">{text.modelsError}</p> : models.length === 0 ? <p className={paragraph}>{loaded ? text.noModels : text.notLoaded}</p> : null}
                 </div>}
             </section>
+
+            {!isCodex && <section className={`${panel} space-y-4`} aria-labelledby="guide-opencode">
+                <div className="flex items-center gap-2">
+                    <CodeXml size={20} className="text-teal-500" />
+                    <h2 id="guide-opencode" className="text-lg font-semibold">{text.opencodeTitle}</h2>
+                </div>
+                <p className={paragraph}>{text.opencodeHint}</p>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                    <label className="block min-w-0 flex-1 text-sm font-medium">
+                        <span className="mb-2 block">{text.opencodeKey}</span>
+                        <input
+                            type="password"
+                            value={openCodeKey}
+                            onChange={event => {
+                                openCodeController.current?.abort();
+                                setLoadingOpenCodeModels(false);
+                                setOpenCodeModels([]);
+                                setOpenCodeModelsKey('');
+                                setOpenCodeKey(event.target.value);
+                            }}
+                            autoComplete="off"
+                            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2.5 font-mono text-sm dark:border-base-300 dark:bg-base-200"
+                        />
+                    </label>
+                    <button type="button" className={`${button} !py-2.5`} disabled={insecure || !openCodeKey.trim() || loadingOpenCodeModels} onClick={() => void loadOpenCodeModels()}>
+                        <RefreshCw size={15} className={loadingOpenCodeModels ? 'animate-spin' : ''} />{text.opencodeLoadModels}
+                    </button>
+                    <button type="button" className={`${button} !py-2.5`} disabled={insecure || !openCodeKey.trim() || syncingOpenCode || loadingOpenCodeModels || openCodeModelsKey !== openCodeKey.trim() || openCodeModels.length === 0} onClick={() => void syncOpenCode()}>
+                        <CodeXml size={15} />{syncingOpenCode ? text.loading : text.opencodeSync}
+                    </button>
+                {openCodeModelsKey === openCodeKey.trim() && openCodeModels.length > 0 && <p className="text-xs text-gray-500 dark:text-gray-400">{text.opencodeModels} ({openCodeModels.length})</p>}
+                </div>
+            </section>}
 
             <section className={`${panel} space-y-4 scroll-mt-4`} aria-labelledby="guide-setup">
                 <h2 id="guide-setup" className="text-lg font-semibold">{text.setupTitle}</h2>

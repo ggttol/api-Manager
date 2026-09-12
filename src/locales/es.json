@@ -633,6 +633,13 @@
     },
     "config": {
       "title": "Configuración del Servicio",
+      "log_retention": {
+        "title": "Conservación de registros de solicitudes",
+        "zero_disables": "Establece cualquier valor en 0 para desactivar ese límite.",
+        "body_hours": "Conservar cuerpos de solicitudes y respuestas (horas)",
+        "metadata_days": "Conservar metadatos del registro (días)",
+        "max_rows": "Número máximo de registros"
+      },
       "request": {
         "user_agent": "Reemplazo de User-Agent",
         "user_agent_tooltip": "Reemplazar el encabezado User-Agent enviado a las API ascendentes. Deje vacío para usar el predeterminado.",

@@ -1549,11 +1549,15 @@ pub fn transform_openai_request_with_session(
         "request": reordered_request,
         "model": config.final_model,
         "userAgent": "antigravity",
-        // [CHANGED v4.1.24] Use "agent" for all non-image requests (matches official client)
-        "requestType": if config.request_type == "image_gen" { "image_gen" } else { "agent" },
         // [CACHE] requestId stays last so its per-attempt value does not disturb the stable prefix.
         "requestId": request_id,
     });
+
+    if config.request_type == "image_gen" {
+        final_body["requestType"] = json!("image_gen");
+    } else if crate::proxy::mappers::common_utils::request_requires_agent(&final_body["request"]) {
+        final_body["requestType"] = json!("agent");
+    }
 
     // [CACHE:L3] 使用多层级缓存的 compute_prefix_hash 计算组合哈希
     // Layer 1 + Layer 2 的独立 hash 组合 → Layer 3 key
@@ -1753,6 +1757,7 @@ mod tests {
 
         let (first, _, _, _) =
             transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
+        assert!(first.get("requestType").is_none());
         let (second, _, _, _) =
             transform_openai_request(&req, "test-project", "gemini-3.7-flash-high", None);
         let first_id = first["requestId"].as_str().unwrap();

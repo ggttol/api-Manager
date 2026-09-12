@@ -698,6 +698,29 @@ export default function ApiProxy() {
         saveConfig(newConfig);
     };
 
+    const updateLogRetentionConfig = async (
+        updates: Partial<NonNullable<ProxyConfig['log_retention']>>,
+    ) => {
+        try {
+            await updateConfig(current => ({
+                ...current,
+                proxy: {
+                    ...current.proxy,
+                    log_retention: {
+                        body_retention_hours: 24,
+                        metadata_retention_days: 30,
+                        max_rows: 100000,
+                        ...current.proxy.log_retention,
+                        ...updates,
+                    },
+                },
+            }));
+        } catch (error) {
+            console.error('Failed to update log retention:', error);
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
     const updateSchedulingConfig = (updates: Partial<StickySessionConfig>) => {
         if (!appConfig) return;
         const currentScheduling = appConfig.proxy.scheduling || { mode: 'Balance', max_wait_seconds: 60 };
@@ -1225,6 +1248,49 @@ print(response.choices[0].message.content)`;
                                 </div>
                             </div>
 
+
+                            <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">
+                                <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 mb-2">
+                                    <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
+                                        {t('proxy.config.log_retention.title', { defaultValue: 'Request log retention' })}
+                                    </span>
+                                    <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                                        {t('proxy.config.log_retention.zero_disables', { defaultValue: 'Set any value to 0 to disable that limit.' })}
+                                    </span>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                    {([
+                                        ['body_retention_hours', 'body_hours', 24],
+                                        ['metadata_retention_days', 'metadata_days', 30],
+                                        ['max_rows', 'max_rows', 100000],
+                                    ] as const).map(([field, label, fallback]) => (
+                                        <label key={field} className="block text-xs font-medium text-gray-700 dark:text-gray-300">
+                                            {t(`proxy.config.log_retention.${label}`, {
+                                                defaultValue: field === 'body_retention_hours'
+                                                    ? 'Keep request and response bodies (hours)'
+                                                    : field === 'metadata_retention_days'
+                                                        ? 'Keep log metadata (days)'
+                                                        : 'Maximum log rows',
+                                            })}
+                                            <input
+                                                type="number"
+                                                min={0}
+                                                step={1}
+                                                value={appConfig.proxy.log_retention?.[field] ?? fallback}
+                                                onChange={(event) => {
+                                                    const value = Number(event.target.value);
+                                                    if (Number.isFinite(value) && value >= 0) {
+                                                        void updateLogRetentionConfig({
+                                                            [field]: Math.floor(value),
+                                                        });
+                                                    }
+                                                }}
+                                                className="w-full mt-1 px-2.5 py-1.5 border border-gray-300 dark:border-base-200 rounded-lg bg-white dark:bg-base-200 text-xs text-gray-900 dark:text-base-content focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                                            />
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
 
                             {/* 局域网访问 & 访问授权 - 合并到同一行 */}
                             <div className="border-t border-gray-200 dark:border-base-300 pt-3 mt-3">

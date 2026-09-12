@@ -567,6 +567,13 @@
     },
     "config": {
       "title": "服務配置",
+      "log_retention": {
+        "title": "請求日誌保留",
+        "zero_disables": "設為 0 可分別關閉對應限制。",
+        "body_hours": "請求與回應內容保留（小時）",
+        "metadata_days": "日誌中繼資料保留（天）",
+        "max_rows": "日誌筆數上限"
+      },
       "request": {
         "user_agent": "User-Agent 覆蓋",
         "user_agent_tooltip": "自定義發送給上游 API 的 User-Agent 請求頭。留空則使用默認值。",

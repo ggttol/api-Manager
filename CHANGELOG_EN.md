@@ -2,6 +2,34 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## API Manager v4.7.1 integration (2026-09-12)
+
+Integrated upstream v4.7.1 request-mode, quota, log-retention, and persistence improvements while preserving this fork's isolated Codex endpoints, unified console, and Gemini client system-envelope fix.
+
+Plain requests without tools no longer force `requestType: agent`; tool definitions or tool history retain `agent`, and image requests retain `image_gen`. Generic `QUOTA_EXHAUSTED` is no longer sufficient evidence of a long quota outage. Explicit hard-quota evidence and `Retry-After` remain authoritative, and stale quota snapshots cannot overwrite newer live 429 locks.
+
+Quota refresh merges real QuotaSummary windows, supports Sandbox → Daily → Prod fallback, reuses cached projects, and preserves known subscription tiers. Aliases sharing a quota family use its minimum balance consistently during refresh, account loading, legacy protection migration, and recovery. A healthy alias cannot unlock an exhausted sibling; other model families remain independent.
+
+Gateway settings now expose request-log retention, applied at startup and hourly using current configuration. Defaults retain bodies for 24 hours, metadata for 30 days, and at most 100,000 rows. Each zero value disables only that limit. Expired bodies are cleared without removing status or usage metadata until the age or row limit applies. Back up `proxy_logs.db` before upgrading. Existing databases do not undergo a full startup `VACUUM`, so cleanup does not promise immediate file shrinkage. Corresponding `gui_config.json` fragment:
+
+```json
+{
+  "proxy": {
+    "log_retention": {
+      "body_retention_hours": 24,
+      "metadata_retention_days": 30,
+      "max_rows": 100000
+    }
+  }
+}
+```
+
+The integration guide can generate an OpenAI-compatible OpenCode provider from the live model catalog. It prefers existing `opencode.jsonc`, preserves unrelated settings, creates a backup, and writes atomically with private permissions. The target belongs to the user running API Manager; a web deployment does not modify the browser computer. The gateway key is stored in plaintext in the target OpenCode configuration, explicitly disclosed by the UI; the page does not persist the input.
+
+Undecryptable legacy proxy credential residues fall back to valid credentials already present in the proxy URL. Without usable fallback credentials, requests fail explicitly rather than sending or logging ciphertext as a password. Account and index writes use atomic replacement. Linux Secret Service compatibility, RFC3339/seconds/milliseconds parsing, dark checked toggles, and bounded Docker log rotation are also included.
+
+Live upstream acceptance covered OpenAI text and tool calls, native Gemini, and an original 73-message OMP system-envelope stream. Browser acceptance covered configuration saves, body/metadata/row retention, all-zero limits, OpenCode JSONC synchronization, and failure without overwriting existing configuration. The shared-quota regression failed before the fix and passed afterward, covering refresh, loading, legacy migration, and threshold recovery.
+
 ## Gemini client system-envelope compatibility
 
 Fixed generic upstream `429 RESOURCE_EXHAUSTED` responses triggered by client `system-conventions` envelopes through Anthropic Messages and OpenAI Chat Completions. For Gemini only, a complete envelope at the start of a system text uses plain bracket delimiters; its instructions, code examples, and trailing text remain intact. Other models, ordinary mentions, and incomplete envelopes are unchanged. Clients keep sending their original requests. Two boundary regressions and 27 Claude request-mapping regressions passed; live upstream acceptance covered Gemini 3.8 Flash medium/high/tiered and both compatibility protocols.

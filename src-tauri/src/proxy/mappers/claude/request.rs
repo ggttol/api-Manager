@@ -538,7 +538,7 @@ pub fn transform_claude_request_in(
         let needs_signature_check = has_function_calls;
 
         if !has_thinking_history && is_thinking_enabled {
-            tracing::info!(
+            tracing::debug!(
                 "[Thinking-Mode] First thinking request detected. Using permissive mode - \
                  signature validation will be handled by upstream API."
             );
@@ -554,7 +554,7 @@ pub fn transform_claude_request_in(
             // [FIX #2167] Flash / gemini-pro-agent 无签名时使用哨兵值而不是禁用 thinking
             // 禁用 thinking 会导致模型失去思考能力，哨兵值可让 Gemini 跳过签名校验
             if model_keeps_thinking_without_signature(&mapped_model) {
-                tracing::info!(
+                tracing::debug!(
                     "[Thinking-Mode] [FIX #2167] No signature for model function calls. \
                      Will rely on sentinel injection in build_contents."
                 );
@@ -696,9 +696,13 @@ pub fn transform_claude_request_in(
         "request": inner_request,
         "model": config.final_model,
         "userAgent": "antigravity",
-        // [CHANGED v4.1.24] Use "agent" for all non-image requests
-        "requestType": if config.request_type == "image_gen" { "image_gen" } else { "agent" },
     });
+
+    if config.request_type == "image_gen" {
+        body["requestType"] = json!("image_gen");
+    } else if crate::proxy::mappers::common_utils::request_requires_agent(&body["request"]) {
+        body["requestType"] = json!("agent");
+    }
 
     // 如果提供了 metadata.user_id，则复用为 sessionId
     if let Some(metadata) = &claude_req.metadata {
@@ -837,7 +841,7 @@ fn has_valid_signature_for_function_calls(
     // When retrying, the signature may not be in messages but exists in Session Cache
     if let Some(sig) = crate::proxy::SignatureCache::global().get_session_signature(session_id) {
         if sig.len() >= MIN_SIGNATURE_LENGTH {
-            tracing::info!(
+            tracing::debug!(
                 "[Signature-Check] Found valid signature in SESSION cache (session: {}, len: {})",
                 session_id,
                 sig.len()
@@ -1259,7 +1263,7 @@ fn build_contents(
                                 // Try session-based signature cache at specific msg_index first (Layer 3)
                                 crate::proxy::SignatureCache::global().get_session_signature_at(session_id, msg_index)
                                     .map(|s| {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             "[Claude-Request] Recovered signature from SESSION cache at turn {} (session: {}, len: {})",
                                             msg_index, session_id, s.len()
                                         );
@@ -1270,7 +1274,7 @@ fn build_contents(
                                 // Fallback to latest session signature
                                 crate::proxy::SignatureCache::global().get_session_signature(session_id)
                                     .map(|s| {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             "[Claude-Request] Recovered latest signature from SESSION cache (session: {}, len: {})",
                                             session_id, s.len()
                                         );
@@ -1281,7 +1285,7 @@ fn build_contents(
                                 // Try tool-specific signature cache (Layer 1)
                                 crate::proxy::SignatureCache::global().get_tool_signature(id)
                                     .map(|s| {
-                                        tracing::info!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
+                                        tracing::debug!("[Claude-Request] Recovered signature from TOOL cache for tool_id: {}", id);
                                         s
                                     })
                             })
@@ -1368,7 +1372,7 @@ fn build_contents(
                                 && (is_thinking_enabled
                                     || model_keeps_thinking_without_signature(&mapped_model));
                             if needs_sentinel {
-                                tracing::info!(
+                                tracing::debug!(
                                     "[Tool-Signature] Adding GEMINI_SKIP_SIGNATURE for tool_use: {} (model: {})",
                                     id, mapped_model
                                 );
@@ -2384,6 +2388,7 @@ mod tests {
         let body = result.unwrap();
         assert_eq!(body["project"], "test-project");
         assert!(body["requestId"].as_str().unwrap().starts_with("agent/"));
+        assert!(body.get("requestType").is_none());
     }
 
     #[test]

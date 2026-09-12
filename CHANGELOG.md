@@ -2,6 +2,34 @@
 
 > 完整版本历史记录。返回项目主页请查看 [README.md](README.md) | [English Changelog](CHANGELOG_EN.md)。
 
+## API Manager v4.7.1 整合升级（2026-09-12）
+
+整合上游 v4.7.1 的请求模式、配额、日志保留和持久化增强，保留本修改版的 Codex 独立通道、统一控制台及 Gemini 客户端系统封套兼容修复。
+
+普通无工具请求不再固定标记为 `agent`；存在工具定义或工具历史时仍使用 `agent`，生图请求保留 `image_gen`。通用 `QUOTA_EXHAUSTED` 不再直接等同于长期额度耗尽，明确的硬配额证据和 `Retry-After` 仍被尊重。旧配额快照不能覆盖更新的真实 429 锁。
+
+配额查询整合真实 QuotaSummary 双窗口数据，支持 Sandbox → Daily → Prod 端点回退及缓存项目复用，保留已知订阅等级。同族别名按最低余额聚合；配额刷新、启动加载、旧账号保护迁移和恢复判定使用一致语义，避免一个健康别名提前解锁耗尽的共享额度。其他模型族不受该族保护影响。
+
+网关配置新增请求日志保留策略，启动时及每小时按最新配置清理。默认正文保留 24 小时、元数据保留 30 天、最多 100,000 行；每项设为 `0` 时单独禁用该限制。正文过期只清除请求/响应正文，状态和计量仍保留到元数据或行数限制触发。升级前应备份 `proxy_logs.db`；既有数据库不在启动时强制执行整库 `VACUUM`，清理后不保证文件立即缩小。`gui_config.json` 对应配置片段：
+
+```json
+{
+  "proxy": {
+    "log_retention": {
+      "body_retention_hours": 24,
+      "metadata_retention_days": 30,
+      "max_rows": 100000
+    }
+  }
+}
+```
+
+接入指南支持从真实模型目录生成 OpenCode 的 OpenAI-compatible Provider，优先更新已存在的 `opencode.jsonc`，保留无关配置并创建备份，使用私有权限原子写入。目标是运行 API Manager 的用户目录；Web 部署不会修改浏览器所在电脑。网关 Key 会以明文保存在目标 OpenCode 配置中，页面已明确提示且不持久保存输入。
+
+旧代理显式凭据若仅剩无法解密的密文，可回退至代理 URL 中已有的有效凭据；无备用凭据则明确失败，不把密文作为密码发送或写入日志。账号与索引写入统一使用原子替换；改善 Linux Secret Service 兼容，统一 RFC3339/秒/毫秒时间解析，修复深色开关样式并限制 Docker 日志轮转大小。
+
+真实上游验收覆盖 OpenAI 普通对话及工具调用、Gemini 原生请求、含 73 条消息的原始 OMP 系统封套流式请求；浏览器实测配置保存、日志正文/元数据/行数清理、全零禁用策略、OpenCode JSONC 同步及错误不覆盖原文件。共享模型额度保护回归验证修复前失败、修复后通过，覆盖刷新、启动加载、旧状态迁移及阈值恢复。
+
 ## API Manager 修改版（基于 v4.7.0）
 
 修复 Gemini 经 Anthropic Messages / OpenAI Chat Completions 接收客户端 `system-conventions` 系统封套时，上游可能返回通用 `429 RESOURCE_EXHAUSTED` 的兼容问题。仅将系统文本开头完整封套的外层分隔符转为方括号，保留内部规则、代码示例和后续正文；非 Gemini 模型、普通引用及不完整封套不改。客户端可继续发送原始请求，不需要删系统提示或新建会话。2 项边界回归与 27 项 Claude 请求转换回归通过，真实上游验证 Gemini 3.8 Flash medium/high/tiered 及两种兼容协议成功响应。

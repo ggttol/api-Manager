@@ -3,6 +3,16 @@ export interface UpstreamProxyConfig {
     url: string;
 }
 
+export interface LogRetentionConfig {
+    /** Zero disables body removal. */
+    body_retention_hours: number;
+    /** Zero disables metadata row removal. */
+    metadata_retention_days: number;
+    /** Zero disables the row-count limit. */
+    max_rows: number;
+}
+
+
 export interface ProxyConfig {
     enabled: boolean;
     allow_lan_access?: boolean;
@@ -14,6 +24,7 @@ export interface ProxyConfig {
     custom_mapping?: Record<string, string>;
     request_timeout: number;
     enable_logging: boolean;
+    log_retention?: LogRetentionConfig;
     debug_logging?: DebugLoggingConfig;
     upstream_proxy: UpstreamProxyConfig;
     zai?: ZaiConfig;

@@ -633,6 +633,13 @@
     },
     "config": {
       "title": "Конфигурация сервиса",
+      "log_retention": {
+        "title": "Хранение журналов запросов",
+        "zero_disables": "Установите значение 0, чтобы отключить соответствующее ограничение.",
+        "body_hours": "Хранить тела запросов и ответов (часы)",
+        "metadata_days": "Хранить метаданные журнала (дни)",
+        "max_rows": "Максимальное число записей"
+      },
       "request": {
         "user_agent": "User-Agent Override",
         "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",

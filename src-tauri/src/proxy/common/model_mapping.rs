@@ -367,6 +367,39 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     None
 }
 
+/// Maps explicit quota-group metadata to the standard protection IDs used by
+/// selection and circuit breaking. Unknown groups deliberately map to nothing.
+pub fn quota_group_standard_ids(metadata: &str) -> Vec<&'static str> {
+    let metadata = metadata.to_ascii_lowercase();
+    if metadata.contains("claude")
+        || metadata.contains("gpt")
+        || metadata.contains("3p")
+        || metadata.contains("third party")
+    {
+        return vec!["claude"];
+    }
+    if !metadata.contains("gemini") {
+        return Vec::new();
+    }
+
+    let image = metadata.contains("image") || metadata.contains("imagen");
+    let flash = metadata.contains("flash");
+    let pro = metadata.contains("pro");
+    match (image, flash, pro) {
+        (true, true, _) => vec!["gemini-3.1-flash-image"],
+        (true, _, true) => vec!["gemini-3-pro-image"],
+        (true, false, false) => vec!["gemini-3.1-flash-image", "gemini-3-pro-image"],
+        (false, true, _) => vec!["gemini-3-flash"],
+        (false, _, true) => vec!["gemini-3-pro-high"],
+        (false, false, false) => vec![
+            "gemini-3-flash",
+            "gemini-3-pro-high",
+            "gemini-3.1-flash-image",
+            "gemini-3-pro-image",
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +592,17 @@ mod tests {
         assert_eq!(resolve_model_route("random-model", &custom), "catch-all");
         // Multi-wildcard: "a*b*c" (3)
         assert_eq!(resolve_model_route("a-test-b-foo-c", &custom), "multi-wild");
+    }
+    #[test]
+    fn quota_group_mapping_keeps_families_isolated() {
+        assert_eq!(
+            quota_group_standard_ids("Gemini Flash image 5h"),
+            vec!["gemini-3.1-flash-image"]
+        );
+        assert_eq!(
+            quota_group_standard_ids("Claude and GPT weekly"),
+            vec!["claude"]
+        );
+        assert!(quota_group_standard_ids("unrelated experimental quota").is_empty());
     }
 }

@@ -532,6 +532,13 @@
     },
     "config": {
       "title": "Hizmet Yapılandırması",
+      "log_retention": {
+        "title": "İstek günlüğü saklama",
+        "zero_disables": "İlgili sınırı devre dışı bırakmak için değeri 0 yapın.",
+        "body_hours": "İstek ve yanıt gövdelerini saklama (saat)",
+        "metadata_days": "Günlük meta verilerini saklama (gün)",
+        "max_rows": "En fazla günlük kaydı"
+      },
       "request": {
         "user_agent": "User-Agent Override",
         "user_agent_tooltip": "Override the User-Agent header sent to upstream APIs. Leave empty to use default.",

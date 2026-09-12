@@ -25,7 +25,8 @@ const OLD_BACKUP_SUFFIX: &str = ".antigravity.bak";
 const ACCOUNTS_OWNERSHIP_FILE: &str = ".antigravity-manager-accounts-owned";
 
 const ANTIGRAVITY_PROVIDER_ID: &str = "antigravity-manager";
-
+const API_MANAGER_PROVIDER_ID: &str = "api-manager";
+const OPENAI_COMPATIBLE_NPM: &str = "@ai-sdk/openai-compatible";
 /// Variant type for model variants
 #[derive(Debug, Clone, Copy)]
 enum VariantType {
@@ -353,10 +354,10 @@ fn strip_jsonc_comments(input: &str) -> String {
 
     while i < bytes.len() {
         let c = bytes[i];
-
         if in_string {
             out.push(c);
             if c == b'\\' && i + 1 < bytes.len() {
+                // Keep escaped and UTF-8 bytes verbatim.
                 out.push(bytes[i + 1]);
                 i += 2;
                 continue;
@@ -367,11 +368,10 @@ fn strip_jsonc_comments(input: &str) -> String {
             i += 1;
             continue;
         }
-
         match c {
             b'"' => {
                 in_string = true;
-                out.push(c);
+                out.push(b'"');
                 i += 1;
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
@@ -393,8 +393,7 @@ fn strip_jsonc_comments(input: &str) -> String {
             }
         }
     }
-
-    String::from_utf8(out).expect("JSONC input was valid UTF-8")
+    String::from_utf8(out).expect("JSONC normalization preserves UTF-8")
 }
 
 /// Remove trailing commas (a `,` followed, after optional whitespace, by a closing
@@ -406,10 +405,8 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     let mut in_string = false;
-
     while i < bytes.len() {
         let c = bytes[i];
-
         if in_string {
             out.push(c);
             if c == b'\\' && i + 1 < bytes.len() {
@@ -423,14 +420,12 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
             i += 1;
             continue;
         }
-
         if c == b'"' {
             in_string = true;
-            out.push(c);
+            out.push(b'"');
             i += 1;
             continue;
         }
-
         if c == b',' {
             let mut j = i + 1;
             while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
@@ -441,12 +436,10 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
                 continue;
             }
         }
-
         out.push(c);
         i += 1;
     }
-
-    String::from_utf8(out).expect("JSONC input was valid UTF-8")
+    String::from_utf8(out).expect("JSONC normalization preserves UTF-8")
 }
 
 /// Read and parse an OpenCode config file, tolerating JSONC comments and trailing commas.
@@ -959,7 +952,7 @@ fn restore_backup_to_target(
         .map_err(|error| format!("Failed to remove restored {} backup: {error}", label))
 }
 
-fn validate_config_shape(config: &Value) -> Result<(), String> {
+fn validate_config_shape(config: &Value, provider_id: &str) -> Result<(), String> {
     let root = config
         .as_object()
         .ok_or_else(|| "OpenCode config root must be an object".to_string())?;
@@ -969,16 +962,16 @@ fn validate_config_shape(config: &Value) -> Result<(), String> {
     let providers = provider
         .as_object()
         .ok_or_else(|| "OpenCode config field 'provider' must be an object".to_string())?;
-    let Some(manager) = providers.get(ANTIGRAVITY_PROVIDER_ID) else {
+    let Some(manager) = providers.get(provider_id) else {
         return Ok(());
     };
-    let manager = manager.as_object().ok_or_else(|| {
-        format!("OpenCode provider '{ANTIGRAVITY_PROVIDER_ID}' must be an object")
-    })?;
+    let manager = manager
+        .as_object()
+        .ok_or_else(|| format!("OpenCode provider '{provider_id}' must be an object"))?;
     for key in ["options", "models"] {
         if manager.get(key).is_some_and(|value| !value.is_object()) {
             return Err(format!(
-                "OpenCode provider '{ANTIGRAVITY_PROVIDER_ID}.{key}' must be an object"
+                "OpenCode provider '{provider_id}.{key}' must be an object"
             ));
         }
     }
@@ -1424,6 +1417,116 @@ fn merge_catalog_models(provider: &mut Value, model_inputs: Option<&[ModelInput]
     }
 }
 
+fn validate_provider_id(provider_id: &str) -> Result<(), String> {
+    if provider_id.is_empty()
+        || !provider_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(
+            "OpenCode provider id must contain only letters, digits, '-' or '_'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn replace_openai_provider_models(provider: &mut Value, inputs: Option<&[ModelInput]>) {
+    let Some(inputs) = inputs.filter(|inputs| !inputs.is_empty()) else {
+        return;
+    };
+    let existing = provider
+        .get("models")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut models = serde_json::Map::new();
+    for input in inputs {
+        let id = input.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let entry = existing
+            .get(id)
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| build_fallback_model_json(id, input.name.as_deref()));
+        models.insert(id.to_string(), entry);
+    }
+    provider["models"] = Value::Object(models);
+}
+
+fn apply_openai_compatible_provider_sync(
+    mut config: Value,
+    provider_id: &str,
+    provider_name: &str,
+    proxy_url: &str,
+    api_key: &str,
+    models: Option<&[ModelInput]>,
+) -> Value {
+    ensure_object(&mut config, "provider");
+    if config.get("$schema").is_none() {
+        config["$schema"] = Value::String("https://opencode.ai/config.json".to_string());
+    }
+    let providers = config["provider"]
+        .as_object_mut()
+        .expect("provider object was ensured");
+    ensure_provider_object(providers, provider_id);
+    let provider = providers
+        .get_mut(provider_id)
+        .expect("provider object was ensured");
+    ensure_provider_string_field(provider, "npm", OPENAI_COMPATIBLE_NPM);
+    ensure_provider_string_field(
+        provider,
+        "name",
+        if provider_name.trim().is_empty() {
+            "API Manager"
+        } else {
+            provider_name.trim()
+        },
+    );
+    merge_provider_options(provider, &normalize_opencode_base_url(proxy_url), api_key);
+    replace_openai_provider_models(provider, models);
+    config
+}
+
+pub fn sync_opencode_openai_provider(
+    provider_id: &str,
+    provider_name: &str,
+    proxy_url: &str,
+    api_key: &str,
+    models: Option<Vec<ModelInput>>,
+) -> Result<(), String> {
+    let provider_id = provider_id.trim();
+    validate_provider_id(provider_id)?;
+    let _client_lock = lock_client_config();
+    let Some((config_path, _, _)) = get_config_paths() else {
+        return Err("Failed to get OpenCode config directory".to_string());
+    };
+    let config = match fs::read_to_string(&config_path) {
+        Ok(content) => parse_jsonc(&content)
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                "OpenCode config must be a valid JSON/JSONC object; file left unchanged".to_string()
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(format!("Failed to read OpenCode config: {error}")),
+    };
+    validate_config_shape(&config, provider_id)?;
+    create_backup(&config_path)?;
+    let updated = apply_openai_compatible_provider_sync(
+        config,
+        provider_id,
+        provider_name,
+        proxy_url,
+        api_key,
+        models.as_deref(),
+    );
+    let content = serde_json::to_vec_pretty(&updated)
+        .map_err(|error| format!("Failed to serialize OpenCode config: {error}"))?;
+    write_atomic(&config_path, &content)
+        .map_err(|error| format!("Failed to write OpenCode config: {error}"))
+}
+
 pub fn sync_opencode_config(
     proxy_url: &str,
     api_key: &str,
@@ -1440,7 +1543,7 @@ pub fn sync_opencode_config(
     let config = if config_path.exists() {
         let config = parse_config_file(&config_path)
             .ok_or_else(|| format!("Failed to parse existing config: {}", config_path.display()))?;
-        validate_config_shape(&config)?;
+        validate_config_shape(&config, ANTIGRAVITY_PROVIDER_ID)?;
         config
     } else {
         serde_json::json!({})
@@ -1648,7 +1751,7 @@ pub fn restore_opencode_config() -> Result<(), String> {
             let config = parse_jsonc(&content).ok_or_else(|| {
                 "Failed to parse config backup (not valid JSON/JSONC)".to_string()
             })?;
-            validate_config_shape(&config)?;
+            validate_config_shape(&config, ANTIGRAVITY_PROVIDER_ID)?;
         }
     }
     for suffix in [BACKUP_SUFFIX, OLD_BACKUP_SUFFIX] {
@@ -2979,6 +3082,33 @@ pub async fn execute_opencode_sync(
 }
 
 #[tauri::command]
+pub async fn execute_opencode_openai_sync(
+    proxy_url: String,
+    api_key: String,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+    models: Option<Vec<ModelInput>>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        sync_opencode_openai_provider(
+            provider_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or(API_MANAGER_PROVIDER_ID),
+            provider_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("API Manager"),
+            &proxy_url,
+            &api_key,
+            models,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err("Failed to execute OpenCode sync".to_string()))
+}
+
+#[tauri::command]
 pub async fn execute_opencode_restore() -> Result<(), String> {
     tokio::task::spawn_blocking(restore_opencode_config)
         .await
@@ -3047,7 +3177,7 @@ fn clear_opencode_config(proxy_url: Option<String>, clear_legacy: bool) -> Resul
             fs::read_to_string(&config_path).map_err(|e| format!("Failed to read config: {e}"))?;
         let config = parse_jsonc(&content)
             .ok_or_else(|| "Failed to parse config (not valid JSON/JSONC)".to_string())?;
-        validate_config_shape(&config)?;
+        validate_config_shape(&config, ANTIGRAVITY_PROVIDER_ID)?;
         Some(config)
     } else {
         None
