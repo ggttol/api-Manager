@@ -151,6 +151,7 @@ impl CodexManager {
     pub fn new(data_dir: PathBuf, proxy: Option<UpstreamProxyConfig>) -> Result<Self, String> {
         let client = Self::build_client(proxy)?;
         let (vault, accounts) = Vault::open(data_dir)?;
+        let sessions = relay::SessionCache::load(&vault)?;
         let refresh_locks = accounts
             .accounts
             .iter()
@@ -165,7 +166,7 @@ impl CodexManager {
                 devices: HashMap::new(),
             }),
             imports: Mutex::new(()),
-            sessions: Mutex::new(relay::SessionCache::default()),
+            sessions: Mutex::new(sessions),
             #[cfg(test)]
             responses_url: None,
         })

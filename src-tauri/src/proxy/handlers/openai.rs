@@ -3522,6 +3522,7 @@ pub async fn handle_completions(
                                             "content": output_str,
                                         }));
                                     }
+                                    "reasoning" | "compaction" | "item_reference" => {}
                                     _ => {
                                         messages.push(item.clone());
                                     }
@@ -6002,13 +6003,15 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
         let mut translation_state = TranslationState {
             response_id: format!("resp-{}", &Uuid::new_v4().to_string()[..24]),
             item_id: format!("item-{}", &Uuid::new_v4().to_string()[..16]),
-            reasoning_item_id: format!("msg_thought_{}", &Uuid::new_v4().to_string()[..16]),
+            reasoning_item_id: format!("rs_{}", &Uuid::new_v4().to_string()[..16]),
             message_output_index: None,
             reasoning_output_index: None,
             next_output_index: 0,
             tool_output_indices: std::collections::HashMap::new(),
             message_item_added: false,
             reasoning_item_added: false,
+            reasoning_item_closed: false,
+            completed_reasoning_item: None,
             content_part_added: false,
             accumulated_text: String::new(),
             accumulated_reasoning: String::new(),
@@ -6716,6 +6719,8 @@ struct TranslationState {
     tool_output_indices: std::collections::HashMap<u32, u32>,
     message_item_added: bool,
     reasoning_item_added: bool,
+    reasoning_item_closed: bool,
+    completed_reasoning_item: Option<Value>,
     content_part_added: bool,
     accumulated_text: String,
     accumulated_reasoning: String,
@@ -6728,6 +6733,57 @@ struct TranslationState {
 async fn send_ws_event(socket: &mut WebSocket, ws_events: &mut Vec<Value>, event: &Value) {
     ws_events.push(event.clone());
     let _ = socket.send(Message::Text(event.to_string())).await;
+}
+
+fn finish_ws_reasoning(state: &mut TranslationState) -> Vec<Value> {
+    if !state.reasoning_item_added || state.reasoning_item_closed {
+        return Vec::new();
+    }
+    let Some(output_index) = state.reasoning_output_index else {
+        return Vec::new();
+    };
+    let text_done = json!({
+        "type": "response.reasoning_summary_text.done",
+        "item_id": &state.reasoning_item_id,
+        "output_index": output_index,
+        "summary_index": 0,
+        "text": &state.accumulated_reasoning
+    });
+    let part = json!({
+        "type": "summary_text",
+        "text": &state.accumulated_reasoning
+    });
+    let part_done = json!({
+        "type": "response.reasoning_summary_part.done",
+        "item_id": &state.reasoning_item_id,
+        "output_index": output_index,
+        "summary_index": 0,
+        "part": &part
+    });
+    let item = json!({
+        "id": &state.reasoning_item_id,
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [part]
+    });
+    let item_done = json!({
+        "type": "response.output_item.done",
+        "output_index": output_index,
+        "item": &item
+    });
+    state.completed_reasoning_item = Some(item);
+    state.reasoning_item_closed = true;
+    vec![text_done, part_done, item_done]
+}
+
+async fn close_ws_reasoning(
+    state: &mut TranslationState,
+    socket: &mut WebSocket,
+    ws_events: &mut Vec<Value>,
+) {
+    for event in finish_ws_reasoning(state) {
+        send_ws_event(socket, ws_events, &event).await;
+    }
 }
 
 async fn translate_openai_chunk_to_ws(
@@ -6761,30 +6817,40 @@ async fn translate_openai_chunk_to_ws(
             if let Some(delta) = choice.get("delta") {
                 if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
                     if !reasoning.is_empty() {
-                        let output_index = match state.reasoning_output_index {
-                            Some(index) => index,
-                            None => {
-                                let index = state.next_output_index;
-                                state.next_output_index += 1;
-                                state.reasoning_output_index = Some(index);
-                                index
+                        if state.reasoning_item_closed
+                            || state.message_item_added
+                            || !state.tool_calls_added.is_empty()
+                        {
+                            tracing::warn!(
+                                "[Codex-WebSocket] Dropping late reasoning delta after visible output started"
+                            );
+                        } else {
+                            let output_index = match state.reasoning_output_index {
+                                Some(index) => index,
+                                None => {
+                                    let index = state.next_output_index;
+                                    state.next_output_index += 1;
+                                    state.reasoning_output_index = Some(index);
+                                    index
+                                }
+                            };
+                            if !state.reasoning_item_added {
+                                let item_added = json!({"type":"response.output_item.added","output_index":output_index,"item":{"id":&state.reasoning_item_id,"type":"reasoning","status":"in_progress","summary":[]}});
+                                send_ws_event(socket, ws_events, &item_added).await;
+                                let part_added = json!({"type":"response.reasoning_summary_part.added","item_id":&state.reasoning_item_id,"output_index":output_index,"summary_index":0,"part":{"type":"summary_text","text":""}});
+                                send_ws_event(socket, ws_events, &part_added).await;
+                                state.reasoning_item_added = true;
                             }
-                        };
-                        if !state.reasoning_item_added {
-                            let item_added = json!({"type":"response.output_item.added","output_index":output_index,"item":{"id":&state.reasoning_item_id,"type":"message","role":"assistant","phase":"commentary","status":"in_progress","content":[]}});
-                            send_ws_event(socket, ws_events, &item_added).await;
-                            let part_added = json!({"type":"response.content_part.added","item_id":&state.reasoning_item_id,"output_index":output_index,"content_index":0,"part":{"type":"output_text","text":""}});
-                            send_ws_event(socket, ws_events, &part_added).await;
-                            state.reasoning_item_added = true;
+                            let event = json!({"type":"response.reasoning_summary_text.delta","item_id":&state.reasoning_item_id,"output_index":output_index,"summary_index":0,"delta":reasoning});
+                            send_ws_event(socket, ws_events, &event).await;
+                            state.accumulated_reasoning.push_str(reasoning);
                         }
-                        let event = json!({"type":"response.reasoning_summary_text.delta","item_id":&state.reasoning_item_id,"output_index":output_index,"summary_index":0,"delta":reasoning});
-                        send_ws_event(socket, ws_events, &event).await;
-                        state.accumulated_reasoning.push_str(reasoning);
                     }
                 }
 
                 if let Some(content) = delta.get("content").and_then(Value::as_str) {
                     if !content.is_empty() {
+                        close_ws_reasoning(state, socket, ws_events).await;
                         let message_output_index = match state.message_output_index {
                             Some(index) => index,
                             None => {
@@ -6816,6 +6882,9 @@ async fn translate_openai_chunk_to_ws(
                 }
 
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    if !tool_calls.is_empty() {
+                        close_ws_reasoning(state, socket, ws_events).await;
+                    }
                     for tc in tool_calls {
                         let tc_idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                         let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -6912,7 +6981,17 @@ async fn finalize_ws_events(
     session_state: &mut WebsocketSessionState,
     ws_events: &mut Vec<Value>,
 ) -> Value {
+    close_ws_reasoning(state, socket, ws_events).await;
+    let mut output_items = std::collections::BTreeMap::<u32, Value>::new();
+    if let (Some(index), Some(item)) = (
+        state.reasoning_output_index,
+        state.completed_reasoning_item.clone(),
+    ) {
+        output_items.insert(index, item);
+    }
+
     if let Some(error) = state.terminal_error.as_ref() {
+        let output: Vec<Value> = output_items.into_values().collect();
         let failed = json!({
             "type": "response.failed",
             "response": {
@@ -6920,13 +6999,14 @@ async fn finalize_ws_events(
                 "object": "response",
                 "status": "failed",
                 "error": error,
-                "output": []
+                "output": &output
             }
         });
         send_ws_event(socket, ws_events, &failed).await;
-        return json!([]);
+        return json!(output);
     }
     if let Some(reason) = state.incomplete_reason {
+        let output: Vec<Value> = output_items.into_values().collect();
         let incomplete = json!({
             "type": "response.incomplete",
             "response": {
@@ -6934,17 +7014,15 @@ async fn finalize_ws_events(
                 "object": "response",
                 "status": "incomplete",
                 "incomplete_details": { "reason": reason },
-                "output": []
+                "output": &output
             }
         });
         send_ws_event(socket, ws_events, &incomplete).await;
-        return json!([]);
+        return json!(output);
     }
 
-    let mut output_items = Vec::new();
     let mut tool_keys: Vec<u32> = state.tool_calls.keys().cloned().collect();
     tool_keys.sort();
-
     for tc_idx in tool_keys {
         if let Some((tool_item_id, call_id, name, args)) = state.tool_calls.get(&tc_idx) {
             let tool_output_index = match state.tool_output_indices.get(&tc_idx) {
@@ -6976,21 +7054,18 @@ async fn finalize_ws_events(
             if let Some(ns) = namespace {
                 item_obj["namespace"] = json!(ns);
             }
-
             let tool_done = json!({
                 "type": "response.output_item.done",
                 "output_index": tool_output_index,
-                "item": item_obj
+                "item": &item_obj
             });
             send_ws_event(socket, ws_events, &tool_done).await;
 
-            let tc_val = item_obj.clone();
-
             session_state
                 .tool_call_cache
-                .insert(call_id.clone(), tc_val.clone());
-            insert_cached_tool_call(call_id.clone(), tc_val.clone());
-            output_items.push(tc_val);
+                .insert(call_id.clone(), item_obj.clone());
+            insert_cached_tool_call(call_id.clone(), item_obj.clone());
+            output_items.insert(tool_output_index, item_obj);
         }
     }
 
@@ -7004,7 +7079,6 @@ async fn finalize_ws_events(
             "text": &state.accumulated_text
         });
         send_ws_event(socket, ws_events, &text_done).await;
-
         let part_done = json!({
             "type": "response.content_part.done",
             "item_id": &state.item_id,
@@ -7016,25 +7090,7 @@ async fn finalize_ws_events(
             }
         });
         send_ws_event(socket, ws_events, &part_done).await;
-
-        let message_done = json!({
-            "type": "response.output_item.done",
-            "output_index": message_output_index,
-            "item": {
-                "id": &state.item_id,
-                "type": "message",
-                "role": "assistant",
-                "phase": "final_answer",
-                "status": "completed",
-                "content": [{
-                    "type": "output_text",
-                    "text": &state.accumulated_text
-                }]
-            }
-        });
-        send_ws_event(socket, ws_events, &message_done).await;
-
-        output_items.push(json!({
+        let message = json!({
             "id": &state.item_id,
             "type": "message",
             "role": "assistant",
@@ -7044,20 +7100,27 @@ async fn finalize_ws_events(
                 "type": "output_text",
                 "text": &state.accumulated_text
             }]
-        }));
+        });
+        let message_done = json!({
+            "type": "response.output_item.done",
+            "output_index": message_output_index,
+            "item": &message
+        });
+        send_ws_event(socket, ws_events, &message_done).await;
+        output_items.insert(message_output_index, message);
     }
 
+    let output_items: Vec<Value> = output_items.into_values().collect();
     let completed_ev = json!({
         "type": "response.completed",
         "response": {
             "id": &state.response_id,
             "object": "response",
             "status": "completed",
-            "output": output_items
+            "output": &output_items
         }
     });
     send_ws_event(socket, ws_events, &completed_ev).await;
-
     json!(output_items)
 }
 
@@ -7309,4 +7372,61 @@ async fn try_compress_openai_with_summary(
     let mut forked_request = original_request.clone();
     forked_request.messages = forked_messages;
     Ok(forked_request)
+}
+
+#[cfg(test)]
+mod websocket_reasoning_tests {
+    use super::{finish_ws_reasoning, TranslationState};
+    use serde_json::Value;
+
+    fn reasoning_state() -> TranslationState {
+        TranslationState {
+            response_id: "resp-test".into(),
+            item_id: "msg-test".into(),
+            reasoning_item_id: "rs-test".into(),
+            message_output_index: None,
+            reasoning_output_index: Some(0),
+            next_output_index: 1,
+            tool_output_indices: std::collections::HashMap::new(),
+            message_item_added: false,
+            reasoning_item_added: true,
+            reasoning_item_closed: false,
+            completed_reasoning_item: None,
+            content_part_added: false,
+            accumulated_text: String::new(),
+            accumulated_reasoning: "Checking.".into(),
+            terminal_error: None,
+            incomplete_reason: None,
+            tool_calls: std::collections::HashMap::new(),
+            tool_calls_added: std::collections::HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn websocket_reasoning_closes_as_standard_summary_once() {
+        let mut state = reasoning_state();
+        let events = finish_ws_reasoning(&mut state);
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done"
+            ]
+        );
+        assert_eq!(events[0]["summary_index"], 0);
+        assert_eq!(events[0]["text"], "Checking.");
+        assert_eq!(events[1]["part"]["type"], "summary_text");
+        assert_eq!(events[2]["item"]["type"], "reasoning");
+        assert_eq!(events[2]["item"]["summary"][0]["text"], "Checking.");
+        assert_eq!(
+            state.completed_reasoning_item,
+            Some(events[2]["item"].clone())
+        );
+        assert!(finish_ws_reasoning(&mut state).is_empty());
+    }
 }

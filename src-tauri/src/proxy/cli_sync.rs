@@ -587,6 +587,19 @@ fn validate_existing_config(app: &CliApp, file: &CliConfigFile) -> Result<(), St
     Ok(())
 }
 
+fn is_apikey_service_url(url: &str) -> bool {
+    let Some(host) = url::Url::parse(url).ok().and_then(|url| {
+        url.host_str()
+            .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+    }) else {
+        return false;
+    };
+    ["apikey.fun", "apikey.fan"].iter().any(|domain| {
+        host.strip_suffix(domain)
+            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+    })
+}
+
 /// 执行同步逻辑
 fn sync_config_locked(
     app: &CliApp,
@@ -662,7 +675,7 @@ fn sync_config_locked(
                             Value::String(proxy_url.to_string()),
                         );
                         if !api_key.is_empty() {
-                            if proxy_url.contains("apikey.fun") {
+                            if is_apikey_service_url(proxy_url) {
                                 env_obj.insert(
                                     "ANTHROPIC_AUTH_TOKEN".to_string(),
                                     Value::String(api_key.to_string()),
@@ -715,7 +728,7 @@ fn sync_config_locked(
                             "OPENAI_API_KEY".to_string(),
                             Value::String(api_key.to_string()),
                         );
-                        if proxy_url.contains("apikey.fun") {
+                        if is_apikey_service_url(proxy_url) {
                             obj.remove("OPENAI_BASE_URL");
                         } else {
                             // Codex 的 auth.json 似乎也支持 OPENAI_BASE_URL，但 ccs 没写，我们也同步写一下
@@ -734,7 +747,7 @@ fn sync_config_locked(
 
                     // 必须使用 custom 提供商，Codex 不支持原生的 codex provider
                     let provider_key = "custom";
-                    let display_name = if proxy_url.contains("apikey.fun") {
+                    let display_name = if is_apikey_service_url(proxy_url) {
                         "APIKEY.FUN"
                     } else {
                         "Custom Node"
@@ -743,7 +756,7 @@ fn sync_config_locked(
                     // 优先设置 Root Keys 确保位于顶部
                     doc.insert("model_provider", value(provider_key));
 
-                    if proxy_url.contains("apikey.fun") {
+                    if is_apikey_service_url(proxy_url) {
                         doc.insert("model", value("gpt-5.5"));
                         doc.insert("review_model", value("gpt-5.5"));
                         doc.insert("model_reasoning_effort", value("high"));
@@ -782,7 +795,7 @@ fn sync_config_locked(
                         }
                     }
 
-                    if proxy_url.contains("apikey.fun") {
+                    if is_apikey_service_url(proxy_url) {
                         let features = doc
                             .entry("features")
                             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
@@ -1023,8 +1036,8 @@ pub async fn get_cli_config_content(
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_path, created_marker_path, restore_files_locked, validate_existing_config, CliApp,
-        CliConfigFile,
+        backup_path, created_marker_path, is_apikey_service_url, restore_files_locked,
+        validate_existing_config, CliApp, CliConfigFile,
     };
     use std::fs;
 
@@ -1080,5 +1093,14 @@ mod tests {
         assert!(!companion.path.exists());
         assert!(!created_marker_path(&companion).exists());
         assert!(!backup_path(&companion).exists());
+    }
+
+    #[test]
+    fn apikey_service_recognizes_both_supported_domains() {
+        assert!(is_apikey_service_url("https://api.apikey.fun/v1"));
+        assert!(is_apikey_service_url("https://api.apikey.fan/v1"));
+        assert!(!is_apikey_service_url("https://apikey.example/v1"));
+        assert!(!is_apikey_service_url("https://apikey.fun.evil.example/v1"));
+        assert!(!is_apikey_service_url("https://example.test/apikey.fan/v1"));
     }
 }

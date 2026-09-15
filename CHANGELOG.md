@@ -2,6 +2,14 @@
 
 > 完整版本历史记录。返回项目主页请查看 [README.md](README.md) | [English Changelog](CHANGELOG_EN.md)。
 
+## API Manager 定制稳定性更新（2026-09-15）
+
+Codex 会话账号 affinity 从进程内缓存升级为独立加密存储 `codex/session-affinity.enc.json`，沿用账号 Vault 密钥但使用独立 AAD，采用私有权限、临时文件、`fsync` 和原子替换写入。账号绑定不再按时间过期，也不再受 8192 条内存缓存上限约束；session/cache/response/turn/item/call/encrypted-content 同时保存调用方 scoped key 与跨 API key 的 global key。缺失或冲突的旧 continuation 会恢复到可用账号并立即永久持久化，而不是返回本地 409。
+
+选择性吸收上游 v4.7.2：Gemini thought 在 Responses SSE 和定制 WebSocket 中统一为标准 reasoning summary 生命周期，旧 `msg_thought_*` commentary 会话仍可读取但新输出使用 `rs_*`；Antigravity 身份、全局系统提示词使用双换行隔离，Gemini 包装使用精确段匹配防止重试重复注入；CLI Sync 同时识别 `apikey.fun` 与 `apikey.fan` 的真实主机及子域，不接受路径或伪后缀匹配。未吸收上游不安全的在线数据目录复制/删除实现，也未改写定制版版本号。
+
+验证覆盖 744 项 Rust 库测试、受影响模块定向测试、前端生产构建和 Linux x86_64 release 构建。隔离网关以真实 Codex tool call 创建会话，进程停止并确认端口释放后由新进程加载 affinity，tool output 续接返回 200；生产部署使用截图会话的原请求体和客户端实际 Codex user token，将原 409 恢复为 `response.completed`，再次重启正式服务后同一请求仍返回 200。Gemini 3.8 真实流输出标准 reasoning item、40 个 summary delta、完整 done 事件及 `response.completed`。
+
 ## API Manager v4.7.1 整合升级（2026-09-12）
 
 整合上游 v4.7.1 的请求模式、配额、日志保留和持久化增强，保留本修改版的 Codex 独立通道、统一控制台及 Gemini 客户端系统封套兼容修复。

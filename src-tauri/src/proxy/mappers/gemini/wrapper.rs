@@ -716,7 +716,7 @@ pub fn wrap_request_v2(
             "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
             You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
             **Absolute paths only**\n\
-            **Proactiveness**"
+            **Proactiveness**\n\n"
         };
 
         // [HYBRID] 检查是否已有 systemInstruction
@@ -745,16 +745,25 @@ pub fn wrap_request_v2(
 
                     // [NEW] 注入全局系统提示词 (紧跟 Antigravity 身份之后，用户指令之前)
                     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
-                    if global_prompt_config.enabled
-                        && !global_prompt_config.content.trim().is_empty()
-                    {
-                        // 插入位置：Antigravity 身份之后 (index 1)
-                        let insert_pos = if has_antigravity { 1 } else { 1 };
-                        if insert_pos <= parts_array.len() {
-                            parts_array
-                                .insert(insert_pos, json!({"text": global_prompt_config.content}));
-                        } else {
-                            parts_array.push(json!({"text": global_prompt_config.content}));
+                    if global_prompt_config.enabled {
+                        if let Some(formatted) =
+                            crate::proxy::common::system_prompt::separated_prompt(
+                                &global_prompt_config.content,
+                            )
+                        {
+                            let already_has_global = parts_array.iter().any(|part| {
+                                part.get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| {
+                                        crate::proxy::common::system_prompt::matches_prompt_segment(
+                                            text,
+                                            &global_prompt_config.content,
+                                        )
+                                    })
+                            });
+                            if !already_has_global {
+                                parts_array.insert(1, json!({"text": formatted}));
+                            }
                         }
                     }
                 }
@@ -764,8 +773,12 @@ pub fn wrap_request_v2(
             let mut parts = vec![json!({"text": antigravity_identity})];
             // [NEW] 注入全局系统提示词
             let global_prompt_config = crate::proxy::config::get_global_system_prompt();
-            if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-                parts.push(json!({"text": global_prompt_config.content}));
+            if global_prompt_config.enabled {
+                if let Some(content) = crate::proxy::common::system_prompt::separated_prompt(
+                    &global_prompt_config.content,
+                ) {
+                    parts.push(json!({"text": content}));
+                }
             }
             inner_request["systemInstruction"] = json!({
                 "role": "user",

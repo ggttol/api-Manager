@@ -26,6 +26,20 @@ pub fn normalize_system_envelope<'a>(text: &'a str, model: &str) -> Cow<'a, str>
     Cow::Owned(normalized)
 }
 
+/// Normalize an injected system-prompt segment and keep it isolated from the
+/// surrounding markdown.
+pub fn separated_prompt(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{text}\n\n"))
+}
+
+/// Detect only an already-injected full prompt. A substring match can suppress
+/// a legitimate prompt when the user's own instructions merely quote it.
+pub fn matches_prompt_segment(candidate: &str, prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    !prompt.is_empty() && candidate.trim() == prompt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +69,22 @@ mod tests {
         }
         let text = "<system-conventions>\nrules\n</system-conventions>";
         assert_eq!(normalize_system_envelope(text, "claude-sonnet-4-6"), text);
+    }
+
+    #[test]
+    fn prompt_segments_are_trimmed_separated_and_matched_exactly() {
+        assert_eq!(
+            separated_prompt("  # Global Rules\nDo this. \n"),
+            Some("# Global Rules\nDo this.\n\n".to_string())
+        );
+        assert_eq!(separated_prompt(" \n\t"), None);
+        assert!(matches_prompt_segment(
+            "# Global Rules\nDo this.\n\n",
+            " # Global Rules\nDo this. "
+        ));
+        assert!(!matches_prompt_segment(
+            "User quoted: # Global Rules\nDo this.",
+            "# Global Rules\nDo this."
+        ));
     }
 }

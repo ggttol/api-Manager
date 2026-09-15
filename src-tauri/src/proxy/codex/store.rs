@@ -14,7 +14,10 @@ use std::{
 use super::auth::Tokens;
 
 const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SESSION_STORE_BYTES: u64 = 256 * 1024 * 1024;
 const AAD: &[u8] = b"api-manager/codex/credentials/v1";
+const SESSION_AAD: &[u8] = b"api-manager/codex/session-affinity/v1";
+const SESSION_STORE: &str = "session-affinity.enc.json";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Account {
@@ -50,6 +53,20 @@ pub(super) struct Record {
 pub(super) struct Accounts {
     pub accounts: Vec<Record>,
     pub active_account_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct StoredSessionPin {
+    pub key: String,
+    pub account_id: String,
+    pub touched_at: i64,
+    pub version: u64,
+    pub migrated: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct StoredSessionPins {
+    pub pins: Vec<StoredSessionPin>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -240,6 +257,84 @@ impl Vault {
         }
         result.map_err(|_| "Cannot atomically persist Codex credentials".into())
     }
+
+    pub fn load_session_pins(&self) -> Result<StoredSessionPins, String> {
+        let path = self.dir.join(SESSION_STORE);
+        let bytes = match private_read(&path, MAX_SESSION_STORE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StoredSessionPins::default())
+            }
+            Err(_) => return Err("Cannot read Codex session affinity store".into()),
+        };
+        let envelope: Envelope = serde_json::from_slice(&bytes)
+            .map_err(|_| "Invalid Codex session affinity envelope")?;
+        if envelope.version != 1 {
+            return Err("Unsupported Codex session affinity envelope version".into());
+        }
+        let nonce = STANDARD
+            .decode(envelope.nonce)
+            .map_err(|_| "Invalid Codex session affinity nonce")?;
+        if nonce.len() != 12 {
+            return Err("Invalid Codex session affinity nonce".into());
+        }
+        let ciphertext = STANDARD
+            .decode(envelope.ciphertext)
+            .map_err(|_| "Invalid Codex session affinity ciphertext")?;
+        let plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &ciphertext,
+                    aad: SESSION_AAD,
+                },
+            )
+            .map_err(|_| "Cannot decrypt Codex session affinity store")?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|_| "Invalid decrypted Codex session affinity data".into())
+    }
+
+    pub fn save_session_pins(&self, pins: &StoredSessionPins) -> Result<(), String> {
+        let plaintext =
+            serde_json::to_vec(pins).map_err(|_| "Cannot encode Codex session affinity data")?;
+        let mut nonce = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: SESSION_AAD,
+                },
+            )
+            .map_err(|_| "Cannot encrypt Codex session affinity data")?;
+        let bytes = serde_json::to_vec(&Envelope {
+            version: 1,
+            nonce: STANDARD.encode(nonce),
+            ciphertext: STANDARD.encode(ciphertext),
+        })
+        .map_err(|_| "Cannot encode Codex session affinity envelope")?;
+        if bytes.len() as u64 > MAX_SESSION_STORE_BYTES {
+            return Err("Codex session affinity store is full".into());
+        }
+        let temporary = self
+            .dir
+            .join(format!(".session-affinity-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = private_open(&temporary, true)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, self.dir.join(SESSION_STORE))?;
+            sync_directory(&self.dir)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|_| "Cannot atomically persist Codex session affinity".into())
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +388,26 @@ mod tests {
         envelope.ciphertext = STANDARD.encode(bytes);
         fs::write(file, serde_json::to_vec(&envelope).unwrap()).unwrap();
         assert!(Vault::open(temp.path().to_path_buf()).is_err());
+    }
+
+    #[test]
+    fn session_affinity_is_encrypted_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let (vault, _) = Vault::open(temp.path().to_path_buf()).unwrap();
+        let pins = StoredSessionPins {
+            pins: vec![StoredSessionPin {
+                key: "opaque-session-key".into(),
+                account_id: "account-id".into(),
+                touched_at: 123,
+                version: 7,
+                migrated: true,
+            }],
+        };
+        vault.save_session_pins(&pins).unwrap();
+        let path = temp.path().join("codex").join(SESSION_STORE);
+        let encrypted = fs::read_to_string(path).unwrap();
+        assert!(!encrypted.contains("opaque-session-key"));
+        assert!(!encrypted.contains("account-id"));
+        assert_eq!(vault.load_session_pins().unwrap(), pins);
     }
 }

@@ -2,6 +2,14 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## API Manager custom stability update (2026-09-15)
+
+Codex account affinity now survives process restarts in a dedicated encrypted `codex/session-affinity.enc.json` store. It reuses the account Vault key with distinct AAD and uses private permissions, a temporary file, `fsync`, and atomic replacement. Affinity no longer expires by age or uses the former 8,192-entry memory-cache ceiling. Session/cache/response/turn/item/call/encrypted-content identifiers retain both caller-scoped and API-key-independent global keys. A missing or conflicting legacy continuation is rebound to an available account and permanently persisted instead of failing locally with HTTP 409.
+
+Selected upstream v4.7.2 fixes were ported without merging the release or changing this fork's version identity: Gemini thoughts use standard Responses reasoning-summary lifecycles across SSE and the custom WebSocket path; old `msg_thought_*` commentary sessions remain readable while new output uses `rs_*`; injected identities and global prompts are separated by double newlines, with exact-segment deduplication on Gemini retries; CLI Sync recognizes the actual `apikey.fun` and `apikey.fan` hosts and subdomains without matching path text or hostile suffixes. The upstream live data-directory copy/delete implementation was intentionally not imported.
+
+Verification covered all 744 Rust library tests, focused affected-module suites, the production frontend build, and a Linux x86_64 release build. An isolated gateway created a real Codex tool call, fully stopped and released its port, then loaded affinity in a new process and accepted the tool output with HTTP 200. Production replayed the screenshot session's original request with the client's actual Codex user token, recovering the prior 409 to `response.completed`; the same request remained HTTP 200 after another production service restart. A live Gemini 3.8 stream emitted a standard reasoning item, 40 summary deltas, matching done events, and `response.completed`.
+
 ## API Manager v4.7.1 integration (2026-09-12)
 
 Integrated upstream v4.7.1 request-mode, quota, log-retention, and persistence improvements while preserving this fork's isolated Codex endpoints, unified console, and Gemini client system-envelope fix.

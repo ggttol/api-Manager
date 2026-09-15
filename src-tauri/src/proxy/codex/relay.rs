@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -12,68 +13,157 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use super::{auth, now, parse_json, scheduler, store::Record, CodexError, CodexManager};
+use super::{
+    auth, now, parse_json, scheduler,
+    store::{Record, StoredSessionPin, StoredSessionPins, Vault},
+    CodexError, CodexManager,
+};
 use crate::proxy::server::AppState;
 
-const MAX_SESSIONS: usize = 8192;
 pub(super) const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SESSION_TOUCH_PERSIST_INTERVAL: i64 = 5 * 60;
 const MAX_EVENT: usize = 32 * 1024 * 1024;
 pub(super) const MAX_COLLECTED: usize = 64 * 1024 * 1024;
 pub(super) const STREAM_IDLE: Duration = Duration::from_secs(300);
 
 struct Pin {
     account_id: String,
-    touched: Instant,
+    touched_at: i64,
+    persisted_touched_at: i64,
     version: u64,
     migrated: bool,
 }
-#[derive(Default)]
+
 pub(super) struct SessionCache {
     pins: HashMap<[u8; 32], Pin>,
     pub(super) anthropic_tools: super::anthropic::ToolCache,
     next_version: u64,
+    dirty: bool,
+}
+
+impl Default for SessionCache {
+    fn default() -> Self {
+        Self {
+            pins: HashMap::new(),
+            anthropic_tools: super::anthropic::ToolCache::default(),
+            next_version: 0,
+            dirty: false,
+        }
+    }
 }
 
 impl SessionCache {
+    pub(super) fn load(vault: &Vault) -> Result<Self, String> {
+        let stored = vault.load_session_pins()?;
+        let at = now();
+        let mut pins = HashMap::with_capacity(stored.pins.len());
+        let mut next_version = 0;
+        let mut normalized_timestamp = false;
+        for stored in stored.pins {
+            let decoded = STANDARD
+                .decode(stored.key.as_bytes())
+                .map_err(|_| "Invalid Codex session affinity key")?;
+            let key: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| "Invalid Codex session affinity key length")?;
+            if stored.account_id.is_empty() || stored.version == 0 {
+                return Err("Invalid Codex session affinity record".into());
+            }
+            let touched_at = stored.touched_at.min(at);
+            normalized_timestamp |= touched_at != stored.touched_at;
+            next_version = next_version.max(stored.version);
+            if pins
+                .insert(
+                    key,
+                    Pin {
+                        account_id: stored.account_id,
+                        touched_at,
+                        persisted_touched_at: touched_at,
+                        version: stored.version,
+                        migrated: stored.migrated,
+                    },
+                )
+                .is_some()
+            {
+                return Err("Duplicate Codex session affinity key".into());
+            }
+        }
+        let mut cache = Self {
+            pins,
+            anthropic_tools: super::anthropic::ToolCache::default(),
+            next_version,
+            dirty: normalized_timestamp,
+        };
+        cache.persist(vault)?;
+        Ok(cache)
+    }
+
+    fn persist(&mut self, vault: &Vault) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let mut pins: Vec<StoredSessionPin> = self
+            .pins
+            .iter()
+            .map(|(key, pin)| StoredSessionPin {
+                key: STANDARD.encode(key),
+                account_id: pin.account_id.clone(),
+                touched_at: pin.touched_at,
+                version: pin.version,
+                migrated: pin.migrated,
+            })
+            .collect();
+        pins.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        vault.save_session_pins(&StoredSessionPins { pins })?;
+        for pin in self.pins.values_mut() {
+            pin.persisted_touched_at = pin.touched_at;
+        }
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn touch(pin: &mut Pin) -> bool {
+        let at = now();
+        pin.touched_at = at;
+        at.saturating_sub(pin.persisted_touched_at) >= SESSION_TOUCH_PERSIST_INTERVAL
+    }
+
     fn prune(&mut self) {
-        self.pins
-            .retain(|_, pin| pin.touched.elapsed() < SESSION_TTL);
+        // Durable account affinity never expires. Only protocol-specific
+        // ephemeral tool payload caches retain their bounded lifecycle.
         self.anthropic_tools.prune();
     }
+
     fn lookup(&mut self, key: &[u8; 32]) -> Option<String> {
-        self.pins.get_mut(key).map(|pin| {
-            pin.touched = Instant::now();
-            pin.account_id.clone()
-        })
+        let pin = self.pins.get_mut(key)?;
+        self.dirty |= Self::touch(pin);
+        Some(pin.account_id.clone())
     }
+
     fn bind(&mut self, key: [u8; 32], account_id: &str) -> Result<(), CodexError> {
         if let Some(pin) = self.pins.get_mut(&key) {
             if pin.account_id != account_id {
                 return Err(CodexError::new(StatusCode::CONFLICT, "Conflicting Codex session account; do not mix conversations from different accounts"));
             }
-            pin.touched = Instant::now();
+            self.dirty |= Self::touch(pin);
             return Ok(());
         }
-        // Never evict a still-live session: fail explicitly rather than silently losing account affinity.
-        self.prune();
-        if self.pins.len() >= MAX_SESSIONS {
-            return Err(CodexError::unavailable(
-                "Codex session cache is full; wait for inactive sessions to expire",
-            ));
-        }
+        // Durable affinity is never evicted by age or an arbitrary entry count.
         self.next_version += 1;
         self.pins.insert(
             key,
             Pin {
                 account_id: account_id.to_string(),
-                touched: Instant::now(),
+                touched_at: now(),
+                persisted_touched_at: 0,
                 version: self.next_version,
                 migrated: false,
             },
         );
+        self.dirty = true;
         Ok(())
     }
 
@@ -82,15 +172,6 @@ impl SessionCache {
         keys: &[[u8; 32]],
         account: &str,
     ) -> Result<Vec<([u8; 32], u64)>, CodexError> {
-        let new_keys = keys
-            .iter()
-            .filter(|key| !self.pins.contains_key(*key))
-            .count();
-        if self.pins.len() + new_keys > MAX_SESSIONS {
-            return Err(CodexError::unavailable(
-                "Codex session cache is full; wait for inactive sessions to expire",
-            ));
-        }
         let mut result = Vec::with_capacity(keys.len());
         let migrated = keys.iter().any(|key| {
             self.pins
@@ -103,13 +184,15 @@ impl SessionCache {
                 *key,
                 Pin {
                     account_id: account.to_string(),
-                    touched: Instant::now(),
+                    touched_at: now(),
+                    persisted_touched_at: 0,
                     version: self.next_version,
                     migrated,
                 },
             );
             result.push((*key, self.next_version));
         }
+        self.dirty = true;
         Ok(result)
     }
 }
@@ -158,6 +241,9 @@ impl Selection {
             self.keys = sessions.aliases(&keys, &next)?;
             self.id = next;
         }
+        sessions
+            .persist(&manager.vault)
+            .map_err(CodexError::storage)?;
         Ok(())
     }
 }
@@ -193,6 +279,37 @@ pub(super) fn session_key(scope: &[u8; 32], kind: &str, id: &str) -> [u8; 32] {
     hash.update(id.as_bytes());
     hash.finalize().into()
 }
+
+fn global_session_key(kind: &str, id: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"global-affinity");
+    hash.update([0]);
+    hash.update(kind.as_bytes());
+    hash.update([0]);
+    hash.update(id.as_bytes());
+    hash.finalize().into()
+}
+
+fn affinity_keys(scope: &[u8; 32], kind: &str, id: &str) -> [[u8; 32]; 2] {
+    [session_key(scope, kind, id), global_session_key(kind, id)]
+}
+
+fn push_affinity_keys(keys: &mut Vec<[u8; 32]>, scope: &[u8; 32], kind: &str, id: &str) {
+    keys.extend(affinity_keys(scope, kind, id));
+}
+
+fn bind_affinity(
+    sessions: &mut SessionCache,
+    scope: &[u8; 32],
+    kind: &str,
+    id: &str,
+    account_id: &str,
+) -> Result<(), CodexError> {
+    for key in affinity_keys(scope, kind, id) {
+        sessions.bind(key, account_id)?;
+    }
+    Ok(())
+}
 fn scoped_id(scope: &[u8; 32], kind: &str, id: &str) -> String {
     let key = session_key(scope, kind, id);
     let mut bytes = [0u8; 16];
@@ -215,7 +332,7 @@ fn identifiers(
                 return Err(CodexError::bad_request("Invalid Codex session identifier"));
             }
             // Different header spellings describing the same session deliberately share a namespace.
-            result.push(session_key(scope, "session", value));
+            push_affinity_keys(&mut result, scope, "session", value);
         }
     }
     for (field, kind) in [
@@ -229,7 +346,7 @@ fn identifiers(
                 .ok_or_else(|| {
                     CodexError::bad_request("Invalid Codex cache or response identifier")
                 })?;
-            result.push(session_key(scope, kind, value));
+            push_affinity_keys(&mut result, scope, kind, value);
         }
     }
     result.sort_unstable();
@@ -270,7 +387,7 @@ fn private_identifiers(headers: &HeaderMap, body: &Value, scope: &[u8; 32]) -> V
         .get("x-codex-turn-state")
         .and_then(|value| value.to_str().ok())
     {
-        keys.push(session_key(scope, "turn", turn));
+        push_affinity_keys(&mut keys, scope, "turn", turn);
     }
     if let Some(items) = body.get("input").and_then(Value::as_array) {
         for item in items {
@@ -295,10 +412,12 @@ fn private_identifiers(headers: &HeaderMap, body: &Value, scope: &[u8; 32]) -> V
                     }
                 };
             if let Some((kind, value)) = identity {
-                keys.push(session_key(scope, kind, value));
+                push_affinity_keys(&mut keys, scope, kind, value);
             }
         }
     }
+    keys.sort_unstable();
+    keys.dedup();
     keys
 }
 
@@ -353,8 +472,8 @@ pub(super) async fn select_account(
     select_account_inner(manager, headers, body, scope, None, false).await
 }
 
-// Only the Messages mapper may opt into self-contained tool replay. Native Responses retains
-// its strict continuation guard, including for arbitrary function_call_output input.
+// Only the Messages mapper may opt into self-contained tool replay. Native Responses
+// persistently recovers missing account affinity before forwarding private state.
 pub(super) async fn select_messages_account(
     manager: &CodexManager,
     headers: &HeaderMap,
@@ -373,7 +492,7 @@ async fn select_account_inner(
     tool_account: Option<String>,
     self_contained_messages: bool,
 ) -> Result<Selection, CodexError> {
-    let keys = identifiers(headers, body, scope)?;
+    let mut keys = identifiers(headers, body, scope)?;
     let private_keys = private_identifiers(
         headers,
         if self_contained_messages {
@@ -396,42 +515,28 @@ async fn select_account_inner(
     let migrated = keys
         .iter()
         .any(|key| sessions.pins.get(key).is_some_and(|pin| pin.migrated));
-    let immutable_origin = tool_account.is_some()
-        || body
-            .get("previous_response_id")
-            .is_some_and(|value| !value.is_null());
-    if migrated
-        && !portable
-        && ((private_keys.is_empty() && !immutable_origin)
-            || private_keys
-                .iter()
-                .any(|key| !sessions.pins.contains_key(key)))
-    {
-        return Err(CodexError::new(StatusCode::CONFLICT,
-            "Codex private state has no verified issuer after this session changed accounts; restart with full plain-text input"));
-    }
     let mut pinned = tool_account;
+    let mut conflicting_affinity = false;
     for key in keys.iter().chain(&private_keys) {
         if let Some(id) = sessions.lookup(key) {
             if pinned.as_ref().is_some_and(|pinned| pinned != &id) {
-                return Err(CodexError::new(
-                    StatusCode::CONFLICT,
-                    "Codex request references sessions belonging to different accounts",
-                ));
+                conflicting_affinity = true;
+                continue;
             }
             pinned = Some(id);
         }
     }
-    if let Some(previous) = body.get("previous_response_id").and_then(Value::as_str) {
-        if sessions
-            .lookup(&session_key(scope, "response", previous))
-            .is_none()
-        {
-            return Err(CodexError::new(StatusCode::CONFLICT, "Unknown or expired Codex previous_response_id; restart the conversation with full input"));
-        }
-    }
-    if pinned.is_none() && continuation(headers, body) && !self_contained_messages {
-        return Err(CodexError::new(StatusCode::CONFLICT, "Codex continuation has no known account affinity; restart the conversation with a new session ID"));
+    let recovering_affinity = conflicting_affinity
+        || (pinned.is_none() && continuation(headers, body) && !self_contained_messages);
+    if recovering_affinity {
+        tracing::warn!(
+            conflicting_affinity,
+            private_identifiers = private_keys.len(),
+            "Recovering Codex continuation affinity onto an available account"
+        );
+        keys.extend(private_keys.iter().copied());
+        keys.sort_unstable();
+        keys.dedup();
     }
     let id = if let Some(id) = pinned {
         let record = inner.accounts.accounts.iter().find(|record| record.account.id == id)
@@ -449,15 +554,6 @@ async fn select_account_inner(
         scheduler::select(&inner.accounts, &HashSet::new(), now())?
     };
     // Preserve versions for unchanged pins, so concurrent same-account requests do not conflict.
-    let new_keys = keys
-        .iter()
-        .filter(|key| !sessions.pins.contains_key(*key))
-        .count();
-    if sessions.pins.len() + new_keys > MAX_SESSIONS {
-        return Err(CodexError::unavailable(
-            "Codex session cache is full; wait for inactive sessions to expire",
-        ));
-    }
     let rebind = keys.iter().any(|key| {
         sessions
             .pins
@@ -477,10 +573,16 @@ async fn select_account_inner(
                     .migrated = true;
             }
         }
+        if migrated {
+            sessions.dirty = true;
+        }
         keys.into_iter()
             .map(|key| (key, sessions.pins[&key].version))
             .collect()
     };
+    sessions
+        .persist(&manager.vault)
+        .map_err(CodexError::storage)?;
     Ok(Selection { id, keys, portable })
 }
 
@@ -823,11 +925,11 @@ async fn forward_inner(
         .get("x-codex-turn-state")
         .and_then(|value| value.to_str().ok())
     {
-        manager
-            .sessions
-            .lock()
-            .await
-            .bind(session_key(&scope, "turn", turn), &id)?;
+        let mut sessions = manager.sessions.lock().await;
+        bind_affinity(&mut sessions, &scope, "turn", turn, &id)?;
+        sessions
+            .persist(&manager.vault)
+            .map_err(CodexError::storage)?;
     }
     {
         let mut inner = manager.inner.lock().await;
@@ -898,8 +1000,12 @@ async fn forward_inner(
                     remember_response(&stream_manager, &scope, &id, response).await.map_err(|error| std::io::Error::other(error.message))?;
                 }
                 if let Some(item) = event.get("item") {
-                    remember_item(&mut *stream_manager.sessions.lock().await, &scope, &id, item)
+                    let mut sessions = stream_manager.sessions.lock().await;
+                    remember_item(&mut sessions, &scope, &id, item)
                         .map_err(|error| std::io::Error::other(error.message))?;
+                    sessions
+                        .persist(&stream_manager.vault)
+                        .map_err(std::io::Error::other)?;
                 }
                 terminal |= matches!(event.get("type").and_then(Value::as_str), Some("response.completed" | "response.incomplete" | "response.failed" | "error"));
             }
@@ -969,13 +1075,16 @@ pub(super) async fn remember_response(
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty() && id.len() <= 512)
     {
-        sessions.bind(session_key(scope, "response", id), account_id)?;
+        bind_affinity(&mut sessions, scope, "response", id, account_id)?;
     }
     if let Some(items) = response.get("output").and_then(Value::as_array) {
         for item in items {
             remember_item(&mut sessions, scope, account_id, item)?;
         }
     }
+    sessions
+        .persist(&manager.vault)
+        .map_err(CodexError::storage)?;
     Ok(())
 }
 
@@ -995,7 +1104,7 @@ fn remember_item(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
         {
-            sessions.bind(session_key(scope, kind, value), account_id)?;
+            bind_affinity(sessions, scope, kind, value, account_id)?;
         }
     }
     Ok(())
@@ -1137,7 +1246,11 @@ pub(super) async fn collect_response(
             }
             observe_terminal_event(manager, account_id, &event).await?;
             if let Some(item) = event.get("item") {
-                remember_item(&mut *manager.sessions.lock().await, scope, account_id, item)?;
+                let mut sessions = manager.sessions.lock().await;
+                remember_item(&mut sessions, scope, account_id, item)?;
+                sessions
+                    .persist(&manager.vault)
+                    .map_err(CodexError::storage)?;
             }
             match event.get("type").and_then(Value::as_str) {
                 Some("response.output_item.done") => {
@@ -1448,6 +1561,126 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_affinity_survives_manager_restart() {
+        let fixture = Fixture::new(Vec::new()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer gateway-key-a"),
+        );
+        headers.insert("session_id", HeaderValue::from_static("durable-session"));
+        let caller_scope = scope(&headers);
+        let first_request = json!({
+            "model": "native-model",
+            "prompt_cache_key": "durable-cache",
+            "input": "hello"
+        });
+        let selected = select_account(&fixture.manager, &headers, &first_request, &caller_scope)
+            .await
+            .unwrap();
+        assert_eq!(selected.id, fixture.first);
+        remember_response(
+            &fixture.manager,
+            &caller_scope,
+            &selected.id,
+            &json!({
+                "id": "resp-durable",
+                "output": [{
+                    "type": "reasoning",
+                    "id": "rs-durable",
+                    "encrypted_content": "opaque-private-state",
+                    "summary": []
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+        {
+            let mut inner = fixture.manager.inner.lock().await;
+            inner.accounts.active_account_id = Some(fixture.second.clone());
+            fixture.manager.vault.save(&inner.accounts).unwrap();
+        }
+        let restarted = CodexManager::new(fixture.temp.path().to_path_buf(), None).unwrap();
+        let continuation = json!({
+            "model": "native-model",
+            "prompt_cache_key": "durable-cache",
+            "previous_response_id": "resp-durable",
+            "input": [{
+                "type": "reasoning",
+                "id": "rs-durable",
+                "encrypted_content": "opaque-private-state",
+                "summary": []
+            }]
+        });
+        let mut continuation_headers = headers.clone();
+        continuation_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer gateway-key-b"),
+        );
+        let continuation_scope = scope(&continuation_headers);
+        let restored = select_account(
+            &restarted,
+            &continuation_headers,
+            &continuation,
+            &continuation_scope,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.id, selected.id);
+    }
+
+    #[tokio::test]
+    async fn missing_affinity_recovers_and_never_expires() {
+        let fixture = Fixture::new(Vec::new()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer original-key"),
+        );
+        headers.insert("session_id", HeaderValue::from_static("unbounded-session"));
+        let caller_scope = scope(&headers);
+        let continuation = json!({
+            "model": "native-model",
+            "prompt_cache_key": "previously-unseen-cache",
+            "input": [{
+                "type": "reasoning",
+                "id": "rs-unbounded",
+                "encrypted_content": "old-private-state",
+                "summary": []
+            }]
+        });
+
+        let recovered = select_account(&fixture.manager, &headers, &continuation, &caller_scope)
+            .await
+            .unwrap();
+        assert_eq!(recovered.id, fixture.first);
+
+        let mut stored = fixture.manager.vault.load_session_pins().unwrap();
+        for pin in &mut stored.pins {
+            pin.touched_at = now() - 10 * 365 * 24 * 60 * 60;
+        }
+        fixture.manager.vault.save_session_pins(&stored).unwrap();
+        {
+            let mut inner = fixture.manager.inner.lock().await;
+            inner.accounts.active_account_id = Some(fixture.second.clone());
+            fixture.manager.vault.save(&inner.accounts).unwrap();
+        }
+
+        let restarted = CodexManager::new(fixture.temp.path().to_path_buf(), None).unwrap();
+        let mut new_headers = headers;
+        new_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer replacement-key"),
+        );
+        let new_scope = scope(&new_headers);
+        let restored = select_account(&restarted, &new_headers, &continuation, &new_scope)
+            .await
+            .unwrap();
+        assert_eq!(restored.id, fixture.first);
+    }
+
+    #[tokio::test]
     async fn all_accounts_exhausted_return_earliest_retry_after_without_replay() {
         let first_reset = now() + 180;
         let second_reset = now() + 90;
@@ -1501,7 +1734,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn quota_migration_preserves_native_private_state_issuers() {
+    async fn quota_migration_recovers_native_private_state_without_local_conflict() {
         let mut first = Reply::ok("resp-before");
         let mut value: Value = serde_json::from_str(&first.body).unwrap();
         value["output"] = json!([
@@ -1523,7 +1756,7 @@ pub(super) mod tests {
             .headers
             .insert("x-codex-turn-state", HeaderValue::from_static("turn-B"));
         let mut replies = vec![first, Reply::quota(now() + 120), second];
-        replies.extend((0..5).map(|_| Reply::ok("resp-continuation")));
+        replies.extend((0..11).map(|_| Reply::ok("resp-continuation")));
         let fixture = Fixture::new(replies).await;
         let mut headers = HeaderMap::new();
         headers.insert("session_id", HeaderValue::from_static("migrating-session"));
@@ -1554,11 +1787,14 @@ pub(super) mod tests {
             }
             let response = fixture.responses(headers,
                 json!({"model":"native","input":if input.is_null() {json!("continue")} else {input}}), false).await;
-            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["x-account-email"],
+                fixture.second.as_str()
+            );
         }
-        assert_eq!(fixture.calls.lock().await.len(), 3);
-        // New state really issued by B remains usable; do not simply reject all private
-        // continuations after failover, which would break the next native CLI turn.
+        assert_eq!(fixture.calls.lock().await.len(), 9);
+        // New state issued by B remains usable after the recovered old state.
         for input in [
             json!([{"type":"reasoning","encrypted_content":"encrypted-B"}]),
             json!([{"type":"compaction","encrypted_content":"encrypted-B"}]),
@@ -1578,7 +1814,7 @@ pub(super) mod tests {
                 fixture.second.as_str()
             );
         }
-        assert_eq!(fixture.calls.lock().await.len(), 8);
+        assert_eq!(fixture.calls.lock().await.len(), 14);
     }
 
     #[tokio::test]
@@ -1901,7 +2137,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_account_dependent_state_still_conflicts() {
+    async fn unbound_account_dependent_state_requires_an_available_account() {
         let temp = tempfile::tempdir().unwrap();
         let manager = CodexManager::new(temp.path().to_path_buf(), None).unwrap();
         let mut headers = HeaderMap::new();
@@ -1915,13 +2151,13 @@ pub(super) mod tests {
             let error = select_account(&manager, &headers, &body, &scope(&headers))
                 .await
                 .unwrap_err();
-            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         }
         headers.insert("x-codex-turn-state", HeaderValue::from_static("opaque"));
         let error = select_account(&manager, &headers, &json!({}), &scope(&headers))
             .await
             .unwrap_err();
-        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
