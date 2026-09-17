@@ -757,7 +757,7 @@ function Accounts() {
   };
 
   return (
-    <div className="console-page console-page-fixed overflow-y-auto">
+    <div className="console-page console-page-scroll h-full space-y-5">
       <input
         ref={fileInputRef}
         type="file"
@@ -830,9 +830,9 @@ function Accounts() {
 
 
       {/* 账号列表内容区域 */}
-      <div className="flex-1 min-h-64 min-w-0 w-full relative" ref={containerRef}>
+      <div className="min-w-0 w-full relative" ref={containerRef}>
         {viewMode === "list" ? (
-          <div className="h-full bg-white dark:bg-base-100 rounded-2xl shadow-sm border border-gray-100 dark:border-base-200 flex flex-col overflow-hidden">
+          <div className="bg-white dark:bg-base-100 rounded-2xl shadow-sm border border-gray-100 dark:border-base-200 overflow-hidden">
             <div className="flex-1 min-w-0 overflow-auto">
               <AccountTable
                 accounts={paginatedAccounts}
@@ -863,7 +863,7 @@ function Accounts() {
             </div>
           </div>
         ) : (
-          <div className="h-full overflow-y-auto">
+          <div>
             <AccountGrid
               accounts={paginatedAccounts}
               selectedIds={selectedIds}
@@ -894,7 +894,7 @@ function Accounts() {
 
       {/* 极简分页 - 无边框浮动样式 */}
       {filteredAccounts.length > 0 && (
-        <div className="flex-none">
+        <div>
           <Pagination
             currentPage={currentPage}
             totalPages={totalPages}

@@ -637,7 +637,7 @@ function AccountRowContent({
                 <div className="flex flex-wrap items-center justify-center gap-2 min-w-40 mx-auto" onClick={event => event.stopPropagation()}>
                     <button className="console-button" onClick={onViewDetails}><Info size={15} />{t('common.details')}</button>
                     <button className="console-button" onClick={onRefresh} disabled={isRefreshing || isDisabled} title={isDisabled ? t('accounts.disabled_tooltip') : undefined}><RefreshCw size={15} className={isRefreshing ? 'animate-spin' : ''} />{t('common.refresh')}</button>
-                    <details className="w-full text-left">
+                    <details className="w-full text-center">
                         <summary className="console-button cursor-pointer justify-center">{t('console.more_actions', { defaultValue: i18n.language.startsWith('zh') ? '更多操作' : 'More actions' })}</summary>
                         <div className="mt-2 flex flex-col gap-1 rounded-lg bg-[var(--console-surface-muted)] p-2">
                             <button className="console-button justify-start" onClick={() => onSwitch()} disabled={isSwitching || isDisabled}><ArrowRightLeft size={15} />{t('console.switch_classic', { defaultValue: i18n.language.startsWith('zh') ? '切换到 Antigravity 经典版' : 'Switch to Antigravity Classic' })}</button>
