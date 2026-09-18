@@ -16,6 +16,9 @@ pub(super) const MODELS_URL: &str =
     "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0";
 pub(super) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(super) const JSON_LIMIT: usize = 8 * 1024 * 1024;
+const VERIFY_ATTEMPTS: usize = 2;
+const VERIFY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+const VERIFY_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Tokens {
@@ -215,7 +218,7 @@ pub(super) async fn json_body(response: Response) -> Result<Value, CodexError> {
 pub(super) fn authorized(
     client: &Client,
     method: reqwest::Method,
-    url: &'static str,
+    url: &str,
     tokens: &Tokens,
 ) -> reqwest::RequestBuilder {
     client
@@ -286,13 +289,59 @@ pub(super) async fn refresh(client: &Client, old: &Tokens) -> Result<Tokens, Cod
 }
 
 pub(super) async fn verify(client: &Client, tokens: &Tokens) -> Result<Value, CodexError> {
-    let response = authorized(client, reqwest::Method::GET, USAGE_URL, tokens)
-        .timeout(Duration::from_secs(45))
-        .send()
-        .await
-        .map_err(|_| {
-            CodexError::upstream("Unable to reach ChatGPT to verify subscription credentials")
-        })?;
+    verify_at(client, tokens, USAGE_URL).await
+}
+
+async fn verify_at(client: &Client, tokens: &Tokens, url: &str) -> Result<Value, CodexError> {
+    let mut response = None;
+    for attempt in 1..=VERIFY_ATTEMPTS {
+        match authorized(client, reqwest::Method::GET, url, tokens)
+            .timeout(VERIFY_ATTEMPT_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(candidate)
+                if matches!(
+                    candidate.status(),
+                    reqwest::StatusCode::BAD_GATEWAY
+                        | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                        | reqwest::StatusCode::GATEWAY_TIMEOUT
+                ) && attempt < VERIFY_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    attempt,
+                    status = %candidate.status(),
+                    "[Codex] ChatGPT subscription verification returned a transient status; retrying"
+                );
+            }
+            Ok(candidate) => {
+                response = Some(candidate);
+                break;
+            }
+            Err(error) if attempt < VERIFY_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    error = %error,
+                    "[Codex] ChatGPT subscription verification transport failed; retrying"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    attempts = VERIFY_ATTEMPTS,
+                    error = %error,
+                    "[Codex] ChatGPT subscription verification transport failed"
+                );
+                return Err(CodexError::upstream(
+                    "Unable to reach ChatGPT to verify subscription credentials",
+                ));
+            }
+        }
+        tokio::time::sleep(VERIFY_RETRY_DELAY).await;
+    }
+
+    let response = response.ok_or_else(|| {
+        CodexError::upstream("Unable to reach ChatGPT to verify subscription credentials")
+    })?;
     let status = response.status();
     if !status.is_success() {
         return Err(CodexError::upstream_status(
@@ -426,4 +475,61 @@ pub(super) async fn poll_device(
     let value = json_body(response).await?;
     let tokens = Tokens::from_auth_json(&json!({"tokens": value}))?;
     Ok(Some(tokens))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{verify_at, Tokens};
+    use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn verification_retries_a_transient_upstream_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let observed = observed.clone();
+                async move {
+                    if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    Json(json!({
+                        "account_id": "workspace",
+                        "rate_limit": {"allowed": true}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tokens = Tokens {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            id_token: "identity".into(),
+            account_id: "workspace".into(),
+            refreshed_at: 0,
+        };
+
+        let usage = verify_at(
+            &reqwest::Client::new(),
+            &tokens,
+            &format!("http://{address}/usage"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(usage["rate_limit"]["allowed"], true);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
 }
