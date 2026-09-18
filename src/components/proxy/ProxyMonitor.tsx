@@ -155,7 +155,6 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const [accountFilter, setAccountFilter] = useState('');
     const [reloadSequence, setReloadSequence] = useState(0);
     const [knownAccounts, setKnownAccounts] = useState<string[]>([]);
-    const [accountsLoadError, setAccountsLoadError] = useState(false);
     const dataGeneration = useRef(0);
     const detailGeneration = useRef(0);
     const dataLoading = useRef(false);
@@ -312,7 +311,6 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     useEffect(() => {
         const controller = new AbortController();
         let active = true;
-        setAccountsLoadError(false);
         void Promise.all([
             invoke<string[]>('get_proxy_log_accounts', undefined, { signal: controller.signal }),
             isTauri()
@@ -323,7 +321,6 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             if (active) setKnownAccounts([...history, ...codex.accounts.map(account => account.email ?? account.id)]);
         }).catch(error => {
             if (active) {
-                setAccountsLoadError(true);
                 console.error('Failed to load log account options', error);
             }
         });
@@ -495,7 +492,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                     {(filter || accountFilter) && <button onClick={() => { setFilter(''); setAccountFilter(''); setCurrentPage(1); }} className="console-button"> {t('monitor.filters.reset')} </button>}
                 </div>
             </div>
-            {(loadError || accountsLoadError || actionError) && <div role="alert" className="p-4 text-sm text-error">{actionError || t('common.load_failed')}</div>}
+            {(loadError || actionError) && <div role="alert" className="p-4 text-sm text-error">{actionError || t('common.load_failed')}</div>}
 
             <LogTable
                 logs={logs}
