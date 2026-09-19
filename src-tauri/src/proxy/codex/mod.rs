@@ -257,8 +257,9 @@ impl CodexManager {
         if record.tokens.access_token != snapshot.tokens.access_token {
             return Ok(());
         }
-        // An older admin lookup must not clear a quota failure observed while it was in flight.
-        let may_recover = record.quota_version == snapshot.quota_version;
+        // An older admin lookup must not clear a quota or connection failure observed in flight.
+        let may_recover = record.quota_version == snapshot.quota_version
+            && record.account.last_error == snapshot.account.last_error;
         let observation = scheduler::usage(value, now());
         let exhausted = matches!(&observation, scheduler::Usage::Exhausted(_));
         let before = (

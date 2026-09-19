@@ -274,12 +274,14 @@ pub(super) fn apply_usage(account: &mut Account, observation: Usage, now: i64, m
             },
             now,
         ),
-        Usage::Available
-            if may_recover && account.cooldown_reason.as_deref() == Some("quota_exhausted") =>
-        {
-            account.cooldown_until = None;
-            account.cooldown_reason = None;
-            account.last_error = None;
+        Usage::Available if may_recover => {
+            if account.cooldown_reason.as_deref() == Some("quota_exhausted") {
+                account.cooldown_until = None;
+                account.cooldown_reason = None;
+            }
+            if account.cooldown_reason.is_none() {
+                account.last_error = None;
+            }
         }
         _ => {}
     }
@@ -368,5 +370,35 @@ mod tests {
         };
         assert_eq!(account.cooldown_until, Some(now + 240));
         assert_eq!(account.cooldown_reason.as_deref(), Some("rate_limited"));
+    }
+
+    #[test]
+    fn successful_usage_clears_only_recoverable_account_errors() {
+        let now = 1_800_000_000;
+        let mut account = Account {
+            id: "account".into(),
+            email: None,
+            label: "account".into(),
+            plan_type: None,
+            enabled: true,
+            expires_at: None,
+            last_used_at: None,
+            last_error: Some("Unable to reach ChatGPT".into()),
+            cooldown_until: None,
+            cooldown_reason: None,
+        };
+        apply_usage(&mut account, Usage::Available, now, true);
+        assert_eq!(account.last_error, None);
+
+        account.last_error = Some("newer failure".into());
+        apply_usage(&mut account, Usage::Available, now, false);
+        assert_eq!(account.last_error.as_deref(), Some("newer failure"));
+
+        account.cooldown_until = Some(now + 60);
+        account.cooldown_reason = Some("rate_limited".into());
+        apply_usage(&mut account, Usage::Available, now, true);
+        assert_eq!(account.cooldown_until, Some(now + 60));
+        assert_eq!(account.cooldown_reason.as_deref(), Some("rate_limited"));
+        assert_eq!(account.last_error.as_deref(), Some("newer failure"));
     }
 }
