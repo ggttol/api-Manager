@@ -16,7 +16,6 @@ use crate::proxy::debug_logger;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
 const MAX_INPUT_IMAGES: usize = 16;
 const MAX_OUTPUT_IMAGES: usize = 10;
 const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -34,6 +33,51 @@ use std::collections::VecDeque;
 use std::io;
 use tokio::task::JoinSet;
 use tokio::time::Duration;
+
+fn image_retry_strategy(
+    retry_state: &mut RequestRetryState,
+    account_id: &str,
+    status_code: u16,
+    error_text: &str,
+    retry_after: Option<&str>,
+    attempt: usize,
+    pool_size: usize,
+) -> Option<RetryStrategy> {
+    matches!(status_code, 429 | 503 | 529).then(|| {
+        retry_state.determine_strategy_adaptive(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            false,
+            attempt,
+            pool_size,
+        )
+    })
+}
+
+#[cfg(test)]
+mod image_retry_policy_tests {
+    use super::*;
+
+    #[test]
+    fn multi_account_image_retry_rotates_during_first_round() {
+        let mut state = RequestRetryState::default();
+        let strategy = image_retry_strategy(
+            &mut state,
+            "account-a",
+            429,
+            "RESOURCE_EXHAUSTED",
+            Some("20"),
+            0,
+            2,
+        );
+        assert!(matches!(
+            strategy,
+            Some(RetryStrategy::FixedDelay(delay)) if delay == Duration::from_millis(50)
+        ));
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NormalizedInputImage {
@@ -2093,7 +2137,8 @@ pub async fn handle_chat_completions(
     let request_timeout = state.request_timeout;
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    // Adaptive budget: single-account backoff or two complete pool rounds.
+    let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -2668,6 +2713,11 @@ pub async fn handle_chat_completions(
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        if status_code == 429 || status_code == 529 || status_code == 503 {
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id))
+                .await;
+        }
 
         // [New] 打印错误报文日志
         tracing::error!(
@@ -2724,13 +2774,15 @@ pub async fn handle_chat_completions(
             continue;
         }
 
-        // Determine retry strategy only after the bounded signature recovery transition.
-        let strategy = retry_state.determine_strategy(
+        // Adaptive strategy uses current attempt and pool size.
+        let strategy = retry_state.determine_strategy_adaptive(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
             retried_without_thinking,
+            attempt,
+            pool_size,
         );
         let should_mark_limited =
             status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500;
@@ -3871,7 +3923,7 @@ pub async fn handle_completions(
 
     let upstream = state.upstream.clone();
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -4596,6 +4648,11 @@ pub async fn handle_completions(
             .await
             .unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        if status_code == 429 || status_code == 529 || status_code == 503 {
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id_str))
+                .await;
+        }
 
         tracing::error!(
             "[Codex-Upstream] Error Response {}: {}",
@@ -4616,12 +4673,14 @@ pub async fn handle_completions(
                 .await;
         }
 
-        let strategy = retry_state.determine_strategy(
+        let strategy = retry_state.determine_strategy_adaptive(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
             false,
+            attempt,
+            pool_size,
         );
 
         // 执行退备
@@ -4950,15 +5009,13 @@ pub async fn handle_images_generations_internal(
         _ => {}
     }
     let contents_parts = build_image_contents(final_prompt, &input_images, None);
-
-    // 4. 并发发送请求
     // 注意：不再在外部获取 Token，而是移入 Task 内部并在重试时获取
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager.clone();
     let image_scheduler = state.image_scheduler.clone();
     let request_timeout = state.request_timeout;
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(max_pool_size).max(1);
+    let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(max_pool_size);
 
     let mut tasks = JoinSet::new();
 
@@ -5090,18 +5147,17 @@ pub async fn handle_images_generations_internal(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
-                            let strategy = (status_code == 429).then(|| {
-                                retry_state.determine_strategy(
-                                    &account_id,
-                                    status_code,
-                                    &err_text,
-                                    retry_after.as_deref(),
-                                    false,
-                                )
-                            });
+                            let strategy = image_retry_strategy(
+                                &mut retry_state,
+                                &account_id,
+                                status_code,
+                                &err_text,
+                                retry_after.as_deref(),
+                                attempt,
+                                max_pool_size,
+                            );
                             // 429/500/503: mark limited before retry/rotation
-                            let should_mark_limited =
-                                status_code == 429 || status_code == 503 || status_code == 500;
+                            let should_mark_limited = matches!(status_code, 429 | 500 | 503 | 529);
                             let needs_quota_refresh = if should_mark_limited {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
@@ -5157,7 +5213,7 @@ pub async fn handle_images_generations_internal(
                                 }
                             }
 
-                            if status_code == 503 || status_code == 500 {
+                            if matches!(status_code, 500 | 503 | 529) {
                                 force_rotate = true;
                                 continue; // Retry loop
                             }
@@ -5488,7 +5544,7 @@ pub async fn handle_images_edits(
     let image_scheduler = state.image_scheduler.clone();
     let request_timeout = state.request_timeout;
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(max_pool_size).max(1);
+    let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(max_pool_size);
 
     let mut tasks = JoinSet::new();
     for _ in 0..n {
@@ -5584,18 +5640,17 @@ pub async fn handle_images_edits(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
-                            let strategy = (status_code == 429).then(|| {
-                                retry_state.determine_strategy(
-                                    &account_id,
-                                    status_code,
-                                    &err_text,
-                                    retry_after.as_deref(),
-                                    false,
-                                )
-                            });
+                            let strategy = image_retry_strategy(
+                                &mut retry_state,
+                                &account_id,
+                                status_code,
+                                &err_text,
+                                retry_after.as_deref(),
+                                attempt,
+                                max_pool_size,
+                            );
                             // 429/500/503 等错误进行标记和重试
-                            let should_mark_limited =
-                                status_code == 429 || status_code == 503 || status_code == 500;
+                            let should_mark_limited = matches!(status_code, 429 | 500 | 503 | 529);
                             let needs_quota_refresh = if should_mark_limited {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
@@ -5651,7 +5706,7 @@ pub async fn handle_images_edits(
                                 }
                             }
 
-                            if status_code == 503 || status_code == 500 {
+                            if matches!(status_code, 500 | 503 | 529) {
                                 continue; // Retry loop
                             }
                             return Err((failure_statuses.final_status(), last_error));

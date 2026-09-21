@@ -51,8 +51,10 @@ export default function AccountErrorDialog({ account, onClose }: AccountErrorDia
     };
 
     const extractActionInfo = (raw: string): { url: string | null, label: string | null } => {
-        if (account.validation_url) {
-            return { url: account.validation_url, label: null };
+        const isSafeHttpUrl = (urlStr: string) => /^https?:\/\//i.test(urlStr.trim());
+
+        if (account.validation_url && isSafeHttpUrl(account.validation_url)) {
+            return { url: account.validation_url.trim(), label: null };
         }
 
         const trimmed = raw.trim();
@@ -69,11 +71,13 @@ export default function AccountErrorDialog({ account, onClose }: AccountErrorDia
                     const innerMeta = innerParsed?.error?.details?.[0]?.metadata;
                     url = innerMeta?.appeal_url || innerMeta?.validation_url;
                     label = innerMeta?.appeal_url_link_text || innerMeta?.validation_url_link_text;
-                } catch (_) { }
+                } catch { }
             }
 
-            if (url) return { url: String(url), label: label ? String(label) : null };
-        } catch (_) { }
+            if (url && isSafeHttpUrl(String(url))) {
+                return { url: String(url).trim(), label: label ? String(label) : null };
+            }
+        } catch { }
 
         // 最后降级到正则匹配
         const urlRegex = /https:\/\/[^\s"']+/g;
@@ -84,7 +88,9 @@ export default function AccountErrorDialog({ account, onClose }: AccountErrorDia
             if (extracted.endsWith(',')) {
                 extracted = extracted.slice(0, -1);
             }
-            return { url: extracted, label: null };
+            if (isSafeHttpUrl(extracted)) {
+                return { url: extracted.trim(), label: null };
+            }
         }
         return { url: null, label: null };
     };

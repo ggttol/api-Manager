@@ -50,6 +50,7 @@ import {
     ArrowDown,
 } from 'lucide-react';
 import type { Account, ModelQuota } from '../../types/account';
+import { getAccountTier, getTierLabel } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
@@ -168,8 +169,10 @@ function extractAccountResetTime(account: Account, quotaWindow?: '5h' | 'weekly'
     if (quotaWindow === 'weekly') {
         const groups = account.quota?.quota_groups || [];
         for (const group of groups) {
-            for (const bucket of group.buckets || []) {
-                const isWeekly = bucket.window.toLowerCase().includes('week') || bucket.bucket_id.toLowerCase().includes('week');
+            for (const bucket of (group?.buckets || []).filter(Boolean)) {
+                const window = String(bucket?.window || '').toLowerCase();
+                const bucketId = String(bucket?.bucket_id || '').toLowerCase();
+                const isWeekly = window.includes('week') || bucketId.includes('week');
                 if (isWeekly && bucket.reset_time) {
                     const t = new Date(bucket.reset_time).getTime();
                     if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
@@ -349,18 +352,23 @@ function AccountRowContent({
         }
     };
 
-    // 解析周配额项 (当处于 weekly 视图时)
     const weeklyItems = useMemo(() => {
         if (quotaWindow !== 'weekly') return [];
         return (account.quota?.quota_groups || []).flatMap(group => {
-            return group.buckets
-                .filter(b => b.window.toLowerCase().includes('week') || b.bucket_id.toLowerCase().includes('week'))
+            const buckets = (group?.buckets || []).filter(Boolean);
+            const groupName = group?.display_name || '';
+            return buckets
+                .filter(b => {
+                    const window = String(b?.window || '').toLowerCase();
+                    const bucketId = String(b?.bucket_id || '').toLowerCase();
+                    return window.includes('week') || bucketId.includes('week');
+                })
                 .map(b => {
-                    const shortGroupName = group.display_name
+                    const shortGroupName = groupName
                         .replace(/ models?$/i, '')
                         .replace(/Claude and GPT/i, 'Claude/GPT');
                     return {
-                        id: `${group.display_name}-${b.bucket_id}`,
+                        id: `${groupName}-${String(b?.bucket_id || '')}`,
                         label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
                         percentage: Math.round((b.remaining_fraction || 0) * 100),
                         resetTime: b.reset_time,
@@ -482,30 +490,24 @@ function AccountRowContent({
 
 
                         {/* 订阅类型徽章 */}
-                        {account.quota?.subscription_tier && (() => {
-                            const tier = account.quota.subscription_tier.toLowerCase();
-                            if (tier.includes('ultra')) {
-                                return (
-                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
-                                        <Gem className="w-2.5 h-2.5 fill-current" />
-                                        {t('accounts.ultra')}
-                                    </span>
-                                );
-                            } else if (tier.includes('pro')) {
-                                return (
-                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
-                                        <Diamond className="w-2.5 h-2.5 fill-current" />
-                                        {t('accounts.pro')}
-                                    </span>
-                                );
-                            } else {
-                                return (
-                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-600 dark:text-gray-400 text-[10px] font-bold shadow-sm border border-gray-200 dark:border-white/10 hover:bg-gray-200 transition-colors cursor-default">
-                                        <Circle className="w-2.5 h-2.5" />
-                                        {t('accounts.free')}
-                                    </span>
-                                );
-                            }
+                        {(() => {
+                            const tier = getAccountTier(account);
+                            return tier === 'ultra' ? (
+                                <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
+                                    <Gem className="w-2.5 h-2.5 fill-current" />
+                                    {getTierLabel(tier)}
+                                </span>
+                            ) : tier === 'pro' ? (
+                                <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
+                                    <Diamond className="w-2.5 h-2.5 fill-current" />
+                                    {getTierLabel(tier)}
+                                </span>
+                            ) : (
+                                <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-600 dark:text-gray-400 text-[10px] font-bold shadow-sm border border-gray-200 dark:border-white/10 hover:bg-gray-200 transition-colors cursor-default">
+                                    <Circle className="w-2.5 h-2.5" />
+                                    {getTierLabel(tier)}
+                                </span>
+                            );
                         })()}
                         {/* 自定义标签 */}
                         {account.custom_label && !isEditingLabel && (

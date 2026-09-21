@@ -21,8 +21,6 @@ use crate::proxy::session_manager::SessionManager;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
-
 fn response_has_inline_image_data(value: &Value) -> bool {
     let response = value.get("response").unwrap_or(value);
     response
@@ -226,7 +224,8 @@ pub async fn handle_generate(
     let request_timeout = state.request_timeout;
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    // Adaptive budget: single-account backoff or two complete pool rounds.
+    let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
@@ -947,10 +946,11 @@ pub async fn handle_generate(
                 }
             }
         }
-
-        // [FIX] 429 时立即解绑当前会话，确保换号重试与后续请求不会死锁在受限账号上
-        if status_code == 429 || status_code == 529 {
-            token_manager.clear_session_binding(&session_id);
+        // Clear sticky session and last-used marker before rotating away.
+        if status_code == 429 || status_code == 529 || status_code == 503 {
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id))
+                .await;
             tracing::debug!(
                 "[Gemini] Unbound session {} from account {} due to status {}",
                 session_id,
@@ -982,27 +982,31 @@ pub async fn handle_generate(
             continue;
         }
 
-        // 确定重试策略
-        let strategy = retry_state.determine_strategy(
+        // Adaptive strategy uses current attempt and account-pool size.
+        let strategy = retry_state.determine_strategy_adaptive(
             &account_id,
             status_code,
             &error_text,
             retry_after.as_deref(),
             retried_without_thinking,
+            attempt,
+            pool_size,
         );
-        let needs_quota_refresh = if config.request_type == "image_gen" && status_code == 429 {
-            token_manager
-                .mark_rate_limited_fast(
-                    &email,
-                    status_code,
-                    retry_after.as_deref(),
-                    &error_text,
-                    Some(&mapped_model),
-                )
-                .await
-        } else {
-            false
-        };
+        let needs_quota_refresh =
+            if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500
+            {
+                token_manager
+                    .mark_rate_limited_fast(
+                        &email,
+                        status_code,
+                        retry_after.as_deref(),
+                        &error_text,
+                        Some(&mapped_model),
+                    )
+                    .await
+            } else {
+                false
+            };
         if !matches!(&strategy, RetryStrategy::GraceRetry(_)) {
             drop(image_permit.take());
         }

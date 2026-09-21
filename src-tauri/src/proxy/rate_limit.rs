@@ -50,10 +50,10 @@ pub(crate) fn classify_rate_limit_reason(error_body: &str) -> RateLimitReason {
         "quota limit",
         "per day",
         "daily quota",
+        "credits",
     ]
     .iter()
     .any(|marker| body_lower.contains(marker));
-
     let parsed = serde_json::from_str::<serde_json::Value>(error_body).ok();
     let mut structured_reasons = parsed
         .as_ref()
@@ -105,7 +105,7 @@ pub(crate) fn classify_rate_limit_reason(error_body: &str) -> RateLimitReason {
     }
 }
 
-pub(crate) fn is_active_persisted_long_image_limit(
+pub(crate) fn is_active_persisted_long_limit(
     model_key: &str,
     status: &crate::models::account::LiveLimitStatus,
     now: i64,
@@ -114,17 +114,11 @@ pub(crate) fn is_active_persisted_long_image_limit(
         && status.reason == "QuotaExhausted"
         && status.until > now
         && status.until.saturating_sub(status.detected_at) > MAX_LOCKOUT_SECONDS as i64
-        && normalize_image_model_id(model_key).is_some()
+        && crate::proxy::common::model_mapping::normalize_to_standard_id(model_key).is_some()
         && status.message.as_deref().is_some_and(|message| {
             has_explicit_quota_exhausted(message)
                 && crate::proxy::upstream::retry::parse_retry_delay(message, None).is_some()
         })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LimitOrigin {
-    Http429,
-    QuotaObservation,
 }
 
 /// 限流信息
@@ -146,7 +140,13 @@ pub struct RateLimitInfo {
     /// None 表示账号级别限流,Some(model) 表示特定模型限流
     #[allow(dead_code)] // Used for model-level rate limiting
     pub model: Option<String>,
-    origin: LimitOrigin,
+}
+
+/// Official quota observations are independent from short-lived HTTP limits.
+struct QuotaBucketLimit {
+    observed_at: i64,
+    reset_time: Option<SystemTime>,
+    weekly: bool,
 }
 
 /// 失败计数过期时间：1小时（超过此时间未失败则重置计数）
@@ -155,14 +155,14 @@ const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
 /// 限流跟踪器
 pub struct RateLimitTracker {
     limits: DashMap<String, RateLimitInfo>,
-    /// 连续失败计数（用于智能指数退避），带时间戳用于自动过期
+    quota_limits: DashMap<(String, String), QuotaBucketLimit>,
     failure_counts: DashMap<String, (u32, SystemTime)>,
 }
-
 impl RateLimitTracker {
     pub fn new() -> Self {
         Self {
             limits: DashMap::new(),
+            quota_limits: DashMap::new(),
             failure_counts: DashMap::new(),
         }
     }
@@ -172,17 +172,19 @@ impl RateLimitTracker {
     /// - 模型级: "account_id:model_id"
     fn get_limit_key(&self, account_id: &str, model: Option<&str>) -> String {
         match model {
-            Some(m) if !m.is_empty() => format!("{}:{}", account_id, m),
+            Some(m) if !m.is_empty() => {
+                let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(m)
+                    .unwrap_or_else(|| m.to_string());
+                format!("{}:{}", account_id, normalized)
+            }
             _ => account_id.to_string(),
         }
     }
 
-    /// 获取账号剩余的等待时间(秒)
-    /// 支持检查账号级和模型级锁
-    pub fn get_remaining_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
+    /// Remaining transient HTTP limit for an account/model, excluding official quota windows.
+    pub fn get_transient_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
         let now = SystemTime::now();
         let mut longest = Duration::ZERO;
-
         let mut consider = |key: String| {
             if let Some(info) = self.limits.get(&key) {
                 if let Ok(remaining) = info.reset_time.duration_since(now) {
@@ -190,13 +192,10 @@ impl RateLimitTracker {
                 }
             }
         };
-
         consider(account_id.to_string());
         if let Some(model) = model {
             consider(self.get_limit_key(account_id, Some(model)));
         }
-
-        // A positive sub-second lock must remain unavailable until its deadline.
         if longest.is_zero() {
             0
         } else {
@@ -206,6 +205,62 @@ impl RateLimitTracker {
         }
     }
 
+    /// Remaining effective limit when every official quota window is enabled.
+    pub fn get_remaining_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
+        self.get_transient_wait(account_id, model)
+            .max(self.get_quota_wait(account_id, model, false))
+    }
+
+    pub fn get_quota_wait(&self, account_id: &str, model: Option<&str>, weekly_only: bool) -> u64 {
+        let model_key = model.map(|model| self.get_limit_key(account_id, Some(model)));
+        let prefix = format!("{}:", account_id);
+        let now = SystemTime::now();
+        self.quota_limits
+            .iter()
+            .filter(|entry| {
+                let key = entry.key().0.as_str();
+                let matches_scope = match &model_key {
+                    Some(model_key) => key == account_id || key == model_key.as_str(),
+                    None => key == account_id || key.starts_with(&prefix),
+                };
+                matches_scope && (!weekly_only || entry.value().weekly)
+            })
+            .filter_map(|entry| entry.value().reset_time?.duration_since(now).ok())
+            .map(|duration| duration.as_secs().max(1))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn sync_quota_bucket(
+        &self,
+        account_id: &str,
+        model: &str,
+        bucket_id: &str,
+        observed_at: i64,
+        exhausted_until: Option<SystemTime>,
+        weekly: bool,
+    ) {
+        let key = (
+            self.get_limit_key(account_id, Some(model)),
+            bucket_id.to_string(),
+        );
+        self.quota_limits
+            .entry(key)
+            .and_modify(|current| {
+                if observed_at > current.observed_at {
+                    *current = QuotaBucketLimit {
+                        observed_at,
+                        reset_time: exhausted_until,
+                        weekly,
+                    };
+                }
+            })
+            .or_insert(QuotaBucketLimit {
+                observed_at,
+                reset_time: exhausted_until,
+                weekly,
+            });
+    }
     /// 标记账号请求成功，重置连续失败计数
     ///
     /// 当账号成功完成请求后调用此方法，将其失败计数归零，
@@ -257,7 +312,6 @@ impl RateLimitTracker {
             detected_at: now,
             reason,
             model: model.clone(), // 🆕 支持模型级别限流
-            origin: LimitOrigin::Http429,
         };
 
         let key = self.get_limit_key(account_id, model.as_deref());
@@ -292,14 +346,16 @@ impl RateLimitTracker {
         self.set_lockout_until_with_cap(account_id, reset_time, reason, model, true);
     }
 
-    pub fn restore_persisted_long_image_limit(
+    pub fn restore_persisted_long_limit(
         &self,
         account_id: &str,
         reset_time: SystemTime,
         detected_at: SystemTime,
         model: &str,
     ) -> bool {
-        let Some(normalized_model) = normalize_image_model_id(model) else {
+        let Some(normalized_model) =
+            crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+        else {
             return false;
         };
         let now = SystemTime::now();
@@ -319,123 +375,10 @@ impl RateLimitTracker {
             detected_at,
             reason: RateLimitReason::QuotaExhausted,
             model: Some(normalized_model.clone()),
-            origin: LimitOrigin::Http429,
         };
         let key = self.get_limit_key(account_id, Some(&normalized_model));
         self.limits.insert(key, info);
         true
-    }
-
-    /// Record a model quota lock derived from a quota snapshot.
-    ///
-    /// Snapshot locks are deliberately distinguishable from direct HTTP 429
-    /// failures, so a later refreshed snapshot cannot erase a newer failure.
-    pub fn lock_quota_model_until(
-        &self,
-        account_id: &str,
-        model: &str,
-        reset_time: SystemTime,
-        observed_at: SystemTime,
-    ) {
-        let normalized_model = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
-            .unwrap_or_else(|| model.to_string());
-        let now = SystemTime::now();
-        let Ok(remaining) = reset_time.duration_since(now) else {
-            return;
-        };
-        let key = self.get_limit_key(account_id, Some(&normalized_model));
-
-        self.record_quota_snapshot_lock(
-            key,
-            RateLimitInfo {
-                reset_time,
-                retry_after_sec: remaining.as_secs(),
-                detected_at: observed_at,
-                reason: RateLimitReason::QuotaExhausted,
-                model: Some(normalized_model),
-                origin: LimitOrigin::QuotaObservation,
-            },
-            now,
-        );
-    }
-
-    /// Record an account-wide quota lock from a snapshot when every known
-    /// model is exhausted.
-    pub fn lock_quota_account_until(
-        &self,
-        account_id: &str,
-        reset_time: SystemTime,
-        observed_at: SystemTime,
-    ) {
-        let now = SystemTime::now();
-        let Ok(remaining) = reset_time.duration_since(now) else {
-            return;
-        };
-        self.record_quota_snapshot_lock(
-            account_id.to_string(),
-            RateLimitInfo {
-                reset_time,
-                retry_after_sec: remaining.as_secs(),
-                detected_at: observed_at,
-                reason: RateLimitReason::QuotaExhausted,
-                model: None,
-                origin: LimitOrigin::QuotaObservation,
-            },
-            now,
-        );
-    }
-
-    fn record_quota_snapshot_lock(&self, key: String, info: RateLimitInfo, now: SystemTime) {
-        match self.limits.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                let current = entry.get();
-                if (current.origin == LimitOrigin::Http429 && current.reset_time > now)
-                    || current.detected_at > info.detected_at
-                {
-                    return;
-                }
-                entry.insert(info);
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(info);
-            }
-        }
-    }
-
-    /// Clear only an account-wide lock created by a quota snapshot no newer
-    /// than this observation.
-    pub fn clear_quota_account_lock_before(
-        &self,
-        account_id: &str,
-        observed_at: SystemTime,
-    ) -> bool {
-        self.limits
-            .remove_if(account_id, |_, info| {
-                info.origin == LimitOrigin::QuotaObservation && info.detected_at <= observed_at
-            })
-            .is_some()
-    }
-
-    /// Clear only a quota-snapshot lock that is no newer than this observation.
-    ///
-    /// Direct 429 locks are never cleared here, even though they share the
-    /// `QuotaExhausted` reason.
-    pub fn clear_quota_model_lock_before(
-        &self,
-        account_id: &str,
-        model: &str,
-        observed_at: SystemTime,
-    ) -> bool {
-        let normalized_model = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
-            .unwrap_or_else(|| model.to_string());
-        self.limits
-            .remove_if(
-                &self.get_limit_key(account_id, Some(&normalized_model)),
-                |_, info| {
-                    info.origin == LimitOrigin::QuotaObservation && info.detected_at <= observed_at
-                },
-            )
-            .is_some()
     }
 
     pub fn set_lockout_until_iso_with_cap(
@@ -565,14 +508,14 @@ impl RateLimitTracker {
                 .or_else(|| self.parse_retry_time_from_body_baseline(body)),
         };
         let has_explicit_retry_time = retry_after_sec.is_some();
-        let preserve_long_image_quota = parser_mode == RetryParserMode::Current
+        let preserve_long_quota = parser_mode == RetryParserMode::Current
             && status == 429
             && reason == RateLimitReason::QuotaExhausted
             && has_explicit_quota_exhausted(body)
             && has_explicit_retry_time
             && model
                 .as_deref()
-                .and_then(normalize_image_model_id)
+                .and_then(crate::proxy::common::model_mapping::normalize_to_standard_id)
                 .is_some();
 
         // 4. 处理默认值与软避让逻辑（根据限流类型设置不同默认值）
@@ -687,7 +630,7 @@ impl RateLimitTracker {
             .max()
             .unwrap_or(MAX_LOCKOUT_SECONDS)
             .max(MAX_LOCKOUT_SECONDS);
-        if retry_sec > max_allowed_lockout && !preserve_long_image_quota {
+        if retry_sec > max_allowed_lockout && !preserve_long_quota {
             tracing::info!(
                 "Capping retry lockout time for {} from {}s to {}s (max backoff limit)",
                 account_id,
@@ -703,7 +646,6 @@ impl RateLimitTracker {
             detected_at: SystemTime::now(),
             reason,
             model: model.clone(),
-            origin: LimitOrigin::Http429,
         };
 
         let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
@@ -890,7 +832,7 @@ impl RateLimitTracker {
                 && info
                     .model
                     .as_deref()
-                    .and_then(normalize_image_model_id)
+                    .and_then(crate::proxy::common::model_mapping::normalize_to_standard_id)
                     .is_some()
                 && info
                     .reset_time
@@ -1003,7 +945,7 @@ mod tests {
         assert!(tracker.is_rate_limited("acc-long", Some("gemini-3-pro-image")));
 
         let now = SystemTime::now();
-        assert!(tracker.restore_persisted_long_image_limit(
+        assert!(tracker.restore_persisted_long_limit(
             "acc-expiring",
             now + Duration::from_secs(30),
             now - Duration::from_secs(301),
@@ -1166,12 +1108,25 @@ mod tests {
     }
 
     #[test]
-    fn quota_snapshot_clear_preserves_direct_429_lock() {
+    fn quota_bucket_recovery_preserves_direct_429_lock() {
         let tracker = RateLimitTracker::new();
-        let observed_at = SystemTime::now();
-        let reset_time = observed_at + Duration::from_secs(60);
-        tracker.lock_quota_model_until("account", "gemini-3-flash", reset_time, observed_at);
-        assert!(tracker.clear_quota_model_lock_before("account", "gemini-3-flash", observed_at));
+        let now = SystemTime::now();
+        let reset_time = now + Duration::from_secs(60);
+
+        tracker.sync_quota_bucket(
+            "account",
+            "gemini-3-flash",
+            "weekly",
+            1,
+            Some(reset_time),
+            true,
+        );
+        assert!(tracker.get_quota_wait("account", Some("gemini-3-flash"), true) > 0);
+        tracker.sync_quota_bucket("account", "gemini-3-flash", "weekly", 2, None, true);
+        assert_eq!(
+            tracker.get_quota_wait("account", Some("gemini-3-flash"), true),
+            0
+        );
 
         let direct_body = r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetDelay":"60s"}}]}}"#;
         tracker.parse_from_error(
@@ -1182,24 +1137,27 @@ mod tests {
             Some("gemini-3-flash".to_string()),
             &[60],
         );
-        assert!(!tracker.clear_quota_model_lock_before(
+        tracker.sync_quota_bucket("account", "gemini-3-flash", "weekly", 3, None, true);
+        assert!(tracker.get_transient_wait("account", Some("gemini-3-flash")) > 0);
+    }
+
+    #[test]
+    fn quota_wait_can_exclude_optional_nonweekly_windows() {
+        let tracker = RateLimitTracker::new();
+        let reset_time = SystemTime::now() + Duration::from_secs(60);
+        tracker.sync_quota_bucket(
             "account",
             "gemini-3-flash",
-            observed_at + Duration::from_secs(1)
-        ));
-        assert!(tracker.is_rate_limited("account", Some("gemini-3-flash")));
-
-        tracker.lock_quota_account_until("account", reset_time, observed_at);
-        assert!(tracker.clear_quota_account_lock_before("account", observed_at));
-        tracker.set_lockout_until_with_cap(
-            "account",
-            reset_time,
-            RateLimitReason::QuotaExhausted,
-            None,
+            "5h",
+            1,
+            Some(reset_time),
             false,
         );
-        assert!(!tracker
-            .clear_quota_account_lock_before("account", observed_at + Duration::from_secs(1)));
+        assert!(tracker.get_quota_wait("account", Some("gemini-3-flash"), false) > 0);
+        assert_eq!(
+            tracker.get_quota_wait("account", Some("gemini-3-flash"), true),
+            0
+        );
     }
 
     #[test]

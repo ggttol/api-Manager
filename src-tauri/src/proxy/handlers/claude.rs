@@ -160,8 +160,6 @@ fn apply_thinking_hints(
     }
 }
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
-
 // ===== Model Constants for Background Tasks =====
 // These can be adjusted for performance/cost optimization or overridden by custom_mapping
 const INTERNAL_BACKGROUND_TASK: &str = "internal-background-task"; // Unified virtual ID for all background tasks
@@ -237,9 +235,7 @@ The structure MUST be as follows:
 
 // ===== 统一退避策略模块 =====
 // 移除本地重复定义，使用 common 中的统一实现
-use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
-};
+use super::common::{apply_retry_strategy, should_rotate_account, RetryStrategy};
 
 // ===== 退避策略模块结束 =====
 
@@ -785,9 +781,8 @@ pub async fn handle_messages(
     let token_manager = state.token_manager;
 
     let pool_size = token_manager.len();
-    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries (e.g. stripping signatures)
-    // even if the user has only 1 account.
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    // Adaptive budget: one account gets two backoff retries; pools complete two rounds.
+    let max_attempts = super::common::calculate_max_retry_attempts(pool_size);
 
     let mut last_error = String::new();
     let mut retried_without_thinking = false;
@@ -1654,18 +1649,17 @@ pub async fn handle_messages(
                 )
                 .await;
 
-            // [FIX] 遭遇 429 限流或服务端过载时，立即解绑会话，防止下一轮尝试或后续请求死锁在故障账号上
-            if status_code == 429 || status_code == 529 {
-                if let Some(sid) = session_id {
-                    token_manager.clear_session_binding(sid);
-                    debug!(
-                        "[{}] Unbound session {} from account {} due to status {}",
-                        trace_id, sid, email, status_code
-                    );
-                }
+            // Clear both the sticky session and last-used marker before rotating.
+            if status_code == 429 || status_code == 529 || status_code == 503 {
+                token_manager
+                    .unbind_session_and_clear_last_used(session_id)
+                    .await;
+                debug!(
+                    "[{}] Unbound session from account {} due to status {}",
+                    trace_id, email, status_code
+                );
             }
         }
-
         // 4. 处理 400 错误 (Thinking 签名失效 或 块顺序错误)
         // [FIX 2026-08-28] Use case-insensitive matching and cover Google's exact phrasing:
         // "Invalid thought signature." / "thoughtSignature" / "thought_signature"
@@ -1817,10 +1811,16 @@ pub async fn handle_messages(
         }
 
         // 确定重试策略
-        let retry_strategy =
-            determine_retry_strategy(status_code, &error_text, retried_without_thinking);
-
-        // 执行退避
+        // Adaptive strategy uses both the current pool and retry attempt.
+        let retry_strategy = super::common::determine_retry_strategy_adaptive(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+            retried_without_thinking,
+            true,
+            attempt,
+            pool_size,
+        );
         if apply_retry_strategy(
             retry_strategy.clone(),
             attempt,

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { X, Clock, AlertCircle, Bot } from 'lucide-react';
 import { createPortal } from 'react-dom';
-import { Account } from '../../types/account';
+import { Account, getAccountTier, getTierLabel } from '../../types/account';
 import { formatDate } from '../../utils/format';
 import { useTranslation } from 'react-i18next';
 import { MODEL_CONFIG, sortModels } from '../../config/modelConfig';
@@ -33,13 +33,16 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                         <div className="px-2.5 py-0.5 rounded-full bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 text-xs font-mono text-gray-500 dark:text-gray-400">
                             {account.email}
                         </div>
-                        {account.quota?.subscription_tier && (
-                            <div className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${account.quota.subscription_tier === 'ultra' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' :
-                                account.quota.subscription_tier === 'pro' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-gray-100 text-gray-600 dark:bg-base-300 dark:text-gray-400'
-                                }`}>
-                                {account.quota.subscription_tier}
-                            </div>
-                        )}
+                        {(() => {
+                            const tier = getAccountTier(account);
+                            return (
+                                <div className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${tier === 'ultra' ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400' :
+                                    tier === 'pro' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' : 'bg-gray-100 text-gray-600 dark:bg-base-300 dark:text-gray-400'
+                                    }`}>
+                                    {getTierLabel(tier)}
+                                </div>
+                            );
+                        })()}
                     </div>
                     <button
                         onClick={onClose}
@@ -182,40 +185,42 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
                     {/* Quota Groups Section (New in 4.2.4) */}
                     {activeTab === 'detailed' && account.quota?.quota_groups && account.quota.quota_groups.length > 0 && (
                         <div className="flex flex-col gap-4">
-                            {account.quota.quota_groups.map((group, idx) => (
-                                <div key={idx} className="p-4 rounded-xl border border-blue-100 dark:border-blue-900/30 bg-blue-50/30 dark:bg-blue-900/10">
-                                    <div className="font-medium text-sm text-blue-800 dark:text-blue-300 mb-3 font-mono flex justify-between items-center">
-                                        <span>{group.display_name}</span>
-                                        {group.description && <span className="text-[10px] font-normal opacity-70">{group.description}</span>}
-                                    </div>
-                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                        {group.buckets.map((bucket, bIdx) => {
-                                            const percentage = Math.round(bucket.remaining_fraction * 100);
-                                            return (
-                                                <div key={bIdx} className="bg-white dark:bg-base-200 p-3 rounded-lg border border-gray-100 dark:border-white/5 shadow-sm">
-                                                    <div className="flex justify-between items-center mb-2">
-                                                        <span className="text-xs font-bold text-gray-600 dark:text-gray-400 uppercase tracking-wider">{bucket.window}</span>
-                                                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${percentage >= 50 ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : percentage >= 20 ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'}`}>
-                                                            {percentage}%
-                                                        </span>
-                                                    </div>
-                                                    {/* Progress bar */}
-                                                    <div className="h-1.5 w-full bg-gray-100 dark:bg-base-300 rounded-full overflow-hidden mb-2">
-                                                        <div className={`h-full rounded-full transition-all duration-500 ${percentage >= 50 ? 'bg-emerald-500' : percentage >= 20 ? 'bg-amber-400' : 'bg-red-500'}`} style={{ width: `${percentage}%` }}></div>
-                                                    </div>
-                                                    <div className="flex justify-between items-center text-[10px] text-gray-500 font-mono">
-                                                        <div className="flex items-center gap-1">
-                                                            <Clock size={10} />
-                                                            <span>{t('accounts.reset_time')}:</span>
+                            {account.quota.quota_groups.map((group, idx) => {
+                                const groupName = group?.display_name || t('accounts.details.quota_groups', 'Detailed Quota');
+                                return (
+                                    <div key={idx} className="p-4 rounded-xl border border-blue-100 dark:border-blue-900/30 bg-blue-50/30 dark:bg-blue-900/10">
+                                        <div className="font-medium text-sm text-blue-800 dark:text-blue-300 mb-3 font-mono flex justify-between items-center">
+                                            <span>{groupName}</span>
+                                            {group?.description && <span className="text-[10px] font-normal opacity-70">{group.description}</span>}
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                            {(group?.buckets || []).filter(Boolean).map((bucket, bIdx) => {
+                                                const percentage = Math.round((bucket.remaining_fraction || 0) * 100);
+                                                return (
+                                                    <div key={bIdx} className="bg-white dark:bg-base-200 p-3 rounded-lg border border-gray-100 dark:border-white/5 shadow-sm">
+                                                        <div className="flex justify-between items-center mb-2">
+                                                            <span className="text-xs font-bold text-gray-600 dark:text-gray-400 uppercase tracking-wider">{bucket.window || t('common.unknown')}</span>
+                                                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${percentage >= 50 ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' : percentage >= 20 ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'}`}>
+                                                                {percentage}%
+                                                            </span>
                                                         </div>
-                                                        <span>{formatDate(bucket.reset_time) || t('common.unknown')}</span>
+                                                        <div className="h-1.5 w-full bg-gray-100 dark:bg-base-300 rounded-full overflow-hidden mb-2">
+                                                            <div className={`h-full rounded-full transition-all duration-500 ${percentage >= 50 ? 'bg-emerald-500' : percentage >= 20 ? 'bg-amber-400' : 'bg-red-500'}`} style={{ width: `${percentage}%` }}></div>
+                                                        </div>
+                                                        <div className="flex justify-between items-center text-[10px] text-gray-500 font-mono">
+                                                            <div className="flex items-center gap-1">
+                                                                <Clock size={10} />
+                                                                <span>{t('accounts.reset_time')}:</span>
+                                                            </div>
+                                                            <span>{formatDate(bucket.reset_time) || t('common.unknown')}</span>
+                                                        </div>
                                                     </div>
-                                                </div>
-                                            );
-                                        })}
+                                                );
+                                            })}
+                                        </div>
                                     </div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     )}
                 </div>

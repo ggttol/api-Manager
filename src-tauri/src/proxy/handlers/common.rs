@@ -41,13 +41,37 @@ impl RequestRetryState {
         retry_after: Option<&str>,
         retried_without_thinking: bool,
     ) -> RetryStrategy {
+        self.determine_strategy_adaptive(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            retried_without_thinking,
+            0,
+            1,
+        )
+    }
+
+    /// Adaptive retry decision aware of the current attempt and account-pool size.
+    pub fn determine_strategy_adaptive(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        retried_without_thinking: bool,
+        attempt: usize,
+        pool_size: usize,
+    ) -> RetryStrategy {
         let allow_grace_retry = !self.grace_retried_accounts.contains(account_id);
-        let strategy = determine_retry_strategy_inner(
+        let strategy = determine_retry_strategy_adaptive(
             status_code,
             error_text,
             retry_after,
             retried_without_thinking,
             allow_grace_retry,
+            attempt,
+            pool_size,
         );
         if matches!(strategy, RetryStrategy::GraceRetry(_)) {
             self.grace_retried_accounts.insert(account_id.to_string());
@@ -59,11 +83,8 @@ impl RequestRetryState {
 pub fn next_rotation_attempt(
     used_attempts: &mut usize,
     max_attempts: usize,
-    retry_same_account: bool,
+    _retry_same_account: bool,
 ) -> Option<usize> {
-    if retry_same_account {
-        return used_attempts.checked_sub(1);
-    }
     if *used_attempts >= max_attempts {
         return None;
     }
@@ -98,47 +119,16 @@ impl FailureStatusTracker {
     }
 }
 
-/// 根据错误状态码和错误信息确定重试策略
-pub fn determine_retry_strategy(
-    status_code: u16,
-    error_text: &str,
-    retried_without_thinking: bool,
-) -> RetryStrategy {
-    if status_code == 429 {
-        let lower = error_text.to_lowercase();
-        let is_hard_quota_exhausted = lower.contains("resource_exhausted")
-            || lower.contains("quota_exhausted")
-            || lower.contains("exceeded your current quota")
-            || lower.contains("insufficient_quota");
-
-        // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
-        if is_hard_quota_exhausted {
-            return RetryStrategy::FixedDelay(Duration::from_millis(50));
-        }
-
-        return match crate::proxy::upstream::retry::parse_legacy_retry_delay(error_text) {
-            Some(delay_ms) if delay_ms > 0 && delay_ms <= 2000 => {
-                let actual_delay = delay_ms.saturating_add(100);
-                tracing::info!(
-                    "Grace Retry Triggered: Delay {}ms is within window, using same account",
-                    actual_delay
-                );
-                RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
-            }
-            Some(delay_ms) => RetryStrategy::FixedDelay(Duration::from_millis(
-                delay_ms.saturating_add(200).min(30_000),
-            )),
-            None => RetryStrategy::LinearBackoff { base_ms: 5000 },
-        };
+/// Calculate the bounded retry budget for a request.
+///
+/// A single account gets three attempts (initial request plus two backoff retries).
+/// Pools get two complete rotations, bounded to four through twelve attempts.
+pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
+    if pool_size <= 1 {
+        3
+    } else {
+        (pool_size * 2).clamp(4, 12)
     }
-
-    determine_retry_strategy_inner(
-        status_code,
-        error_text,
-        None,
-        retried_without_thinking,
-        true,
-    )
 }
 
 pub(crate) fn is_invalid_signature_error(status: u16, error_text: &str) -> bool {
@@ -162,83 +152,104 @@ pub(crate) fn is_invalid_signature_error(status: u16, error_text: &str) -> bool 
         })
 }
 
-fn determine_retry_strategy_inner(
+/// Determine a retry strategy using the default single-account semantics.
+pub fn determine_retry_strategy(
+    status_code: u16,
+    error_text: &str,
+    retried_without_thinking: bool,
+) -> RetryStrategy {
+    determine_retry_strategy_adaptive(
+        status_code,
+        error_text,
+        None,
+        retried_without_thinking,
+        true,
+        0,
+        1,
+    )
+}
+
+/// Adaptive retry strategy aware of retry-delay hints, attempt number and pool size.
+pub fn determine_retry_strategy_adaptive(
     status_code: u16,
     error_text: &str,
     retry_after: Option<&str>,
     retried_without_thinking: bool,
     allow_grace_retry: bool,
+    attempt: usize,
+    pool_size: usize,
 ) -> RetryStrategy {
+    let lower = error_text.to_lowercase();
     match status_code {
-        // 400 错误：仅在特定 Thinking 签名失败时重试一次
         400 if !retried_without_thinking && is_invalid_signature_error(status_code, error_text) => {
             RetryStrategy::FixedDelay(Duration::from_millis(200))
         }
-
-        // 429 限流错误
         429 => {
-            let lower = error_text.to_lowercase();
-            let is_hard_quota_exhausted = lower.contains("resource_exhausted")
-                || lower.contains("quota_exhausted")
-                || lower.contains("exceeded your current quota")
-                || lower.contains("insufficient_quota");
-
-            // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
-            if is_hard_quota_exhausted {
+            let parsed_delay = crate::proxy::upstream::retry::parse_retry_delay_with_source(
+                error_text,
+                retry_after,
+            );
+            // RESOURCE_EXHAUSTED is a transient classification unless the response
+            // also carries deterministic evidence that the account is exhausted.
+            let hard_quota = parsed_delay.is_none()
+                && (lower.contains("quota_exhausted")
+                    || lower.contains("exceeded your current quota")
+                    || lower.contains("insufficient_quota")
+                    || lower.contains("credits")
+                    || lower.contains("zero_quota")
+                    || lower.contains("weekly quota"));
+            if hard_quota {
                 return RetryStrategy::FixedDelay(Duration::from_millis(50));
             }
 
-            // 优先使用服务端返回的 Retry-After / quotaResetDelay
-            if let Some(parsed_delay) = crate::proxy::upstream::retry::parse_retry_delay_with_source(
-                error_text,
-                retry_after,
-            ) {
-                let delay_ms = parsed_delay.raw_ms;
-                // 短期原账号重试已使用时，立即回到现有换号逻辑
-                if crate::proxy::upstream::retry::should_grace_retry(delay_ms) {
-                    if allow_grace_retry {
-                        let actual_delay = parsed_delay.actual_wait_ms();
-                        tracing::info!(
-                            "Grace Retry Triggered: Delay {}ms is within window, using same account",
-                            actual_delay
-                        );
-                        RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
+            if pool_size <= 1 {
+                if let Some(delay) = parsed_delay {
+                    let wait_ms = delay.actual_wait_ms();
+                    return if allow_grace_retry && wait_ms <= 30_000 {
+                        RetryStrategy::GraceRetry(Duration::from_millis(wait_ms))
                     } else {
-                        RetryStrategy::FixedDelay(Duration::ZERO)
-                    }
-                } else {
-                    let actual_delay = parsed_delay.actual_wait_ms().min(30_000);
-                    RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
+                        RetryStrategy::FixedDelay(Duration::from_millis(wait_ms.min(30_000)))
+                    };
                 }
-            } else {
-                // 否则使用线性退避：起始 5s，逐步增加
-                RetryStrategy::LinearBackoff { base_ms: 5000 }
+                let backoff_ms = (3_000 * (attempt as u64 + 1)).min(10_000);
+                return if allow_grace_retry {
+                    RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms))
+                } else {
+                    RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms))
+                };
             }
-        }
 
-        // 503 服务不可用 / 529 服务器过载
+            // First pass quickly escapes each account; the second pass can wait
+            // for a short reset window or continue looking for a healthy account.
+            if attempt < pool_size {
+                return RetryStrategy::FixedDelay(Duration::from_millis(50));
+            }
+            if let Some(delay) = parsed_delay {
+                let wait_ms = delay.actual_wait_ms();
+                if wait_ms <= 5_000 && allow_grace_retry {
+                    return RetryStrategy::GraceRetry(Duration::from_millis(wait_ms));
+                }
+                if pool_size > 2 && attempt + 1 < pool_size * 2 {
+                    return RetryStrategy::FixedDelay(Duration::from_millis(50));
+                }
+                return RetryStrategy::FixedDelay(Duration::from_millis(wait_ms.min(12_000)));
+            }
+            let backoff_ms = (2_000 * (attempt.saturating_sub(pool_size) as u64 + 1)).min(5_000);
+            RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms))
+        }
         503 | 529 => {
-            // 指数退避：起始 10s，上限 60s (针对 Google 边缘节点过载)
-            RetryStrategy::ExponentialBackoff {
-                base_ms: 10000,
-                max_ms: 60000,
+            if pool_size > 1 && attempt < pool_size {
+                RetryStrategy::FixedDelay(Duration::from_millis(50))
+            } else {
+                RetryStrategy::ExponentialBackoff {
+                    base_ms: 5_000,
+                    max_ms: 30_000,
+                }
             }
         }
-
-        // 500 服务器内部错误
-        500 => {
-            // 线性退避：起始 3s
-            RetryStrategy::LinearBackoff { base_ms: 3000 }
-        }
-
-        // 401/403 认证/权限错误：切换账号前给予极短缓冲
+        500 => RetryStrategy::LinearBackoff { base_ms: 3_000 },
         401 | 403 => RetryStrategy::FixedDelay(Duration::from_millis(200)),
-
-        // 404 资源未找到：Google Cloud Code API 的 404 通常是账号级别的间歇性问题
-        // (灰度发布、账号权限不同步等)，轮换账号往往能解决
         404 => RetryStrategy::FixedDelay(Duration::from_millis(300)),
-
-        // 其他错误：不重试
         _ => RetryStrategy::NoRetry,
     }
 }
@@ -273,50 +284,15 @@ mod tests {
     }
 
     #[test]
-    fn task_short_429_preserves_rotation_budget_and_structured_status() {
-        let body = r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#;
+    fn adaptive_budget_and_status_tracking() {
+        assert_eq!(calculate_max_retry_attempts(1), 3);
+        assert_eq!(calculate_max_retry_attempts(3), 6);
+        assert_eq!(calculate_max_retry_attempts(20), 12);
 
-        let drive_failures = |account_count| {
-            let mut state = RequestRetryState::default();
-            let mut used_attempts = 0;
-            let mut retry_same_account = false;
-            let mut sends = Vec::new();
-
-            while let Some(attempt) =
-                next_rotation_attempt(&mut used_attempts, account_count, retry_same_account)
-            {
-                retry_same_account = false;
-                sends.push(attempt);
-                let account_id = format!("account-{}", attempt);
-                let strategy = state.determine_strategy(&account_id, 429, body, None, false);
-                if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                    assert!(!should_rotate_account(429, Some(&strategy)));
-                    retry_same_account = true;
-                } else {
-                    assert!(should_rotate_account(429, Some(&strategy)));
-                }
-            }
-            sends
-        };
-
-        assert_eq!(drive_failures(1), vec![0, 0]);
-        assert_eq!(drive_failures(2), vec![0, 0, 1, 1]);
-
-        let mut all_429 = FailureStatusTracker::default();
-        all_429.record(StatusCode::TOO_MANY_REQUESTS);
-        all_429.record(StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(all_429.final_status(), StatusCode::TOO_MANY_REQUESTS);
-
-        for non_429 in [StatusCode::FORBIDDEN, StatusCode::SERVICE_UNAVAILABLE] {
-            let mut mixed = FailureStatusTracker::default();
-            mixed.record(non_429);
-            mixed.record(StatusCode::TOO_MANY_REQUESTS);
-            assert_eq!(mixed.final_status(), non_429);
-        }
-
-        let mut all_503 = FailureStatusTracker::default();
-        all_503.record(StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(all_503.final_status(), StatusCode::SERVICE_UNAVAILABLE);
+        let mut tracker = FailureStatusTracker::default();
+        tracker.record(StatusCode::SERVICE_UNAVAILABLE);
+        tracker.record(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(tracker.final_status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 
@@ -399,10 +375,8 @@ pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>)
     }
 
     match status_code {
-        // 这些错误是账号级别或特定节点配额的，需要轮换
-        429 | 401 | 403 | 404 | 500 => true,
-        // 503/529 通常是后端过载，切号效果有限，暂不轮换
-        503 | 529 => false,
+        // Account- and node-scoped failures should escape to another account.
+        429 | 401 | 403 | 404 | 500 | 503 | 529 => true,
         _ => false,
     }
 }

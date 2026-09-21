@@ -17,6 +17,7 @@ import {
     resolveQuotaModels,
     type ModelCategory,
 } from '../../utils/modelCategory';
+import { getAccountTier, getTierLabel, type QuotaData } from '../../types/account';
 // Compile-time guard: if findImageQuotaModel is removed from the config re-export,
 // the type alias test below fails with TS2724 on `pnpm tsc --noEmit`.
 function __noop<T>(): void { const _x: T[] = []; void _x; }
@@ -41,6 +42,26 @@ function assertEqual<T>(actual: T, expected: T): void {
     if (actual !== expected) {
         throw new Error(`expected "${expected}", got "${actual}"`);
     }
+}
+const tierCases: Array<[string | undefined | null, 'ultra' | 'pro' | 'free']> = [
+    ['ULTRA', 'ultra'],
+    ['google_one_helium', 'ultra'],
+    ['PRO', 'pro'],
+    ['g1-pro-tier', 'pro'],
+    ['standard-tier', 'free'],
+    ['unknown-tier', 'free'],
+    [undefined, 'free'],
+    [null, 'free'],
+];
+
+for (const [rawTier, expected] of tierCases) {
+    test(`getAccountTier(${String(rawTier)})`, () => {
+        const quota = rawTier == null
+            ? rawTier
+            : { models: [], last_updated: 0, subscription_tier: rawTier };
+        assertEqual(getAccountTier({ quota: quota as QuotaData | null | undefined }), expected);
+        assertEqual(getTierLabel(expected), expected.toUpperCase());
+    });
 }
 
 const categorizeCases: Array<[string, ModelCategory]> = [

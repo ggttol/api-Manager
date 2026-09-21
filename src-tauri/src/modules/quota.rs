@@ -77,9 +77,9 @@ struct QuotaSummaryGroup {
     #[serde(rename = "displayName")]
     display_name: Option<String>,
     description: Option<String>,
+    #[serde(default)]
     buckets: Vec<QuotaSummaryBucket>,
 }
-
 #[derive(Debug, Deserialize)]
 struct QuotaSummaryBucket {
     #[serde(rename = "bucketId")]
@@ -178,42 +178,37 @@ async fn fetch_project_id(
             Ok(res) if res.status().is_success() => match res.json::<LoadProjectResponse>().await {
                 Ok(data) => {
                     let project_id = data.project_id.clone();
-                    let mut subscription_tier = data
+                    // UserTier.id is the stable authority. Names are only a
+                    // compatibility fallback for older deployments.
+                    let raw_tier = data
                         .paid_tier
                         .as_ref()
-                        .and_then(|tier| tier.name.clone())
-                        .or_else(|| data.paid_tier.as_ref().and_then(|tier| tier.id.clone()));
-                    let is_ineligible = data
-                        .ineligible_tiers
-                        .as_ref()
-                        .is_some_and(|tiers| !tiers.is_empty());
-
-                    if subscription_tier.is_none() && !is_ineligible {
-                        subscription_tier = data
-                            .current_tier
-                            .as_ref()
-                            .and_then(|tier| tier.name.clone())
-                            .or_else(|| {
-                                data.current_tier.as_ref().and_then(|tier| tier.id.clone())
-                            });
-                    } else if subscription_tier.is_none() {
-                        if let Some(default_tier) = data.allowed_tiers.as_ref().and_then(|tiers| {
-                            tiers.iter().find(|tier| tier.is_default == Some(true))
-                        }) {
-                            subscription_tier = default_tier
-                                .name
+                        .and_then(|tier| tier.id.clone().or_else(|| tier.name.clone()))
+                        .or_else(|| {
+                            data.current_tier
                                 .as_ref()
-                                .or(default_tier.id.as_ref())
-                                .map(|tier| format!("{} (Restricted)", tier));
-                        }
-                    }
+                                .and_then(|tier| tier.id.clone().or_else(|| tier.name.clone()))
+                        })
+                        .or_else(|| {
+                            data.allowed_tiers.as_ref().and_then(|tiers| {
+                                tiers
+                                    .iter()
+                                    .find(|tier| {
+                                        tier.id.as_deref() == Some("free-tier")
+                                            || tier.is_default == Some(true)
+                                    })
+                                    .and_then(|tier| tier.id.clone().or_else(|| tier.name.clone()))
+                            })
+                        });
+                    let subscription_tier = Some(crate::models::quota::resolve_subscription_tier(
+                        raw_tier.as_deref(),
+                    ));
 
-                    if let Some(tier) = &subscription_tier {
-                        crate::modules::logger::log_info(&format!(
-                            "📊 [{}] Subscription identified successfully: {}",
-                            email, tier
-                        ));
-                    }
+                    crate::modules::logger::log_info(&format!(
+                        "📊 [{}] Subscription identified successfully: {}",
+                        email,
+                        subscription_tier.as_deref().unwrap_or("FREE")
+                    ));
                     return (project_id, subscription_tier);
                 }
                 Err(error) => crate::modules::logger::log_warn(&format!(
@@ -233,7 +228,8 @@ async fn fetch_project_id(
             )),
         }
     }
-
+    // None is reserved for network/endpoint failure. Account::update_quota
+    // then retains the last known paid tier instead of downgrading it.
     (None, None)
 }
 
@@ -255,12 +251,11 @@ pub async fn fetch_quota_with_cache(
 ) -> crate::error::AppResult<(QuotaData, Option<String>)> {
     use crate::error::AppError;
 
-    // Optimization: Skip loadCodeAssist call if project_id is cached to save API quota
-    let (project_id, subscription_tier) = if let Some(pid) = cached_project_id {
-        (Some(pid.to_string()), None)
-    } else {
-        fetch_project_id(access_token, email, account_id).await
-    };
+    // Probe loadCodeAssist on every refresh. A cached project is only a
+    // fallback when the authority endpoint is unavailable.
+    let (fresh_project_id, subscription_tier) =
+        fetch_project_id(access_token, email, account_id).await;
+    let project_id = fresh_project_id.or_else(|| cached_project_id.map(str::to_owned));
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
@@ -559,6 +554,7 @@ async fn fetch_quota_summary(
                     }
                 };
 
+                let observed_at = chrono::Utc::now().timestamp_millis();
                 let groups: Vec<crate::models::quota::QuotaGroup> = summary
                     .groups
                     .into_iter()
@@ -568,13 +564,19 @@ async fn fetch_quota_summary(
                         buckets: g
                             .buckets
                             .into_iter()
-                            .map(|b| crate::models::quota::QuotaBucket {
-                                bucket_id: b.bucket_id.unwrap_or_default(),
-                                window: b.window.unwrap_or_default(),
-                                remaining_fraction: b.remaining_fraction.unwrap_or(0.0),
-                                reset_time: b.reset_time.unwrap_or_default(),
-                                display_name: b.display_name,
-                                description: b.description,
+                            // Missing remainingFraction is not an observation.
+                            .filter_map(|b| {
+                                Some(crate::models::quota::QuotaBucket {
+                                    bucket_id: b.bucket_id.unwrap_or_default(),
+                                    window: b.window.unwrap_or_default(),
+                                    remaining_fraction: b.remaining_fraction?,
+                                    reset_time: b.reset_time.unwrap_or_default(),
+                                    observed_at: Some(observed_at),
+                                    cycle_start: None,
+                                    cycle_tokens: None,
+                                    display_name: b.display_name,
+                                    description: b.description,
+                                })
                             })
                             .collect(),
                     })
@@ -1024,6 +1026,9 @@ mod tests {
                         window: "5h".to_string(),
                         remaining_fraction: 0.5,
                         reset_time: "2026-01-01T01:00:00Z".to_string(),
+                        observed_at: Some(1),
+                        cycle_start: None,
+                        cycle_tokens: None,
                         display_name: None,
                         description: None,
                     },
@@ -1032,6 +1037,9 @@ mod tests {
                         window: "weekly".to_string(),
                         remaining_fraction: 0.2,
                         reset_time: "2026-01-02T01:00:00Z".to_string(),
+                        observed_at: Some(1),
+                        cycle_start: None,
+                        cycle_tokens: None,
                         display_name: None,
                         description: None,
                     },
@@ -1045,6 +1053,9 @@ mod tests {
                     window: "5h".to_string(),
                     remaining_fraction: 0.0,
                     reset_time: "2026-01-03T01:00:00Z".to_string(),
+                    observed_at: Some(1),
+                    cycle_start: None,
+                    cycle_tokens: None,
                     display_name: None,
                     description: None,
                 }],

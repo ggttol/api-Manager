@@ -25,6 +25,12 @@ enum TrackerParserMode {
 }
 
 const IMAGE_ACCOUNT_RESELECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_RETRY_POOL_COOLDOWN_SECONDS: u64 = 5;
+
+fn retry_pool_cooldown(wait_seconds: u64) -> Option<std::time::Duration> {
+    (wait_seconds <= MAX_RETRY_POOL_COOLDOWN_SECONDS)
+        .then(|| std::time::Duration::from_secs(wait_seconds))
+}
 
 async fn wait_for_image_account_change(
     changes: &mut tokio::sync::watch::Receiver<u64>,
@@ -668,7 +674,7 @@ impl TokenManager {
                 ) else {
                     continue;
                 };
-                if !crate::proxy::rate_limit::is_active_persisted_long_image_limit(
+                if !crate::proxy::rate_limit::is_active_persisted_long_limit(
                     model_key, &status, now,
                 ) {
                     continue;
@@ -679,7 +685,7 @@ impl TokenManager {
                 ) else {
                     continue;
                 };
-                self.rate_limit_tracker.restore_persisted_long_image_limit(
+                self.rate_limit_tracker.restore_persisted_long_limit(
                     &account_id,
                     std::time::SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(until_seconds),
@@ -1655,25 +1661,10 @@ impl TokenManager {
         }
 
         tokens_snapshot.sort_by(|a, b| {
-            // Priority 0: 严格的订阅等级排序 (ULTRA > PRO > FREE)
-            // 用户要求：轮询应当遵循 Ultra -> Pro -> Free
-            // 既然已经过滤掉了不支持该模型的账号，剩下的都是支持的
-            // 此时我们优先使用高级订阅
-            let tier_priority = |tier: &Option<String>| {
-                let t = tier.as_deref().unwrap_or("").to_lowercase();
-                if t.contains("ultra") {
-                    0
-                } else if t.contains("pro") {
-                    1
-                } else if t.contains("free") {
-                    2
-                } else {
-                    3
-                }
-            };
-
-            let tier_cmp =
-                tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
+            // Canonical priority: ULTRA > PRO > FREE; unknown is FREE.
+            let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref()).cmp(
+                &crate::models::quota::tier_priority(b.subscription_tier.as_deref()),
+            );
             if tier_cmp != std::cmp::Ordering::Equal {
                 return tier_cmp;
             }
@@ -1965,9 +1956,7 @@ impl TokenManager {
                             .email_to_account_id(&bound_token.email)
                             .unwrap_or_else(|| bound_token.account_id.clone());
                         // [FIX] 传入目标模型标准化 ID，检查该模型是否已被熔断器精准锁定
-                        let reset_sec = self
-                            .rate_limit_tracker
-                            .get_remaining_wait(&key, Some(&normalized_target));
+                        let reset_sec = self.rate_limit_wait(&key, Some(&normalized_target)).await;
                         if reset_sec > 0 {
                             // 【修复 Issue #284】立即解绑并切换账号，不再阻塞等待
                             // 原因：阻塞等待会导致并发请求时客户端 socket 超时 (UND_ERR_SOCKET)
@@ -2119,31 +2108,26 @@ impl TokenManager {
                 None => {
                     // 乐观重置策略: 双层防护机制
                     // 计算最短等待时间
-                    let min_wait = tokens_snapshot
-                        .iter()
-                        .filter_map(|t| {
-                            let wait = self
-                                .rate_limit_tracker
-                                .get_remaining_wait(&t.account_id, Some(&normalized_target));
-                            if wait > 0 {
-                                Some(wait)
-                            } else {
-                                None
-                            }
-                        })
-                        .min();
+                    let mut min_wait: Option<u64> = None;
+                    for candidate in &tokens_snapshot {
+                        let wait = self
+                            .rate_limit_wait(&candidate.account_id, Some(&normalized_target))
+                            .await;
+                        if wait > 0 {
+                            min_wait = Some(min_wait.map_or(wait, |current| current.min(wait)));
+                        }
+                    }
 
-                    // Layer 1: 如果最短等待时间 <= 2秒,执行缓冲延迟
+                    // Bridge the adaptive retry rounds across short upstream cooldowns.
                     if let Some(wait_sec) = min_wait {
-                        if wait_sec <= 2 {
-                            let wait_ms = (wait_sec as f64 * 1000.0) as u64;
+                        if let Some(wait_duration) = retry_pool_cooldown(wait_sec) {
+                            let wait_ms = wait_duration.as_millis() as u64;
                             tracing::warn!(
                                 "All accounts rate-limited but shortest wait is {}s. Applying {}ms buffer for state sync...",
                                 wait_sec, wait_ms
                             );
 
-                            // 缓冲延迟
-                            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+                            tokio::time::sleep(wait_duration).await;
 
                             // 重新尝试选择账号
                             let mut retry_token = None;
@@ -2599,14 +2583,26 @@ impl TokenManager {
         );
     }
 
-    /// 检查账号是否在限流中 (支持模型级)
-    pub async fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
-        // [NEW] 检查熔断是否启用
+    async fn rate_limit_wait(&self, account_id: &str, model: Option<&str>) -> u64 {
         let config = self.circuit_breaker_config.read().await;
-        if !config.enabled {
-            return false;
-        }
-        self.rate_limit_tracker.is_rate_limited(account_id, model)
+        let transient_wait = if config.enabled {
+            self.rate_limit_tracker
+                .get_transient_wait(account_id, model)
+        } else {
+            0
+        };
+        let quota_wait = self.rate_limit_tracker.get_quota_wait(
+            account_id,
+            model,
+            !config.enabled || !config.lock_on_zero_quota,
+        );
+        transient_wait.max(quota_wait)
+    }
+
+    /// Check effective account limits. Official weekly exhaustion is always enforced;
+    /// the circuit-breaker switches control transient failures and optional 5h windows.
+    pub async fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
+        self.rate_limit_wait(account_id, model).await > 0
     }
 
     /// 获取距离限流重置还有多少秒
@@ -3209,7 +3205,8 @@ impl TokenManager {
         error_body: &str,
         info: &crate::proxy::rate_limit::RateLimitInfo,
     ) {
-        let Some(model_key) = model.and_then(crate::proxy::rate_limit::normalize_image_model_id)
+        let Some(model_key) =
+            model.and_then(crate::proxy::common::model_mapping::normalize_to_standard_id)
         else {
             return;
         };
@@ -3365,6 +3362,16 @@ impl TokenManager {
     #[allow(dead_code)]
     pub fn clear_session_binding(&self, session_id: &str) {
         self.session_accounts.remove(session_id);
+    }
+
+    /// Unbind a failed request's sticky session and release the last-used
+    /// account guard, preventing a 429/529 retry deadlock.
+    pub async fn unbind_session_and_clear_last_used(&self, session_id: Option<&str>) {
+        if let Some(session_id) = session_id {
+            self.session_accounts.remove(session_id);
+        }
+        let mut last_used = self.last_used_account.lock().await;
+        *last_used = None;
     }
 
     /// 清除所有会话的粘性映射
@@ -3529,17 +3536,14 @@ impl TokenManager {
         earliest_ts
     }
 
-    /// Sync zero-quota snapshot locks by the actual standard model family.
-    /// Snapshot locks are source-tagged in RateLimitTracker, so a recovered
-    /// bucket cannot erase a newer live 429 for the same model.
+    /// Synchronize official quota observations by model family and bucket.
+    /// Policy is applied when selecting accounts, so toggling optional 5h protection
+    /// never mutates or rolls back the underlying observation.
     fn sync_zero_quota_circuit_breaker(&self, account_id: &str, account: &serde_json::Value) {
         let lock_on_zero = self
             .circuit_breaker_config
             .try_read()
             .is_ok_and(|config| config.enabled && config.lock_on_zero_quota);
-        if !lock_on_zero {
-            return;
-        }
 
         let Some(quota) = account.get("quota") else {
             return;
@@ -3548,11 +3552,7 @@ impl TokenManager {
         else {
             return;
         };
-        let Ok(observed_seconds) = u64::try_from(observed_seconds) else {
-            return;
-        };
-        let observed_at =
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(observed_seconds);
+        let fallback_observed_at = observed_seconds.saturating_mul(1000);
         let parse_reset = |value: &str| {
             chrono::DateTime::parse_from_rfc3339(value)
                 .ok()
@@ -3562,8 +3562,6 @@ impl TokenManager {
                 })
         };
 
-        let mut known_group_keys = HashSet::new();
-        let mut exhausted_until: HashMap<String, std::time::SystemTime> = HashMap::new();
         if let Some(groups) = quota.get("quota_groups").and_then(|value| value.as_array()) {
             for group in groups {
                 let mut metadata = format!(
@@ -3577,76 +3575,105 @@ impl TokenManager {
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                 );
-                let buckets = group.get("buckets").and_then(|value| value.as_array());
-                if let Some(buckets) = buckets {
-                    for bucket in buckets {
-                        metadata.push_str(&format!(
-                            " {} {} {} {}",
-                            bucket
-                                .get("bucket_id")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or_default(),
-                            bucket
-                                .get("window")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or_default(),
-                            bucket
-                                .get("display_name")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or_default(),
-                            bucket
-                                .get("description")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or_default()
-                        ));
-                    }
-                    let keys =
-                        crate::proxy::common::model_mapping::quota_group_standard_ids(&metadata);
-                    if keys.is_empty() {
+                let Some(buckets) = group.get("buckets").and_then(|value| value.as_array()) else {
+                    continue;
+                };
+                for bucket in buckets {
+                    metadata.push_str(&format!(
+                        " {} {} {} {}",
+                        bucket
+                            .get("bucket_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
+                        bucket
+                            .get("window")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
+                        bucket
+                            .get("display_name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
+                        bucket
+                            .get("description")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                    ));
+                }
+                let keys = crate::proxy::common::model_mapping::quota_group_standard_ids(&metadata);
+                if keys.is_empty() {
+                    continue;
+                }
+                for bucket in buckets {
+                    let Some(remaining) = bucket
+                        .get("remaining_fraction")
+                        .and_then(|value| value.as_f64())
+                    else {
+                        continue;
+                    };
+                    let bucket_id = bucket
+                        .get("bucket_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    if bucket_id.is_empty() {
                         continue;
                     }
-                    for key in &keys {
-                        known_group_keys.insert((*key).to_string());
+                    let window = bucket
+                        .get("window")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let marker = format!("{} {}", window, bucket_id).to_ascii_lowercase();
+                    let weekly = marker.contains("week") || marker.contains("7d");
+                    let rolling = marker.contains("5h") || marker.contains("hour");
+                    if !weekly && !rolling {
+                        continue;
                     }
-                    for bucket in buckets {
-                        let remaining = bucket
-                            .get("remaining_fraction")
-                            .and_then(|value| value.as_f64())
-                            .unwrap_or(1.0);
-                        let reset = bucket
+                    let bucket_observed_at = bucket
+                        .get("observed_at")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(fallback_observed_at);
+                    let exhausted_until = if remaining <= 0.001 {
+                        bucket
                             .get("reset_time")
                             .and_then(|value| value.as_str())
-                            .and_then(parse_reset);
-                        if remaining <= 0.001 {
-                            if let Some(reset) = reset {
-                                for key in &keys {
-                                    exhausted_until
-                                        .entry((*key).to_string())
-                                        .and_modify(|until| *until = (*until).max(reset))
-                                        .or_insert(reset);
-                                }
-                            }
-                        }
+                            .and_then(parse_reset)
+                    } else {
+                        None
+                    };
+                    for key in &keys {
+                        self.rate_limit_tracker.sync_quota_bucket(
+                            account_id,
+                            key,
+                            bucket_id,
+                            bucket_observed_at,
+                            exhausted_until,
+                            weekly,
+                        );
                     }
                 }
             }
+            if !groups.is_empty() {
+                self.rate_limit_tracker.sync_quota_bucket(
+                    account_id,
+                    "",
+                    "legacy-all-models",
+                    fallback_observed_at,
+                    None,
+                    false,
+                );
+                return;
+            }
         }
 
-        for key in known_group_keys {
-            if let Some(until) = exhausted_until.get(&key) {
-                self.rate_limit_tracker.lock_quota_model_until(
-                    account_id,
-                    &key,
-                    *until,
-                    observed_at,
-                );
-            } else {
-                self.rate_limit_tracker.clear_quota_model_lock_before(
-                    account_id,
-                    &key,
-                    observed_at,
-                );
-            }
+        if !lock_on_zero {
+            self.rate_limit_tracker.sync_quota_bucket(
+                account_id,
+                "",
+                "legacy-all-models",
+                fallback_observed_at,
+                None,
+                false,
+            );
+            return;
         }
 
         let mut known_models: HashMap<String, (i64, Option<std::time::SystemTime>)> =
@@ -3676,20 +3703,23 @@ impl TokenManager {
                     .or_insert((percentage, reset));
             }
         }
-
-        if !known_models.is_empty()
-            && known_models
-                .values()
-                .all(|(percentage, _)| *percentage <= 0)
-        {
-            if let Some(until) = known_models.values().filter_map(|(_, reset)| *reset).max() {
-                self.rate_limit_tracker
-                    .lock_quota_account_until(account_id, until, observed_at);
-            }
-        } else {
-            self.rate_limit_tracker
-                .clear_quota_account_lock_before(account_id, observed_at);
+        if known_models.is_empty() {
+            return;
         }
+
+        let exhausted_until = known_models
+            .values()
+            .all(|(percentage, _)| *percentage <= 0)
+            .then(|| known_models.values().filter_map(|(_, reset)| *reset).max())
+            .flatten();
+        self.rate_limit_tracker.sync_quota_bucket(
+            account_id,
+            "",
+            "legacy-all-models",
+            fallback_observed_at,
+            exhausted_until,
+            false,
+        );
     }
 
     /// 获取当前所有可用账号中收集到的官方下发的所有动态模型集合
@@ -3980,7 +4010,7 @@ mod tests {
         assert!(!manager
             .rate_limit_tracker
             .is_rate_limited(account_id, Some("gemini-3.1-flash-image")));
-        assert!(!manager
+        assert!(manager
             .rate_limit_tracker
             .is_rate_limited(account_id, Some("gemini-2.5-pro")));
 
@@ -4557,22 +4587,9 @@ mod tests {
     fn compare_tokens(a: &ProxyToken, b: &ProxyToken) -> Ordering {
         const RESET_TIME_THRESHOLD_SECS: i64 = 600; // 10 分钟阈值
 
-        let tier_priority = |tier: &Option<String>| {
-            let t = tier.as_deref().unwrap_or("").to_lowercase();
-            if t.contains("ultra") {
-                0
-            } else if t.contains("pro") {
-                1
-            } else if t.contains("free") {
-                2
-            } else {
-                3
-            }
-        };
-
-        // First: compare by subscription tier
-        let tier_cmp =
-            tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
+        let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref()).cmp(
+            &crate::models::quota::tier_priority(b.subscription_tier.as_deref()),
+        );
         if tier_cmp != Ordering::Equal {
             return tier_cmp;
         }
@@ -5046,23 +5063,12 @@ mod tests {
                 ULTRA_REQUIRED_MODELS.iter().any(|m| lower.contains(m))
             };
 
-            let tier_priority = |tier: &Option<String>| {
-                let t = tier.as_deref().unwrap_or("").to_lowercase();
-                if t.contains("ultra") {
-                    0
-                } else if t.contains("pro") {
-                    1
-                } else if t.contains("free") {
-                    2
-                } else {
-                    3
-                }
-            };
-
             // Priority 0: 高端模型时，订阅等级优先
             if requires_ultra {
-                let tier_cmp =
-                    tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
+                let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref())
+                    .cmp(&crate::models::quota::tier_priority(
+                        b.subscription_tier.as_deref(),
+                    ));
                 if tier_cmp != Ordering::Equal {
                     return tier_cmp;
                 }
@@ -5087,8 +5093,10 @@ mod tests {
 
             // Priority 3: Tier (for non-high-end models)
             if !requires_ultra {
-                let tier_cmp =
-                    tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
+                let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref())
+                    .cmp(&crate::models::quota::tier_priority(
+                        b.subscription_tier.as_deref(),
+                    ));
                 if tier_cmp != Ordering::Equal {
                     return tier_cmp;
                 }
@@ -5145,22 +5153,11 @@ mod tests {
                 ULTRA_REQUIRED_MODELS.iter().any(|m| lower.contains(m))
             };
 
-            let tier_priority = |tier: &Option<String>| {
-                let t = tier.as_deref().unwrap_or("").to_lowercase();
-                if t.contains("ultra") {
-                    0
-                } else if t.contains("pro") {
-                    1
-                } else if t.contains("free") {
-                    2
-                } else {
-                    3
-                }
-            };
-
             if requires_ultra {
-                let tier_cmp =
-                    tier_priority(&a.subscription_tier).cmp(&tier_priority(&b.subscription_tier));
+                let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref())
+                    .cmp(&crate::models::quota::tier_priority(
+                        b.subscription_tier.as_deref(),
+                    ));
                 if tier_cmp != Ordering::Equal {
                     return tier_cmp;
                 }
@@ -5194,22 +5191,11 @@ mod tests {
             };
 
             tokens.sort_by(|a, b| {
-                let tier_priority = |tier: &Option<String>| {
-                    let t = tier.as_deref().unwrap_or("").to_lowercase();
-                    if t.contains("ultra") {
-                        0
-                    } else if t.contains("pro") {
-                        1
-                    } else if t.contains("free") {
-                        2
-                    } else {
-                        3
-                    }
-                };
-
                 if requires_ultra {
-                    let tier_cmp = tier_priority(&a.subscription_tier)
-                        .cmp(&tier_priority(&b.subscription_tier));
+                    let tier_cmp =
+                        crate::models::quota::tier_priority(a.subscription_tier.as_deref()).cmp(
+                            &crate::models::quota::tier_priority(b.subscription_tier.as_deref()),
+                        );
                     if tier_cmp != Ordering::Equal {
                         return tier_cmp;
                     }
@@ -5223,8 +5209,10 @@ mod tests {
                 }
 
                 if !requires_ultra {
-                    let tier_cmp = tier_priority(&a.subscription_tier)
-                        .cmp(&tier_priority(&b.subscription_tier));
+                    let tier_cmp =
+                        crate::models::quota::tier_priority(a.subscription_tier.as_deref()).cmp(
+                            &crate::models::quota::tier_priority(b.subscription_tier.as_deref()),
+                        );
                     if tier_cmp != Ordering::Equal {
                         return tier_cmp;
                     }
@@ -5289,5 +5277,83 @@ mod tests {
             ],
             "Sonnet should sort by quota first, then by tier as tiebreaker"
         );
+    }
+    #[tokio::test]
+    async fn weekly_quota_is_enforced_when_transient_breaker_is_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp.path().to_path_buf());
+        manager.rate_limit_tracker.sync_quota_bucket(
+            "account",
+            "gemini-3-flash",
+            "weekly",
+            1,
+            Some(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+            true,
+        );
+        {
+            let mut config = manager.circuit_breaker_config.write().await;
+            config.enabled = false;
+            config.lock_on_zero_quota = false;
+        }
+        assert!(
+            manager
+                .is_rate_limited("account", Some("gemini-3-flash"))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn five_hour_quota_observation_follows_current_policy_without_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(temp.path().to_path_buf());
+        manager.rate_limit_tracker.sync_quota_bucket(
+            "account",
+            "gemini-3-flash",
+            "5h",
+            1,
+            Some(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+            false,
+        );
+        {
+            let mut config = manager.circuit_breaker_config.write().await;
+            config.enabled = true;
+            config.lock_on_zero_quota = true;
+        }
+        assert!(
+            manager
+                .is_rate_limited("account", Some("gemini-3-flash"))
+                .await
+        );
+
+        manager
+            .circuit_breaker_config
+            .write()
+            .await
+            .lock_on_zero_quota = false;
+        assert!(
+            !manager
+                .is_rate_limited("account", Some("gemini-3-flash"))
+                .await
+        );
+
+        manager
+            .circuit_breaker_config
+            .write()
+            .await
+            .lock_on_zero_quota = true;
+        assert!(
+            manager
+                .is_rate_limited("account", Some("gemini-3-flash"))
+                .await
+        );
+    }
+
+    #[test]
+    fn pool_cooldown_bridges_only_short_adaptive_retry_windows() {
+        assert_eq!(
+            retry_pool_cooldown(5),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(retry_pool_cooldown(6), None);
     }
 }

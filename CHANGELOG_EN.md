@@ -2,6 +2,16 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## API Manager upstream stability integration (2026-09-21)
+
+Selected account, quota, and gateway fixes from upstream v4.7.6–v4.7.11 were ported without merging the official branch or changing the isolated `/codex/v1` ChatGPT subscription path. Subscription tiers now come from authoritative `loadCodeAssist` machine fields and are canonicalized to `FREE`, `PRO`, or `ULTRA`. Every quota refresh can repair stale classifications, failed authority requests preserve the previous tier, and model availability is never used to infer a plan.
+
+Official weekly and 5-hour limits are tracked independently by account, normalized model family, and bucket. Older or incomplete snapshots cannot replace newer observations. Weekly exhaustion is always enforced; optional 5-hour locks follow the zero-quota setting. Successful requests, manual transient-limit clearing, optimistic resets, and account reloads cannot bypass weekly constraints. Explicit long `QUOTA_EXHAUSTED` deadlines now survive restarts for both text and image models without sharing lifecycle with official buckets.
+
+The gateway now uses bounded, pool-aware adaptive retries: finite single-account backoff, at most two pool rounds, 503/529 node escape, and budgeted bridging of short cooldowns. OpenAI, Claude, Gemini, and image generation/editing use the same attempt/pool policy. The frontend tolerates incomplete quota data, renders canonical tiers consistently, restricts validation/appeal URLs to HTTP(S), and rejects cross-origin Web OAuth completion messages.
+
+Verification covers the complete Rust library suite, focused regressions, and the production frontend build. Codex routing, account Vault, session affinity, and its independent scheduler remain isolated.
+
 ## API Manager custom stability update (2026-09-15)
 
 Codex account affinity now survives process restarts in a dedicated encrypted `codex/session-affinity.enc.json` store. It reuses the account Vault key with distinct AAD and uses private permissions, a temporary file, `fsync`, and atomic replacement. Affinity no longer expires by age or uses the former 8,192-entry memory-cache ceiling. Session/cache/response/turn/item/call/encrypted-content identifiers retain both caller-scoped and API-key-independent global keys. A missing or conflicting legacy continuation is rebound to an available account and permanently persisted instead of failing locally with HTTP 409.

@@ -521,7 +521,7 @@ mod tests {
         assert!(!updated
             .live_limited_models
             .contains_key("gemini-3.1-flash-image"));
-        assert!(!updated.live_limited_models.contains_key("gemini-2.5-pro"));
+        assert!(updated.live_limited_models.contains_key("gemini-2.5-pro"));
     }
 
     #[tokio::test]
@@ -1839,14 +1839,12 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     }
     // --- Quota protection logic end ---
 
-    // Preserve explicit long image locks; other live records recover only when every
+    // Preserve explicit long quota locks; other live records recover only when every
     // observed alias sharing that quota family has positive remaining quota.
     if let Some(ref q) = account.quota {
         let now = chrono::Utc::now().timestamp();
         account.live_limited_models.retain(|model_key, status| {
-            if crate::proxy::rate_limit::is_active_persisted_long_image_limit(
-                model_key, status, now,
-            ) {
+            if crate::proxy::rate_limit::is_active_persisted_long_limit(model_key, status, now) {
                 return true;
             }
             let recovered = q

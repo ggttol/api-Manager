@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { ArrowRightLeft, RefreshCw, Trash2, Download, Info, Lock, Ban, Diamond, Gem, Circle, ToggleLeft, ToggleRight, Fingerprint, Sparkles, Tag, X, Check, Clock, Bot, Repeat2, Terminal } from 'lucide-react';
-import { Account, ModelQuota } from '../../types/account';
+import { Account, ModelQuota, getAccountTier, getTierLabel } from '../../types/account';
 import { cn } from '../../utils/cn';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
@@ -134,15 +134,21 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     const weeklyItems = useMemo(() => {
         if (quotaWindow !== 'weekly') return [];
         return (account.quota?.quota_groups || []).flatMap(group => {
-            return group.buckets
-                .filter(b => b.window.toLowerCase().includes('week') || b.bucket_id.toLowerCase().includes('week'))
+            const buckets = (group?.buckets || []).filter(Boolean);
+            const groupName = group?.display_name || '';
+            return buckets
+                .filter(b => {
+                    const window = String(b?.window || '').toLowerCase();
+                    const bucketId = String(b?.bucket_id || '').toLowerCase();
+                    return window.includes('week') || bucketId.includes('week');
+                })
                 .map(b => {
-                    const shortGroupName = group.display_name
+                    const shortGroupName = groupName
                         .replace(/ models?$/i, '')
                         .replace(/Claude and GPT/i, 'Claude/GPT');
                     const weeklySuffix = t('accounts.quota_window_weekly_short', 'Semanal');
                     return {
-                        id: `${group.display_name}-${b.bucket_id}`,
+                        id: `${groupName}-${String(b?.bucket_id || '')}`,
                         label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (${weeklySuffix})`,
                         percentage: Math.round((b.remaining_fraction || 0) * 100),
                         resetTime: b.reset_time,
@@ -220,30 +226,24 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 </span>
                             )}
                             {/* 订阅类型徽章 */}
-                            {account.quota?.subscription_tier && (() => {
-                                const tier = account.quota.subscription_tier.toLowerCase();
-                                if (tier.includes('ultra')) {
-                                    return (
-                                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[9px] font-bold shadow-sm">
-                                            <Gem className="w-2.5 h-2.5 fill-current" />
-                                            ULTRA
-                                        </span>
-                                    );
-                                } else if (tier.includes('pro')) {
-                                    return (
-                                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[9px] font-bold shadow-sm">
-                                            <Diamond className="w-2.5 h-2.5 fill-current" />
-                                            PRO
-                                        </span>
-                                    );
-                                } else {
-                                    return (
-                                        <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-500 dark:text-gray-400 text-[9px] font-bold shadow-sm border border-gray-200 dark:border-white/10">
-                                            <Circle className="w-2.5 h-2.5" />
-                                            FREE
-                                        </span>
-                                    );
-                                }
+                            {(() => {
+                                const tier = getAccountTier(account);
+                                return tier === 'ultra' ? (
+                                    <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[9px] font-bold shadow-sm">
+                                        <Gem className="w-2.5 h-2.5 fill-current" />
+                                        {getTierLabel(tier)}
+                                    </span>
+                                ) : tier === 'pro' ? (
+                                    <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[9px] font-bold shadow-sm">
+                                        <Diamond className="w-2.5 h-2.5 fill-current" />
+                                        {getTierLabel(tier)}
+                                    </span>
+                                ) : (
+                                    <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-500 dark:text-gray-400 text-[9px] font-bold shadow-sm border border-gray-200 dark:border-white/10">
+                                        <Circle className="w-2.5 h-2.5" />
+                                        {getTierLabel(tier)}
+                                    </span>
+                                );
                             })()}
                             {/* 自定义标签 */}
                             {account.custom_label && (

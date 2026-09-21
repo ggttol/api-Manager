@@ -2,6 +2,16 @@
 
 > 完整版本历史记录。返回项目主页请查看 [README.md](README.md) | [English Changelog](CHANGELOG_EN.md)。
 
+## API Manager 上游稳定性整合（2026-09-21）
+
+选择性移植上游 v4.7.6–v4.7.11 的账号、配额和网关修复，不合并官方分支，也不改动独立 `/codex/v1` ChatGPT 订阅通道。订阅等级改用 `loadCodeAssist` 的机器字段并统一为 `FREE`、`PRO`、`ULTRA`；每次配额刷新都可纠正历史误判，权威请求失败时保留旧等级，不再从模型目录推断套餐。
+
+官方 weekly/5h 配额按账号、标准模型族和 bucket 独立记录，较旧或缺失的快照不能覆盖新观测。Weekly 耗尽始终约束调度，5h 锁遵循零配额保护开关；成功请求、手动清除临时限流、乐观重置和账号重载都不会绕过官方周配额。显式长期 `QUOTA_EXHAUSTED` 可在文本与图片模型重启后恢复，并与官方 bucket 生命周期相互独立。
+
+网关采用账号池感知的有界自适应重试：单账号有限退避，多账号最多两轮，503/529 可逃离异常节点，短冷却会在预算内衔接下一轮；OpenAI、Claude、Gemini 及图片生成/编辑使用一致的 attempt/pool 策略。前端补齐不完整配额数据的空值保护、统一套餐展示，验证/申诉 URL 仅允许 HTTP(S)，Web OAuth 回调拒绝跨源消息。
+
+验证覆盖完整 Rust 库测试、相关定向回归和前端生产构建；Codex 路由、账号 Vault、会话 affinity 与独立调度器保持隔离。
+
 ## API Manager 定制稳定性更新（2026-09-15）
 
 Codex 会话账号 affinity 从进程内缓存升级为独立加密存储 `codex/session-affinity.enc.json`，沿用账号 Vault 密钥但使用独立 AAD，采用私有权限、临时文件、`fsync` 和原子替换写入。账号绑定不再按时间过期，也不再受 8192 条内存缓存上限约束；session/cache/response/turn/item/call/encrypted-content 同时保存调用方 scoped key 与跨 API key 的 global key。缺失或冲突的旧 continuation 会恢复到可用账号并立即永久持久化，而不是返回本地 409。

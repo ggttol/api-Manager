@@ -77,9 +77,37 @@ export interface QuotaBucket {
 
 /** 模型组配额 (如 Gemini Models / Claude and GPT models) */
 export interface QuotaGroup {
-    display_name: string;
+    display_name?: string;
     description?: string;
-    buckets: QuotaBucket[];
+    buckets?: QuotaBucket[];
+}
+
+export type AccountTier = 'ultra' | 'pro' | 'free';
+
+/**
+ * Normalize the authoritative subscription tier returned by Code Assist.
+ * Model availability is deliberately not used as a fallback: the model catalog
+ * is shared by free and paid accounts and cannot identify a subscription.
+ */
+export function getAccountTier(account: { quota?: QuotaData | null }): AccountTier {
+    const rawTier = account.quota?.subscription_tier?.trim().toLowerCase();
+    if (!rawTier) return 'free';
+
+    // Canonical values plus historical/internal aliases.
+    if (rawTier.includes('ultra') || rawTier.includes('helium')) return 'ultra';
+    if (rawTier.includes('free') || rawTier.includes('starter')) return 'free';
+    if (
+        rawTier.includes('pro') ||
+        rawTier.includes('premium') ||
+        rawTier.includes('advanced')
+    ) {
+        return 'pro';
+    }
+    return 'free';
+}
+
+export function getTierLabel(tier: AccountTier): string {
+    return tier.toUpperCase();
 }
 
 export interface DeviceProfile {

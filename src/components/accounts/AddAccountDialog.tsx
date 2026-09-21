@@ -360,6 +360,7 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
             }
 
             const handleMessage = async (event: MessageEvent) => {
+                if (event.origin && event.origin !== window.location.origin) return;
                 if (event.data?.type !== 'oauth-success' || !isActiveOAuthSession(session)) return;
                 clearWebOAuthWorkRef.current?.();
                 await fetchAccounts();
