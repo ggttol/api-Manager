@@ -15,13 +15,14 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Import Adapter Registry
 use crate::proxy::debug_logger;
 use crate::proxy::mappers::claude::{
-    clean_cache_control_from_messages, close_tool_loop_for_thinking, create_claude_sse_stream,
+    clean_cache_control_from_messages, create_claude_sse_stream,
     filter_invalid_thinking_blocks_with_family, merge_consecutive_messages,
     models::{Message, MessageContent},
-    transform_claude_request_in, transform_response, ClaudeRequest,
+    transform_response, ClaudeRequest,
 };
 use crate::proxy::mappers::context_manager::ContextManager;
 use crate::proxy::mappers::estimation_calibrator::get_calibrator;
+use crate::proxy::mappers::gemini::SUMMARY_REQUEST_TIMEOUT_SECS;
 use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
@@ -45,35 +46,52 @@ fn extract_thinking_hint(body: &Value) -> ThinkingHint {
     };
 
     // Try to extract budget_tokens from various paths
-    // Priority: thinking.budget_tokens > thinking.budgetTokens > thinking.budget > thinkingConfig.thinkingBudget
+    // Priority: thinking.budget_tokens > thinking.budgetTokens > thinking.max_tokens > thinking.budget > thinkingConfig.thinkingBudget > reasoning.max_tokens
     if let Some(budget) = body
         .get("thinking")
-        .and_then(|t| t.get("budget_tokens"))
-        .and_then(|b| b.as_u64())
-    {
-        hint.budget_tokens = Some(budget as u32);
-    } else if let Some(budget) = body
-        .get("thinking")
-        .and_then(|t| t.get("budgetTokens"))
-        .and_then(|b| b.as_u64())
-    {
-        hint.budget_tokens = Some(budget as u32);
-    } else if let Some(budget) = body
-        .get("thinking")
-        .and_then(|t| t.get("budget"))
+        .and_then(|t| {
+            t.get("budget_tokens")
+                .or_else(|| t.get("budgetTokens"))
+                .or_else(|| t.get("max_tokens"))
+                .or_else(|| t.get("maxTokens"))
+                .or_else(|| t.get("budget"))
+        })
         .and_then(|b| b.as_u64())
     {
         hint.budget_tokens = Some(budget as u32);
     } else if let Some(budget) = body
         .get("thinkingConfig")
-        .and_then(|t| t.get("thinkingBudget"))
+        .and_then(|t| {
+            t.get("thinkingBudget")
+                .or_else(|| t.get("thinking_budget"))
+                .or_else(|| t.get("budget_tokens"))
+                .or_else(|| t.get("budgetTokens"))
+        })
+        .and_then(|b| b.as_u64())
+    {
+        hint.budget_tokens = Some(budget as u32);
+    } else if let Some(budget) = body
+        .get("reasoning")
+        .and_then(|r| {
+            r.get("max_tokens")
+                .or_else(|| r.get("maxTokens"))
+                .or_else(|| r.get("budget_tokens"))
+                .or_else(|| r.get("budgetTokens"))
+        })
         .and_then(|b| b.as_u64())
     {
         hint.budget_tokens = Some(budget as u32);
     }
 
-    // Try to extract level from thinkingLevel
-    if let Some(level) = body.get("thinkingLevel").and_then(|l| l.as_str()) {
+    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort
+    if let Some(level) = body
+        .get("thinkingLevel")
+        .or_else(|| body.get("thinking_level"))
+        .or_else(|| body.get("reasoning_effort"))
+        .or_else(|| body.get("reasoningEffort"))
+        .or_else(|| body.get("output_config").and_then(|o| o.get("effort")))
+        .and_then(|l| l.as_str())
+    {
         hint.level = Some(level.to_lowercase());
     }
 
@@ -291,9 +309,9 @@ mod variant_tests {
     #[test]
     fn invalid_effort_falls_back_to_budget_tokens_for_gemini_3_model() {
         // Given a Gemini 3 model ("gemini-3-flash") with an unrecognized
-        // effort value ("max"), tier_from_effort returns None, so
+        // effort value ("unrecognized"), tier_from_effort returns None, so
         // apply_variant falls back to budget-based tier inference.
-        let mut request = request_with_effort("gemini-3-flash", "max", 4_000);
+        let mut request = request_with_effort("gemini-3-flash", "unrecognized", 4_000);
         let effort = crate::proxy::common::variant_mapping::tier_from_effort(
             request
                 .output_config
@@ -301,7 +319,7 @@ mod variant_tests {
                 .and_then(|config| config.effort.as_deref()),
         );
 
-        // tier_from_effort(Some("max")) → None (invalid value)
+        // tier_from_effort(Some("unrecognized")) → None (invalid value)
         assert_eq!(effort, None);
 
         // With effort=None and budget=4_000, infer_tier → Medium →
@@ -316,6 +334,30 @@ mod variant_tests {
         assert_eq!(
             request.thinking.as_ref().and_then(|t| t.budget_tokens),
             Some(4_000)
+        );
+    }
+
+    #[test]
+    fn max_effort_maps_to_high_tier_for_gemini_3_flash() {
+        let mut request = request_with_effort("gemini-3-flash", "max", 1_000);
+        let effort = crate::proxy::common::variant_mapping::tier_from_effort(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.effort.as_deref()),
+        );
+        assert_eq!(
+            effort,
+            Some(crate::proxy::common::variant_mapping::VariantTier::High)
+        );
+
+        apply_variant(&mut request, effort, Some(1_000))
+            .expect("gemini-3-flash must resolve with max effort");
+
+        assert_eq!(request.model, "gemini-3-flash-agent");
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.budget_tokens),
+            Some(10_000)
         );
     }
 
@@ -384,6 +426,9 @@ fn apply_variant(
 pub async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
+    upstream_recorder: Option<
+        axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>,
+    >,
     Json(body): Json<Value>,
 ) -> Response {
     // [FIX] 保存原始请求体的完整副本，用于日志记录
@@ -442,29 +487,102 @@ pub async fn handle_messages(
             }
         };
 
-    // [Task #6] Apply OpenCode variants thinking hints from raw JSON
-    // 由于此时还没拿到账号，先用模型默认限额兜底
-    let temp_cap = model_specs::get_thinking_budget(&request.model, None);
-    let thinking_hint = extract_thinking_hint(&original_body);
-    apply_thinking_hints(&mut request, &thinking_hint, &trace_id, temp_cap);
-
     // [Variant] Resolve canonical model + variant → real model + real params.
-    let client_budget = original_body
-        .get("thinking")
-        .and_then(|t| t.get("budget_tokens"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let model_lower = request.model.to_lowercase();
+    let is_v3_or_above = model_specs::is_gemini_v3_or_above(&request.model);
+    let is_explicit_tier_model = model_lower.ends_with("-high")
+        || model_lower.ends_with("-medium")
+        || model_lower.ends_with("-low")
+        || model_lower.ends_with("-extra-low");
+
+    let thinking_hint = extract_thinking_hint(&original_body);
+    let tb_config = crate::proxy::config::get_thinking_budget_config();
+    let is_client_control =
+        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
+
+    let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
+        request.thinking.as_ref().map(|t| t.type_.as_str()),
+        request
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens.map(|b| b as u64)),
+        request
+            .output_config
+            .as_ref()
+            .and_then(|c| c.effort.as_deref())
+            .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.as_deref())),
+    );
+    let client_disabled = client_switch.is_disabled();
+
+    let raw_client_budget = request.thinking.as_ref().and_then(|t| t.budget_tokens);
+
+    // [USER RULE] 对于 Gemini >= 3 或显式指定档位的模型，进站阶段彻底忽略客户端思考与预算参数，绝不被客户端 1024 或 low 污染
+    if is_client_control {
+        if client_disabled {
+            request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                type_: "disabled".to_string(),
+                budget_tokens: Some(0),
+                effort: None,
+            });
+        }
+    } else if is_v3_or_above || is_explicit_tier_model {
+        // 无论客户端未提供 thinking，或者传了 disabled，只要是 3+ 或显式模型，强制矫正为 enabled，清理客户端 budget_tokens
+        let effort_in_thinking = request.thinking.as_ref().and_then(|t| t.effort.clone());
+        request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: None,
+            effort: effort_in_thinking,
+        });
+    } else {
+        // 由于此时还没拿到账号，先用模型默认限额兜底
+        let temp_cap = model_specs::get_thinking_budget(&request.model, None);
+        apply_thinking_hints(&mut request, &thinking_hint, &trace_id, temp_cap);
+    }
+
+    // [USER RULE] 对显式指定档位或 Gemini >= 3 的思考模型，进站阶段彻底忽略客户端思考预算，绝不参与档位推断
+    let effective_budget_hint = if !is_client_control && (is_explicit_tier_model || is_v3_or_above)
+    {
+        None
+    } else {
+        original_body
+            .get("thinking")
+            .and_then(|t| t.get("budget_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+    };
+
     let effort_hint = request
         .output_config
         .as_ref()
-        .and_then(|config| config.effort.clone());
+        .and_then(|config| config.effort.clone())
+        .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
+        .or_else(|| thinking_hint.level.clone());
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
     let canonical_model = request.model.clone();
-    if let Some(spec) = apply_variant(&mut request, effort_tier, client_budget) {
+    if let Some(spec) = apply_variant(&mut request, effort_tier, effective_budget_hint) {
+        if is_client_control && client_disabled {
+            request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                type_: "disabled".to_string(),
+                budget_tokens: Some(0),
+                effort: None,
+            });
+        } else if is_client_control && raw_client_budget.is_some() {
+            request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+                type_: "enabled".to_string(),
+                budget_tokens: raw_client_budget,
+                effort: effort_hint.clone(),
+            });
+        } else if is_client_control {
+            // [CRITICAL FIX] 客户端控制模式下，客户端未传数字预算（全缺省或仅传等级）
+            // 严禁保留 apply_variant 内部赋予的 spec.thinking_budget (4000)！保持真实客户端状态
+            if let Some(ref mut t) = request.thinking {
+                t.budget_tokens = None;
+            }
+        }
         tracing::info!(
             "[{}] [Variant] canonical='{}' effort_hint={:?} budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
-            trace_id, canonical_model, effort_hint, client_budget, spec.id, spec.thinking_budget, spec.max_output_tokens
+            trace_id, canonical_model, effort_hint, effective_budget_hint, spec.id, spec.thinking_budget, spec.max_output_tokens
         );
     }
 
@@ -475,7 +593,7 @@ pub async fn handle_messages(
             "protocol": "anthropic",
             "trace_id": trace_id,
             "original_model": request.model,
-            "request": original_body,  // 使用原始请求体，不是结构体序列化
+            "request": crate::proxy::payload_audit::reorder_payload_fields(&original_body),  // 原始请求体（字段按关注度重排），不是结构体序列化
         });
         debug_logger::write_debug_payload(
             &debug_cfg,
@@ -526,6 +644,9 @@ pub async fn handle_messages(
         }
     };
 
+    // [Stage 1 Timing] 初始会话清洗计时
+    let clean_start = std::time::Instant::now();
+
     // [CRITICAL FIX] 预先清理所有消息中的 cache_control 字段 (Issue #744)
     // 必须在序列化之前处理，以确保 z.ai 和 Google Flow 都不受历史消息缓存标记干扰
     clean_cache_control_from_messages(&mut request.messages);
@@ -550,10 +671,12 @@ pub async fn handle_messages(
     // [CRITICAL FIX] 过滤并修复 Thinking 块签名 (Enhanced with family check)
     filter_invalid_thinking_blocks_with_family(&mut request.messages, target_family);
 
-    // [New] Recover from broken tool loops (where signatures were stripped)
-    if state.experimental.read().await.enable_tool_loop_recovery {
-        close_tool_loop_for_thinking(&mut request.messages);
-    }
+    // [FIX Prompt-Cache] 严禁在正常请求路径中注入合成消息 (close_tool_loop_for_thinking)！
+    // Claude Code 客户端按规范不会在后续轮次中回传历史 thinking 块。
+    // InboundThinkingPipeline 与 ThinkingStore 会在转译为 Google contents 时自动恢复真实思考块和加密签名，
+    // finalize_gemini_contents_thinking 亦具备完整的首位思考块与哨兵兜底。
+    // 若在此处注入 "[System: Tool execution completed...]" 等合成消息，会导致对话历史前缀在轮次间突变，
+    // 进而彻底破坏 Google Gemini 上游的 Prompt Caching（缓存崩塌）。
 
     // Snapshot configuration once. Holding a read guard across request processing can
     // deadlock a queued writer when this handler later attempts another read.
@@ -633,6 +756,10 @@ pub async fn handle_messages(
 
         // Inject cache_control into the XML summary message if it is a Forked session
         inject_cache_control_to_forked_summary(&mut new_body);
+
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&new_body);
+        }
 
         return crate::proxy::providers::zai_anthropic::forward_anthropic_json(
             &state,
@@ -791,9 +918,19 @@ pub async fn handle_messages(
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
     let mut force_rotate = false;
 
+    // [Stage Timing] 阶段耗时度量变量 (毫秒，保留微秒级浮点精度)
+    let clean_micros = clean_start.elapsed().as_micros() as u64;
+    let clean_ms: f64 = clean_micros as f64 / 1000.0;
+    let mut norm_ms: f64 = 0.0;
+    let mut think_fill_ms: f64 = 0.0;
+    let mut ttft_ms: f64 = 0.0;
+
     for attempt in 0..max_attempts {
+        // [Stage 2 Timing] 中转归一计时起点
+        let norm_start = std::time::Instant::now();
+
         // 2. 模型路由解析
-        let mut mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
+        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
             &request_for_body.model,
             &*state.custom_mapping.read().await,
         );
@@ -817,9 +954,25 @@ pub async fn handle_messages(
         );
 
         // 0. 尝试提取 session_id 用于粘性调度 (Phase 2/3)
-        // 使用 SessionManager 生成稳定的会话指纹
-        let session_id_str =
-            crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body);
+        // 使用 SessionManager 生成稳定的会话指纹，优先以显式会话头对齐跨协议 store_key
+        let explicit_sid = headers
+            .get("x-session-id")
+            .or_else(|| headers.get("x-jeikcode-session-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let fallback_sid = if let Some(sid) = explicit_sid {
+            sid.to_string()
+        } else {
+            crate::proxy::session_manager::SessionManager::extract_session_id(&request_for_body)
+        };
+        let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+            &headers,
+            Some(&original_body),
+            fallback_sid,
+        );
+        let session_id_str = session_scope.store_key.clone();
+        let client_session_id = session_scope.client_id.clone();
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
@@ -843,65 +996,21 @@ pub async fn handle_messages(
                     None,
                     &safe_message,
                 );
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    headers,
-                    Json(json!({
-                        "type": "error",
-                        "error": {
-                            "type": "overloaded_error",
-                            "message": format!("No available accounts: {}", safe_message)
-                        }
-                    })),
-                )
-                    .into_response();
+                let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+                    "claude",
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    mapped_model.as_str(),
+                    &safe_message,
+                );
+                return (StatusCode::SERVICE_UNAVAILABLE, headers, Json(dual_err)).into_response();
             }
         };
 
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
-        // ===== 【优化】后台任务智能检测与降级 =====
-        // 使用新的检测系统，支持 5 大类关键词和多 Flash 模型策略
-        let background_task_type = detect_background_task_type(&request_for_body);
-
-        // 传递映射后的模型名
+        // 方案 A：移除后台任务静默降级策略，请求直通客户端指定的模型，与 OpenAI 协议保持一致
         let mut request_with_mapped = request_for_body.clone();
-
-        if let Some(task_type) = background_task_type {
-            // 检测到后台任务,强制降级到 Flash 模型
-            let virtual_model_id = select_background_model(task_type);
-
-            // [FIX] 必须根据虚拟 ID Re-resolve 路由，以支持用户自定义映射 (如 internal-task -> gemini-3)
-            // 否则会直接使用 generic ID 导致下游无法识别或只能使用静态默认值
-            let resolved_model = crate::proxy::common::model_mapping::resolve_model_route(
-                virtual_model_id,
-                &*state.custom_mapping.read().await,
-            );
-
-            info!(
-                "[{}][AUTO] 检测到后台任务 (类型: {:?}), 路由重定向: {} -> {} (最终物理模型: {})",
-                trace_id, task_type, mapped_model, virtual_model_id, resolved_model
-            );
-
-            // 覆盖用户自定义映射 (同时更新变量和 Request 对象)
-            mapped_model = resolved_model.clone();
-            request_with_mapped.model = resolved_model;
-
-            // 后台任务净化：
-            // 1. 移除工具定义（后台任务不需要工具）
-            request_with_mapped.tools = None;
-
-            // 2. 移除 Thinking 配置（Flash 模型不支持）
-            request_with_mapped.thinking = None;
-
-            // 3. 清理历史消息中的 Thinking Block，防止 Invalid Argument
-            // 使用 ContextManager 的统一策略 (Aggressive)
-            crate::proxy::mappers::context_manager::ContextManager::purify_history(
-                &mut request_with_mapped.messages,
-                crate::proxy::mappers::context_manager::PurificationStrategy::Aggressive,
-            );
-        }
 
         // ===== [3-Layer Progressive Compression + Calibrated Estimation] Context Management =====
         // [ENHANCED] 整合 3.3.47 的三层压缩框架 + PR #925 的动态校准机制
@@ -1086,41 +1195,61 @@ pub async fn handle_messages(
         // let _trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
 
         let token_obj = token_manager.get_token_by_id(&account_id);
-        let gemini_body = match transform_claude_request_in(
-            &request_with_mapped,
-            &project_id,
-            retried_without_thinking,
-            Some(account_id.as_str()),
-            &session_id_str,
-            token_obj.as_ref(),
-        ) {
-            Ok(b) => {
-                debug!(
-                    "[{}] Transformed Gemini Body: {}",
-                    trace_id,
-                    serde_json::to_string_pretty(&b).unwrap_or_default()
-                );
-                b
-            }
-            Err(e) => {
-                let headers = [
-                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                    ("X-Account-Email", email.as_str()),
-                ];
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    headers,
-                    Json(json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": format!("Transform error: {}", e)
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-        };
+        let (mut gemini_body, transform_timing) =
+            match crate::proxy::mappers::claude::transform_claude_request_in_timed(
+                &request_with_mapped,
+                &project_id,
+                retried_without_thinking,
+                Some(account_id.as_str()),
+                &session_id_str,
+                token_obj.as_ref(),
+            ) {
+                Ok((b, timing)) => {
+                    debug!(
+                        "[{}] Transformed Gemini Body: {}",
+                        trace_id,
+                        serde_json::to_string_pretty(&b).unwrap_or_default()
+                    );
+                    (b, timing)
+                }
+                Err(e) => {
+                    let headers = [
+                        ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                        ("X-Account-Email", email.as_str()),
+                    ];
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        headers,
+                        Json(json!({
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": format!("Transform error: {}", e)
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+
+        let _ =
+            crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+                &mut gemini_body,
+                &mapped_model,
+            );
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+            &mut gemini_body,
+        );
+        crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        let tf_micros = transform_timing.think_fill_micros;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
+
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&gemini_body);
+        }
 
         if debug_logger::is_enabled(&debug_cfg) {
             let payload = json!({
@@ -1163,6 +1292,7 @@ pub async fn handle_messages(
         let query = if actual_stream { Some("alt=sse") } else { None };
         // [FIX #765/1522] Prepare Robust Beta Headers for Claude models
         let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("x-session-id".to_string(), client_session_id.clone());
         if mapped_model.to_lowercase().contains("claude") {
             extra_headers.insert(
                 "anthropic-beta".to_string(),
@@ -1188,7 +1318,8 @@ pub async fn handle_messages(
             }
         }
 
-        // Upstream call configuration continued...
+        // [Stage 4 Timing] 等待谷歌上游首包计时起点
+        let upstream_req_start = std::time::Instant::now();
 
         let call_result = match upstream
             .call_v1_internal_with_headers(
@@ -1331,6 +1462,7 @@ pub async fn handle_messages(
                             }
 
                             // We found real data!
+                            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                             first_data_chunk = Some(bytes);
                             break;
                         }
@@ -1436,10 +1568,16 @@ pub async fn handle_messages(
                                 .header("X-Accel-Buffering", "no")
                                 .header("X-Account-Email", &email)
                                 .header("X-Mapped-Model", &request_with_mapped.model)
+                                .header("X-Session-Id", &client_session_id)
+                                .header("X-Antigravity-Session-Id", &client_session_id)
                                 .header(
                                     "X-Context-Purified",
                                     if is_purified { "true" } else { "false" },
                                 )
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                                 .body(Body::from_stream(combined_stream))
                                 .unwrap();
                         } else {
@@ -1457,10 +1595,19 @@ pub async fn handle_messages(
                                         .header(header::CONTENT_TYPE, "application/json")
                                         .header("X-Account-Email", &email)
                                         .header("X-Mapped-Model", &request_with_mapped.model)
+                                        .header("X-Session-Id", &client_session_id)
+                                        .header("X-Antigravity-Session-Id", &client_session_id)
                                         .header(
                                             "X-Context-Purified",
                                             if is_purified { "true" } else { "false" },
                                         )
+                                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                        .header(
+                                            "X-Timing-Thinking-Ms",
+                                            format!("{:.3}", think_fill_ms),
+                                        )
+                                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                                         .body(Body::from(
                                             serde_json::to_string(&full_response).unwrap(),
                                         ))
@@ -1631,14 +1778,36 @@ pub async fn handle_messages(
             .await;
         }
 
-        // 3. 标记限流状态(用于 UI 显示) - 使用异步版本以支持实时配额刷新
-        // 🆕 传入实际使用的模型,实现模型级别限流,避免不同模型配额互相影响
-        if status_code == 429
-            || status_code == 529
-            || status_code == 503
-            || status_code == 500
-            || status_code == 404
-        {
+        // 3. 统一流水线决策判定（协议无关的唯一真理）
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
+
+        if classification.is_model_not_found() {
+            tracing::warn!(
+                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating retry loop without account lockout.",
+                trace_id, request_with_mapped.model, status_code
+            );
+            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+                "claude",
+                status_code,
+                &request_with_mapped.model,
+                &error_text,
+            );
+            return (
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND),
+                [
+                    ("X-Account-Email", email.as_str()),
+                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
+                ],
+                Json(dual_err),
+            )
+                .into_response();
+        }
+
+        if classification.should_lock_account() {
             token_manager
                 .mark_rate_limited_async_baseline(
                     &email,
@@ -1649,14 +1818,13 @@ pub async fn handle_messages(
                 )
                 .await;
 
-            // Clear both the sticky session and last-used marker before rotating.
-            if status_code == 429 || status_code == 529 || status_code == 503 {
-                token_manager
-                    .unbind_session_and_clear_last_used(session_id)
-                    .await;
+            token_manager
+                .unbind_session_and_clear_last_used(session_id)
+                .await;
+            if let Some(sid) = session_id {
                 debug!(
-                    "[{}] Unbound session from account {} due to status {}",
-                    trace_id, email, status_code
+                    "[{}] Unbound session {} from account {} due to status {}",
+                    trace_id, sid, email, status_code
                 );
             }
         }
@@ -1685,27 +1853,6 @@ pub async fn handle_messages(
                  Retrying with all thinking blocks removed.",
                 trace_id
             );
-
-            // [NEW] 追加修复提示词到最后一条用户消息
-            if let Some(last_msg) = request_for_body.messages.last_mut() {
-                if last_msg.role == "user" {
-                    let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
-
-                    match &mut last_msg.content {
-                        crate::proxy::mappers::claude::models::MessageContent::String(s) => {
-                            s.push_str(repair_prompt);
-                        }
-                        crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => {
-                            blocks.push(
-                                crate::proxy::mappers::claude::models::ContentBlock::Text {
-                                    text: repair_prompt.to_string(),
-                                },
-                            );
-                        }
-                    }
-                    tracing::debug!("[{}] Appended repair prompt to last user message", trace_id);
-                }
-            }
 
             // [IMPROVED] 不再禁用 Thinking 模式！
             // 既然我们已经将历史 Thinking Block 转换为 Text，那么当前请求可以视为一个新的 Thinking 会话
@@ -1739,12 +1886,14 @@ pub async fn handle_messages(
                 }
             }
 
-            // [NEW] Heal session after stripping thinking blocks to prevent "naked ToolResult" rejection
-            // This ensures that any ToolResult in history is properly "closed" with synthetic messages
-            // if its preceding Thinking block was just converted to Text.
-            crate::proxy::mappers::claude::thinking_utils::close_tool_loop_for_thinking(
-                &mut request_for_body.messages,
-            );
+            // 精准定向净化 ThinkingStore 中当前 session 的异构污染签名，保留思考文本与健康历史签名，
+            // 彻底防止重试阶段再次把坏签名还原回 contents
+            crate::proxy::thinking_store::ThinkingStore::global()
+                .purge_corrupted_signatures(&session_id_str, &mapped_model);
+            crate::proxy::SignatureCache::global().delete_session_signature(&client_session_id);
+
+            // [FIX Prompt-Cache] 严禁在重试路径中注入合成消息 (close_tool_loop_for_thinking)！
+            // 保持历史消息真实纯净，由 InboundThinkingPipeline 与 finalize_gemini_contents_thinking 统一兜底签名与占位。
 
             // 清理模型名中的 -thinking 后缀
             if request_for_body.model.contains("claude-") {
@@ -1812,15 +1961,38 @@ pub async fn handle_messages(
 
         // 确定重试策略
         // Adaptive strategy uses both the current pool and retry attempt.
+        // [FIX session-1M] 上游按 sessionId 在服务端累计会话输入，长工具循环会把累计推过 1M，
+        // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
+        // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
+        if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
+            let fingerprint = session_id_str.as_str();
+            let generation = crate::proxy::common::session::bump_session(&account_id, fingerprint);
+            tracing::warn!(
+                "[Claude] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
+                email, generation
+            );
+            continue; // 重试:下一轮 transform 时读取新代数,派生全新 sessionId
+        }
+
+        let scheduling_mode = token_manager.get_sticky_config().await.mode;
+        let allow_grace = match scheduling_mode {
+            crate::proxy::sticky_config::SchedulingMode::Balance => token_manager.len() <= 1,
+            crate::proxy::sticky_config::SchedulingMode::CacheFirst => true,
+            crate::proxy::sticky_config::SchedulingMode::PerformanceFirst => false,
+        };
+
+        // 确定重试策略：传入当前 attempt 与 pool_size，执行智能自适应裁决
         let retry_strategy = super::common::determine_retry_strategy_adaptive(
             status_code,
             &error_text,
             retry_after.as_deref(),
             retried_without_thinking,
-            true,
+            allow_grace,
             attempt,
             pool_size,
         );
+
+        // 执行退避
         if apply_retry_strategy(
             retry_strategy.clone(),
             attempt,
@@ -1842,31 +2014,16 @@ pub async fn handle_messages(
             }
             continue;
         } else {
-            // 5. 增强的 400 错误处理: Prompt Too Long 友好提示
-            if status_code == 400
-                && (error_text.contains("too long")
-                    || error_text.contains("exceeds")
-                    || error_text.contains("limit"))
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("X-Account-Email", email.as_str())],
-                    Json(json!({
-                        "id": "err_prompt_too_long",
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": "Prompt is too long (server-side context limit reached).",
-                            "suggestion": "Please: 1) Executive '/compact' in Claude Code 2) Reduce conversation history 3) Switch to gemini-1.5-pro (2M context limit)"
-                        }
-                    }))
-                ).into_response();
-            }
-
-            // 不可重试的错误，直接返回
+            // 不可重试的错误，直接返回双轨制友好报文
             error!(
                 "[{}] Non-retryable error {}: {}",
                 trace_id, status_code, error_text
+            );
+            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+                "claude",
+                status_code,
+                &request_with_mapped.model,
+                &error_text,
             );
             return (
                 status,
@@ -1874,7 +2031,7 @@ pub async fn handle_messages(
                     ("X-Account-Email", email.as_str()),
                     ("X-Mapped-Model", request_with_mapped.model.as_str()),
                 ],
-                error_text,
+                Json(dual_err),
             )
                 .into_response();
         }
@@ -1887,13 +2044,13 @@ pub async fn handle_messages(
             "X-Account-Email",
             header::HeaderValue::from_str(&email).unwrap(),
         );
-        if let Some(model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(&model) {
+        if let Some(ref model) = last_mapped_model {
+            if let Ok(v) = header::HeaderValue::from_str(model) {
                 headers.insert("X-Mapped-Model", v);
             }
         }
 
-        let error_type = match last_status.as_u16() {
+        let _error_type = match last_status.as_u16() {
             400 => "invalid_request_error",
             401 => "authentication_error",
             403 => "permission_error",
@@ -1916,19 +2073,20 @@ pub async fn handle_messages(
             }
         }
 
-        (response_status, headers, Json(json!({
-            "type": "error",
-            "error": {
-                "id": "err_retry_exhausted",
-                "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
-            }
-        }))).into_response()
+        let model_str = last_mapped_model.as_deref().unwrap_or("unknown");
+        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+            "claude",
+            response_status.as_u16(),
+            model_str,
+            &last_error,
+        );
+
+        (response_status, headers, Json(dual_err)).into_response()
     } else {
         // Fallback if no email (e.g. mapping error before token)
         let mut headers = HeaderMap::new();
-        if let Some(model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(&model) {
+        if let Some(ref model) = last_mapped_model {
+            if let Ok(v) = header::HeaderValue::from_str(model) {
                 headers.insert("X-Mapped-Model", v);
             }
         }
@@ -1939,7 +2097,7 @@ pub async fn handle_messages(
             }
         }
 
-        let error_type = match last_status.as_u16() {
+        let _error_type = match last_status.as_u16() {
             400 => "invalid_request_error",
             401 => "authentication_error",
             403 => "permission_error",
@@ -1955,14 +2113,15 @@ pub async fn handle_messages(
             last_status
         };
 
-        (response_status, headers, Json(json!({
-            "type": "error",
-            "error": {
-                "id": "err_retry_exhausted",
-                "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
-            }
-        }))).into_response()
+        let model_str = last_mapped_model.as_deref().unwrap_or("unknown");
+        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+            "claude",
+            response_status.as_u16(),
+            model_str,
+            &last_error,
+        );
+
+        (response_status, headers, Json(dual_err)).into_response()
     }
 }
 
@@ -2071,6 +2230,7 @@ mod tests {
 // ===== 后台任务检测辅助函数 =====
 
 /// 后台任务类型
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BackgroundTaskType {
     TitleGeneration,    // 标题生成
@@ -2081,7 +2241,7 @@ enum BackgroundTaskType {
     EnvironmentProbe,   // 环境探测
 }
 
-/// 标题生成关键词
+#[allow(dead_code)]
 const TITLE_KEYWORDS: &[&str] = &[
     "write a 5-10 word title",
     "Please write a 5-10 word title",
@@ -2094,7 +2254,7 @@ const TITLE_KEYWORDS: &[&str] = &[
     "为对话起个标题",
 ];
 
-/// 摘要生成关键词
+#[allow(dead_code)]
 const SUMMARY_KEYWORDS: &[&str] = &[
     "Summarize this coding conversation",
     "Summarize the conversation",
@@ -2107,7 +2267,7 @@ const SUMMARY_KEYWORDS: &[&str] = &[
     "extract key points from",
 ];
 
-/// 建议生成关键词
+#[allow(dead_code)]
 const SUGGESTION_KEYWORDS: &[&str] = &[
     "prompt suggestion generator",
     "suggest next prompts",
@@ -2117,7 +2277,7 @@ const SUGGESTION_KEYWORDS: &[&str] = &[
     "possible next actions",
 ];
 
-/// 系统消息关键词
+#[allow(dead_code)]
 const SYSTEM_KEYWORDS: &[&str] = &[
     "Warmup",
     "<system-reminder>",
@@ -2125,7 +2285,7 @@ const SYSTEM_KEYWORDS: &[&str] = &[
     "This is a system message",
 ];
 
-/// 环境探测关键词
+#[allow(dead_code)]
 const PROBE_KEYWORDS: &[&str] = &[
     "check current directory",
     "list available tools",
@@ -2133,7 +2293,7 @@ const PROBE_KEYWORDS: &[&str] = &[
     "test connection",
 ];
 
-/// 检测后台任务并返回任务类型
+#[allow(dead_code)]
 fn detect_background_task_type(request: &ClaudeRequest) -> Option<BackgroundTaskType> {
     let last_user_msg = extract_last_user_message_for_detection(request)?;
     let preview = last_user_msg.chars().take(500).collect::<String>();
@@ -2170,12 +2330,12 @@ fn detect_background_task_type(request: &ClaudeRequest) -> Option<BackgroundTask
     None
 }
 
-/// 辅助函数：关键词匹配
+#[allow(dead_code)]
 fn matches_keywords(text: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|kw| text.contains(kw))
 }
 
-/// 辅助函数：提取最后一条用户消息（用于检测）
+#[allow(dead_code)]
 fn extract_last_user_message_for_detection(request: &ClaudeRequest) -> Option<String> {
     request
         .messages
@@ -2208,7 +2368,7 @@ fn extract_last_user_message_for_detection(request: &ClaudeRequest) -> Option<St
         })
 }
 
-/// 根据后台任务类型选择合适的模型
+#[allow(dead_code)]
 fn select_background_model(task_type: BackgroundTaskType) -> &'static str {
     match task_type {
         BackgroundTaskType::TitleGeneration => INTERNAL_BACKGROUND_TASK,
@@ -2222,61 +2382,36 @@ fn select_background_model(task_type: BackgroundTaskType) -> &'static str {
 
 // ===== [Issue #467 Fix] Warmup 请求拦截 =====
 
-/// 检测是否为 Warmup 请求
+/// 检测是否为真正的 Claude Code 保活心跳请求（极度收窄规则，杜绝误杀）
 ///
-/// Claude Code 每 10 秒发送一次 warmup 请求，特征包括：
-/// 1. 用户消息内容以 "Warmup" 开头或包含 "Warmup"
-/// 2. tool_result 内容为 "Warmup" 错误
-/// 3. 消息循环模式：助手发送工具调用，用户返回 Warmup 错误
+/// 只有当最后一条消息为用户角色且内容严格全等于 "Warmup" 单词本身，且不包含任何工具调用或多余内容时，
+/// 才认定为客户端心跳。绝不使用 starts_with 匹配，绝不拦截 ToolResult。
 fn is_warmup_request(request: &ClaudeRequest) -> bool {
-    // [FIX] Only check the LATEST message for Warmup characteristics.
-    // Scanning history (take(10)) caused a "poisoned session" bug where one historical Warmup
-    // message would cause all subsequent user inputs (e.g. "Continue") to be intercepted
-    // and replied with "OK".
-
     if let Some(msg) = request.messages.last() {
-        // We only care if the *current* trigger is a Warmup
+        if msg.role != "user" {
+            return false;
+        }
         match &msg.content {
             crate::proxy::mappers::claude::models::MessageContent::String(s) => {
-                // Check if simple text starts with Warmup (and is short)
-                if s.trim().starts_with("Warmup") && s.len() < 100 {
-                    return true;
-                }
+                s.trim().eq_ignore_ascii_case("warmup")
             }
             crate::proxy::mappers::claude::models::MessageContent::Array(arr) => {
-                for block in arr {
-                    match block {
-                        crate::proxy::mappers::claude::models::ContentBlock::Text { text } => {
-                            let trimmed = text.trim();
-                            if trimmed == "Warmup" || trimmed.starts_with("Warmup\n") {
-                                return true;
-                            }
-                        }
-                        crate::proxy::mappers::claude::models::ContentBlock::ToolResult {
-                            content,
-                            is_error,
-                            ..
-                        } => {
-                            // Check tool result errors
-                            let content_str = if let Some(s) = content.as_str() {
-                                s.to_string()
-                            } else {
-                                content.to_string()
-                            };
-
-                            // If it's an error and starts with Warmup, it's a warmup signal
-                            if *is_error == Some(true) && content_str.trim().starts_with("Warmup") {
-                                return true;
-                            }
-                        }
-                        _ => {}
+                if arr.len() == 1 {
+                    if let crate::proxy::mappers::claude::models::ContentBlock::Text { text } =
+                        &arr[0]
+                    {
+                        text.trim().eq_ignore_ascii_case("warmup")
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
             }
         }
+    } else {
+        false
     }
-
-    false
 }
 
 /// 创建 Warmup 请求的模拟响应
@@ -2382,45 +2517,49 @@ async fn call_gemini_sync(
     )
     .map_err(|e| format!("Failed to transform request: {}", e))?;
 
+    // 走共享的辅助调用通道：复用主请求路径的客户端（含按账号代理池）、
+    // 端点顺序（Daily → Sandbox → Prod）、URL 形状与回退判定。
+    //
+    // 历史实现把 `transform_claude_request_in` 产出的**已包装 cloudcode 信封**
+    // （内含 project / request / model / userAgent / requestId / requestType）
+    // POST 到 `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
+    // —— host 与形状双双不符。实测该 host 对 Antigravity 账号恒返回
+    // 403 `ACCESS_TOKEN_SCOPE_INSUFFICIENT`（token 不具备公共 Generative Language API 权限），
+    // 因此该后台摘要从未成功过。
     debug!(
-        "[{}] Calling routed Gemini model {} for summary",
-        trace_id, resolved_model
+        "[{}] Calling {} via cloudcode v1internal for summary",
+        trace_id, model
     );
-    let response = upstream
-        .call_v1_internal(
+
+    let gemini_response = upstream
+        .call_v1_internal_auxiliary(
             "generateContent",
             &access_token,
             gemini_body,
-            None,
             Some(account_id.as_str()),
+            SUMMARY_REQUEST_TIMEOUT_SECS,
         )
-        .await
-        .map_err(|e| format!("API call failed: {}", e))?
-        .response;
+        .await?;
 
-    if !response.status().is_success() {
-        return Err(format!(
-            "API returned {}: {}",
-            response.status(),
-            response.text().await.unwrap_or_default()
-        ));
-    }
+    // 上游返回 `{"response": {...}}` 包装体，必须先解包。
+    let unwrapped = crate::proxy::mappers::gemini::unwrap_response(&gemini_response);
 
-    let gemini_response: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
-    let gemini_response = crate::proxy::mappers::gemini::unwrap_response(&gemini_response);
-
-    gemini_response
+    // 只拼接「非思考 part」的文本：前面可能存在 `{"thought": true, "text": ""}` 的空块，
+    // 直接取 `parts[0].text` 会拿到空串并把空摘要当成功。
+    unwrapped
         .get("candidates")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
-        .and_then(|p| p.get(0))
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .map(str::to_owned)
+        .and_then(|parts| parts.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| !crate::proxy::thinking_store::is_thought_part(part))
+                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .collect::<String>()
+        })
+        .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| "Failed to extract text from response".to_string())
 }
 
@@ -2610,5 +2749,90 @@ fn inject_cache_control_to_forked_summary(body: &mut serde_json::Value) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+    use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+
+    #[test]
+    fn test_is_warmup_request_strictly_exact() {
+        // 1. 严格全等为 Warmup 的请求
+        let exact_req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Warmup".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+            stop_sequences: None,
+        };
+        assert!(is_warmup_request(&exact_req));
+
+        // 2. 带后续句子的真实用户问题，绝不误杀！
+        let real_question_req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Warmup function in PyTorch 怎么写？".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+            stop_sequences: None,
+        };
+        assert!(!is_warmup_request(&real_question_req));
+
+        // 3. 包含 ToolResult 的消息，绝不误杀！
+        let tool_error_req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Array(vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool_1".to_string(),
+                    content: serde_json::json!("Warmup failed: connection refused"),
+                    is_error: Some(true),
+                }]),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+            stop_sequences: None,
+        };
+        assert!(!is_warmup_request(&tool_error_req));
     }
 }

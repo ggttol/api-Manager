@@ -3,6 +3,7 @@ use crate::proxy::SignatureCache;
 use tracing::{debug, info, warn};
 
 pub const MIN_SIGNATURE_LENGTH: usize = 50;
+pub const SENTINEL_SIGNATURE: &str = crate::proxy::thinking_store::SENTINEL_SIGNATURE;
 
 #[derive(Debug, Default)]
 pub struct ConversationState {
@@ -112,10 +113,13 @@ pub fn close_tool_loop_for_thinking(messages: &mut Vec<Message>) {
                     } = block
                     {
                         if !thinking.is_empty()
-                            && signature
-                                .as_ref()
-                                .map(|s| s.len() >= MIN_SIGNATURE_LENGTH)
-                                .unwrap_or(false)
+                            && (signature.is_none()
+                                || signature
+                                    .as_ref()
+                                    .map(|s| {
+                                        s.len() >= MIN_SIGNATURE_LENGTH || s == SENTINEL_SIGNATURE
+                                    })
+                                    .unwrap_or(true))
                         {
                             has_valid_thinking = true;
                             break;
@@ -200,45 +204,52 @@ pub fn filter_invalid_thinking_blocks_with_family(
         }
 
         if let MessageContent::Array(blocks) = &mut msg.content {
-            let original_len = blocks.len();
-            blocks.retain(|block| {
+            for block in blocks.iter_mut() {
                 if let ContentBlock::Thinking { signature, .. } = block {
-                    // 1. Basic length check - allow empty signatures to pass through for compatibility
-                    let sig = match signature {
-                        Some(s) if s.len() >= MIN_SIGNATURE_LENGTH || s.is_empty() => s,
-                        None => return true, // Allow None signatures to pass through
-                        _ => {
-                            stripped_count += 1;
-                            return false;
+                    if let Some(s) = signature.as_deref() {
+                        // Empty signature: keep thinking block, normalize signature to None for sentinel resolution
+                        if s.is_empty() {
+                            *signature = None;
+                            continue;
                         }
-                    };
 
-                    // The cache records concrete upstream model versions while handlers
-                    // supply a protocol family (for example, `gemini`). Compare their
-                    // canonical families, retaining the detailed cache value elsewhere.
-                    if let Some(target) = target_family {
-                        if let Some(origin_family) = get_signature_family(sig) {
-                            if normalized_signature_family(&origin_family)
-                                != normalized_signature_family(target)
+                        if let Some(target) = target_family {
+                            if let Some(origin_family) = get_signature_family(s) {
+                                if normalized_signature_family(&origin_family)
+                                    != normalized_signature_family(target)
+                                {
+                                    warn!(
+                                        "[Thinking-Sanitizer] Dropping signature from family '{}' for target '{}'",
+                                        origin_family, target
+                                    );
+                                    *signature = None;
+                                    stripped_count += 1;
+                                }
+                            } else if normalized_signature_family(target) == "gemini"
+                                && !crate::proxy::thinking_store::is_likely_gemini_signature(s)
                             {
-                                warn!("[Thinking-Sanitizer] Dropping signature from family '{}' for target '{}'", origin_family, target);
+                                warn!(
+                                    "[Thinking-Sanitizer] Dropping unknown non-Gemini signature (len: {}) for target '{}'",
+                                    s.len(), target
+                                );
+                                *signature = None;
                                 stripped_count += 1;
-                                return false;
                             }
-                        } else {
-                            // [CRITICAL] Signature family not found in cache.
-                            // This happens after a server restart when memory is cleared.
-                            // If we pass this unverified signature to the upstream, it will likely return 400 "Invalid signature".
-                            // It is safer to strip the signature and let the upstream regenerate it.
-                            info!("[Thinking-Sanitizer] Dropping unverified signature (cache miss after restart)");
-                            stripped_count += 1;
-                            return false;
                         }
-                    } else if get_signature_family(sig).is_none() && !sig.is_empty() {
-                        // Even if no target family is specified, we still want to filter out signatures
-                        // that we can't verify (unless they are empty, which indicates a fresh start).
-                        info!("[Thinking-Sanitizer] Dropping unverified signature (no target family)");
-                        stripped_count += 1;
+                    }
+                }
+            }
+
+            // Clean up completely empty thinking blocks without text or signature
+            let original_len = blocks.len();
+            blocks.retain(|b| {
+                if let ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                    ..
+                } = b
+                {
+                    if thinking.trim().is_empty() && signature.is_none() {
                         return false;
                     }
                 }
@@ -256,7 +267,7 @@ pub fn filter_invalid_thinking_blocks_with_family(
 
     if stripped_count > 0 {
         info!(
-            "[Thinking-Sanitizer] Stripped {} invalid or incompatible thinking blocks",
+            "[Thinking-Sanitizer] Sanitized {} invalid or incompatible thinking signatures (preserved thinking blocks)",
             stripped_count
         );
     }
@@ -306,7 +317,11 @@ mod tests {
         assert!(matches!(
             &messages[0].content,
             MessageContent::Array(blocks)
-                if matches!(blocks.as_slice(), [ContentBlock::Text { text }] if text == ".")
+                if matches!(
+                    blocks.as_slice(),
+                    [ContentBlock::Thinking { thinking, signature: None, .. }]
+                        if thinking == "reasoning"
+                )
         ));
     }
 }

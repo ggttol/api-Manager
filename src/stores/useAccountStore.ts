@@ -47,6 +47,7 @@ interface AccountState {
     warmUpAccounts: () => Promise<string>;
     warmUpAccount: (accountId: string) => Promise<string>;
     updateAccountLabel: (accountId: string, label: string) => Promise<void>;
+    updateAccountPriority: (accountId: string, priority: number) => Promise<void>;
 }
 
 export const useAccountStore = create<AccountState>((set, get) => ({
@@ -328,6 +329,14 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         } finally {
             await get().fetchAccounts();
         }
+    },
+
+    updateAccountPriority: async (accountId, priority) => {
+        await accountService.updateAccountPriority(accountId, priority);
+        set(state => ({
+            accounts: state.accounts.map(account => account.id === accountId ? { ...account, priority } : account),
+            currentAccount: state.currentAccount?.id === accountId ? { ...state.currentAccount, priority } : state.currentAccount,
+        }));
     },
 
     updateAccountLabel: async (accountId: string, label: string) => {

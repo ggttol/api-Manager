@@ -20,82 +20,44 @@ pub fn update_dynamic_forwarding_rules(old_model: String, new_model: String) {
 static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
 
-    // 直接支持的模型
+    // ── Claude 系列核心标准映射 ──
     m.insert("claude-sonnet-4-6", "claude-sonnet-4-6");
     m.insert("claude-sonnet-4-6-thinking", "claude-sonnet-4-6-thinking");
-
-    // [Redirect] Sonnet 4.5 -> Sonnet 4.6
+    m.insert("claude-opus-4-6", "claude-opus-4-6-thinking");
+    m.insert("claude-opus-4-6-thinking", "claude-opus-4-6-thinking");
     m.insert("claude-sonnet-4-5", "claude-sonnet-4-6");
     m.insert("claude-sonnet-4-5-thinking", "claude-sonnet-4-6-thinking");
-
-    // 别名映射
-    m.insert("claude-sonnet-4-5-20250929", "claude-sonnet-4-6-thinking");
-    m.insert("claude-3-5-sonnet-20241022", "claude-sonnet-4-6");
-    m.insert("claude-3-5-sonnet-20240620", "claude-sonnet-4-6");
-    // [Redirect] Opus 4.5 -> Opus 4.6 (Issue #1743)
-    m.insert("claude-opus-4", "claude-opus-4-6-thinking");
     m.insert("claude-opus-4-5-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-5-20251101", "claude-opus-4-6-thinking");
-
-    // Claude Opus 4.6
-    m.insert("claude-opus-4-6-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-6", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4.6-thinking", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4.6", "claude-opus-4-6-thinking");
-    m.insert("claude-opus-4-6-20260201", "claude-opus-4-6-thinking");
-
+    m.insert("claude-haiku-4-5", "claude-sonnet-4-6");
     m.insert("claude-haiku-4", "claude-sonnet-4-6");
-    m.insert("claude-3-haiku-20240307", "claude-sonnet-4-6");
-    m.insert("claude-haiku-4-5-20251001", "claude-sonnet-4-6");
-    // OpenAI 协议映射表
-    m.insert("gpt-4", "gemini-2.5-flash");
-    m.insert("gpt-4-turbo", "gemini-2.5-flash");
-    m.insert("gpt-4-turbo-preview", "gemini-2.5-flash");
-    m.insert("gpt-4-0125-preview", "gemini-2.5-flash");
-    m.insert("gpt-4-1106-preview", "gemini-2.5-flash");
-    m.insert("gpt-4-0613", "gemini-2.5-flash");
 
+    // ── OpenAI 核心标准映射 ──
     m.insert("gpt-4o", "gemini-2.5-flash");
-    m.insert("gpt-4o-2024-05-13", "gemini-2.5-flash");
-    m.insert("gpt-4o-2024-08-06", "gemini-2.5-flash");
-
     m.insert("gpt-4o-mini", "gemini-2.5-flash");
-    m.insert("gpt-4o-mini-2024-07-18", "gemini-2.5-flash");
-
+    m.insert("gpt-4-turbo", "gemini-2.5-flash");
+    m.insert("gpt-4", "gemini-2.5-flash");
     m.insert("gpt-3.5-turbo", "gemini-2.5-flash");
-    m.insert("gpt-3.5-turbo-16k", "gemini-2.5-flash");
-    m.insert("gpt-3.5-turbo-0125", "gemini-2.5-flash");
-    m.insert("gpt-3.5-turbo-1106", "gemini-2.5-flash");
-    m.insert("gpt-3.5-turbo-0613", "gemini-2.5-flash");
 
-    // Gemini 协议映射表
-    m.insert("gemini-2.5-flash-lite", "gemini-2.5-flash");
-    m.insert("gemini-2.5-flash-thinking", "gemini-2.5-flash-thinking");
-    // Gemini Pro family:
-    // - Concrete model IDs should pass through unchanged.
-    // - Generic aliases (without tier) still route to preview as fallback entrypoint.
-    m.insert("gemini-3.1-pro-low", "gemini-3.1-pro-low");
+    // ── Gemini 核心标准映射 ──
+    m.insert("gemini-3.8-flash", "gemini-3.8-flash-tiered");
+    m.insert("gemini-3.7-flash", "gemini-3.7-flash-tiered");
+    m.insert("gemini-3.7-flash-tiered", "gemini-3.7-flash-tiered");
+    m.insert("gemini-3.7-flash-high", "gemini-3.7-flash-high");
+    m.insert("gemini-3.7-flash-medium", "gemini-3.7-flash-medium");
+    m.insert("gemini-3.7-flash-low", "gemini-3.7-flash-low");
+    m.insert("gemini-3.5-flash", "gemini-3.5-flash");
+    m.insert("gemini-3-flash", "gemini-3-flash");
     m.insert("gemini-3.1-pro-high", "gemini-pro-agent");
+    m.insert("gemini-3.1-pro-low", "gemini-3.1-pro-low");
     m.insert("gemini-3.1-pro-preview", "gemini-3.1-pro-preview");
     m.insert("gemini-3.1-pro", "gemini-3.1-pro-preview");
-    m.insert("gemini-3-pro-low", "gemini-3-pro-low");
-    m.insert("gemini-3-pro-high", "gemini-pro-agent");
-    m.insert("gemini-3-pro-preview", "gemini-3-pro-preview");
-    m.insert("gemini-3-pro", "gemini-3-pro-preview");
-    m.insert("gemini-2.5-flash", "gemini-2.5-flash");
-    m.insert("gemini-3-flash", "gemini-3-flash");
-    m.insert("gemini-3.5-flash", "gemini-3.5-flash");
-    m.insert("gemini-3.6-flash", "gemini-3.6-flash");
-    m.insert("gemini-3.7-flash", "gemini-3.7-flash");
-    m.insert("gemini-3.7-flash-tiered", "gemini-3.7-flash-tiered");
-    m.insert("gemini-3.7-flash-low", "gemini-3.7-flash-low");
-    m.insert("gemini-3.7-flash-medium", "gemini-3.7-flash-medium");
-    m.insert("gemini-3.7-flash-high", "gemini-3.7-flash-high");
+    m.insert("gemini-3.1-flash-lite", "gemini-3.1-flash-lite");
+    m.insert("gemini-3.1-flash-image", "gemini-3.1-flash-image");
     m.insert("gemini-3-pro-image", "gemini-3-pro-image");
-
-    // [New] Unified Virtual ID for Background Tasks (Title, Summary, etc.)
-    // Allows users to override all background tasks via custom_mapping
-    m.insert("internal-background-task", "gemini-2.5-flash");
+    m.insert("gemini-2.5-pro", "gemini-2.5-pro");
+    m.insert("gemini-2.5-flash", "gemini-2.5-flash");
+    m.insert("gemini-2.5-flash-thinking", "gemini-2.5-flash-thinking");
+    m.insert("gemini-2.5-flash-lite", "gemini-2.5-flash");
 
     m
 });
@@ -127,25 +89,79 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 /// assert_eq!(map_claude_model_to_gemini("claude-sonnet-5"), "claude-sonnet-5");
 /// ```
 pub fn map_claude_model_to_gemini(input: &str) -> String {
-    // 1. Check exact match in map
+    // 1. 精确匹配标准映射表
     if let Some(mapped) = CLAUDE_TO_GEMINI.get(input) {
         return mapped.to_string();
     }
 
-    // 2. Pass-through known prefixes (gemini-, -thinking) to support dynamic suffixes
+    // 2. 兼容历史老版本 ID 重定向 (不泄漏到外部列表)
+    match input {
+        "claude-3-5-sonnet-20241022" | "claude-3-5-sonnet-20240620" | "claude-3-haiku-20240307" => {
+            return "claude-sonnet-4-6".to_string()
+        }
+        "claude-opus-4" | "claude-opus-4-5-20251101" | "claude-opus-4-6-20260201" => {
+            return "claude-opus-4-6-thinking".to_string()
+        }
+        "gemini-3-pro-high" => return "gemini-pro-agent".to_string(),
+        "gemini-3-pro-low" => return "gemini-3-pro-low".to_string(),
+        "gemini-3-pro" | "gemini-3-pro-preview" => return "gemini-3.1-pro-preview".to_string(),
+        "internal-background-task" => return "gemini-2.5-flash".to_string(),
+        _ => {}
+    }
+
+    // 3. Known prefixes (gemini-, -thinking) pass-through
     if input.starts_with("gemini-") || input.contains("thinking") {
         return input.to_string();
     }
 
-    // 3. [ENHANCED] 直接透传未知模型 ID,而不是强制 fallback
-    // 这允许用户通过自定义映射体验未发布的模型 (如 claude-opus-4-6)
-    // Google API 会自动处理无效模型并返回错误,用户可以根据错误调整映射
+    // 4. 直接透传未知模型 ID
     input.to_string()
 }
 
-/// 获取所有内置支持的模型列表关键字
+/// 获取所有内置支持的标准公开模型列表 (已清理过期实验模型、重复笛卡尔积及旧快照)
 pub fn get_supported_models() -> Vec<String> {
-    CLAUDE_TO_GEMINI.keys().map(|s| s.to_string()).collect()
+    vec![
+        // Gemini 3.x 主力系列
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
+        "gemini-3.7-flash-tiered",
+        "gemini-3.5-flash",
+        "gemini-3-flash",
+        "gemini-3.1-pro",
+        "gemini-3.1-pro-high",
+        "gemini-3.1-pro-low",
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
+        // Gemini 图像生成主力模型 (统一保留规范名称，彻底消除 21 种宽高比/分辨率组合噪点)
+        "gemini-3.1-flash-image",
+        "gemini-3-pro-image",
+        // Gemini 2.5 经典系列
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-thinking",
+        "gemini-2.5-flash-lite",
+        // Claude 系列
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-6-thinking",
+        "claude-opus-4-6",
+        "claude-opus-4-6-thinking",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-5-thinking",
+        "claude-haiku-4-5",
+        "claude-haiku-4",
+        // OpenAI GPT 核心兼容系列
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4-turbo",
+        "gpt-4",
+        "gpt-3.5-turbo",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// 动态获取所有可用模型列表 (包含内置与用户自定义与官方端点动态下发)
@@ -164,7 +180,7 @@ pub async fn get_all_dynamic_models(
         }
     }
 
-    // 如果未开启 only_raw_quota_models，则追加 custom_mapping、内置映射别名与硬编码画画/变体模型
+    // 如果未开启 only_raw_quota_models，则追加 custom_mapping 与内置标准公开模型
     if !only_raw_quota_models {
         // 2. 获取所有自定义映射模型 (Custom)
         {
@@ -174,34 +190,21 @@ pub async fn get_all_dynamic_models(
             }
         }
 
-        // 3. 获取所有内置映射模型
+        // 3. 获取所有内置标准模型
         for m in get_supported_models() {
             model_ids.insert(m);
         }
 
-        // 4. 确保包含常用的 Gemini/画画模型 ID
-        model_ids.insert("gemini-3.1-pro-low".to_string());
-
-        // Issue #247: Dynamically generate all Image Gen Combinations
-        let base = "gemini-3-pro-image";
-        let resolutions = vec!["", "-2k", "-4k"];
-        let ratios = vec!["", "-1x1", "-4x3", "-3x4", "-16x9", "-9x16", "-21x9"];
-
-        for res in resolutions {
-            for ratio in ratios.iter() {
-                let mut id = base.to_string();
-                id.push_str(res);
-                id.push_str(ratio);
-                model_ids.insert(id);
-            }
-        }
-
-        model_ids.insert("gemini-2.0-flash-exp".to_string());
-        model_ids.insert("gemini-2.5-flash".to_string());
-        model_ids.insert("gemini-3-flash".to_string());
+        // 4. 确保包含常用的画画与配额模型 ID (去重)
+        model_ids.insert("gemini-3.1-flash-image".to_string());
+        model_ids.insert("gemini-3-pro-image".to_string());
         model_ids.insert("gemini-3.1-pro-high".to_string());
         model_ids.insert("gemini-3.1-pro-low".to_string());
     }
+
+    // 5. 过滤掉内部虚拟 ID 和已下线的过期实验模型
+    model_ids.remove("internal-background-task");
+    model_ids.remove("gemini-2.0-flash-exp");
 
     let mut sorted_ids: Vec<_> = model_ids.into_iter().collect();
     sorted_ids.sort();
@@ -287,6 +290,20 @@ pub fn resolve_model_route(
         return target.clone();
     }
 
+    // 1.5 [NEW] 检查是否命中自定义映射中的通配符规则 `gemini-3.x-flash`（要求 x > 8）
+    // 统一转为 3.x-flash-tiered 模型
+    if custom_mapping.contains_key("gemini-3.x-flash") {
+        if let Some(target) =
+            crate::proxy::model_specs::resolve_gemini_3x_flash_tiered(original_model)
+        {
+            crate::modules::logger::log_info(&format!(
+                "[Router] 命中内置通配符规则 gemini-3.x-flash (x > 8): {} -> {}",
+                original_model, target
+            ));
+            return target;
+        }
+    }
+
     // 2. Wildcard match - most specific (highest non-wildcard chars) wins
     // Note: When multiple patterns have the SAME specificity, HashMap iteration order
     // determines the result (non-deterministic). Users can avoid this by making patterns
@@ -311,6 +328,17 @@ pub fn resolve_model_route(
     }
 
     // 3. 系统默认映射
+    // [NEW] 检查是否为 >= 3.6 的无后缀 Flash 衍生模型（如 gemini-3.6-flash, gemini-3.7-flash, gemini-3.8-flash 等）
+    // 统一自动预设路由到对应的 tiered 自适应思考模型
+    if crate::proxy::model_specs::is_bare_gemini_v36_or_above_flash(original_model) {
+        let routed = format!("{}-tiered", original_model);
+        crate::modules::logger::log_info(&format!(
+            "[Router] 无后缀 Gemini >= 3.6 Flash 模型统一预设路由至 Tiered: {} -> {}",
+            original_model, routed
+        ));
+        return routed;
+    }
+
     let result = map_claude_model_to_gemini(original_model);
     if result != original_model {
         crate::modules::logger::log_info(&format!(
@@ -332,6 +360,38 @@ pub fn resolve_model_route(
 /// - `claude-sonnet-4-5`: All Claude Sonnet variants (3-5-sonnet, sonnet-4-5, etc.)
 ///
 /// Returns `None` if the model doesn't match any of the 3 protected categories.
+/// 判断是否为 Gemini 3.5 Flash 及以上的高阶 Flash 模型（与 3.1 Pro 共享高级配额）
+/// 严格语义通配：gemini-{ver}-flash*，当版本数值 ver >= 3.5 时生效（支持未来任意 3.10、4.x 等）
+fn is_high_tier_flash(lower: &str) -> bool {
+    if !lower.contains("flash") {
+        return false;
+    }
+
+    if let Some(pos) = lower.find("gemini-") {
+        let rest = &lower[pos + 7..];
+        if let Some(flash_pos) = rest.find("-flash") {
+            let ver = &rest[..flash_pos];
+            let mut parts = ver.split('.');
+            if let Some(major_s) = parts.next() {
+                if let Ok(major) = major_s.parse::<u32>() {
+                    if major > 3 {
+                        return true;
+                    }
+                    if major == 3 {
+                        if let Some(minor_s) = parts.next() {
+                            if let Ok(minor) = minor_s.parse::<u32>() {
+                                return minor >= 5;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
@@ -345,12 +405,17 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
         return Some("gemini-3-pro-image".to_string());
     }
 
-    // 2. gemini-3-flash (包含所有 flash 变体)
+    // 2. 3.5 Flash 及以上的高阶 Flash 模型（如 3.5-flash, 3.7-flash, 3.8-flash 等）与 3.1 Pro 共享高级配额
+    if is_high_tier_flash(&lower) {
+        return Some("gemini-3-pro-high".to_string());
+    }
+
+    // 3. gemini-3-flash (包含普通 1.5-flash, 2.0-flash, 2.5-flash, 3.0-flash 等基础 flash 变体)
     if lower.contains("flash") {
         return Some("gemini-3-flash".to_string());
     }
 
-    // 3. gemini-3-pro-high (包含 pro 变体)
+    // 4. gemini-3-pro-high (包含 pro 变体)
     if lower.contains("pro") && !lower.contains("image") {
         return Some("gemini-3-pro-high".to_string());
     }
@@ -604,5 +669,54 @@ mod tests {
             vec!["claude"]
         );
         assert!(quota_group_standard_ids("unrelated experimental quota").is_empty());
+    }
+
+    #[test]
+    fn test_gemini_3x_flash_wildcard_route() {
+        let mut custom = crate::proxy::config::default_custom_mapping();
+        assert!(custom.contains_key("gemini-3.6-flash"));
+        assert!(custom.contains_key("gemini-3.7-flash"));
+        assert!(custom.contains_key("gemini-3.8-flash"));
+        assert!(custom.contains_key("gemini-3.x-flash"));
+
+        // 1. 3.6 / 3.7 / 3.8 精确匹配默认预设
+        assert_eq!(
+            resolve_model_route("gemini-3.6-flash", &custom),
+            "gemini-3.6-flash-tiered"
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.7-flash", &custom),
+            "gemini-3.7-flash-tiered"
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.8-flash", &custom),
+            "gemini-3.8-flash-tiered"
+        );
+
+        // 2. x > 8 命中通配符规则 gemini-3.x-flash，统一转为 3.x-flash-tiered
+        assert_eq!(
+            resolve_model_route("gemini-3.9-flash", &custom),
+            "gemini-3.9-flash-tiered"
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.10-flash", &custom),
+            "gemini-3.10-flash-tiered"
+        );
+
+        // 3. 用户如果自定义精确覆盖 gemini-3.9-flash，用户自定义优先
+        custom.insert(
+            "gemini-3.9-flash".to_string(),
+            "gemini-3.9-flash-high".to_string(),
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.9-flash", &custom),
+            "gemini-3.9-flash-high"
+        );
+
+        // 4. 大于 3.8 的未来模型即使不在精确表中也统一走 tiered（含 4.x）
+        assert_eq!(
+            resolve_model_route("gemini-4.0-flash", &custom),
+            "gemini-4.0-flash-tiered"
+        );
     }
 }

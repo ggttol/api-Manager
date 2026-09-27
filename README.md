@@ -15,19 +15,19 @@ Codex 账号池默认开启额度切换：上游返回完整 HTTP `429` 错误�
 ---
 
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.7.1)
+> 专业级 AI 账号管理与协议代理系统（基于上游 v4.8.3）
 <div align="center">
-  <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
+  <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
+  <h3>Antigravity Tools</h3>
+  <p>多平台自动化运维与多账号矩阵调度控制台</p>
 
-  <h3>您的个人高性能 AI 调度网关</h3>
-  <p>不仅仅是账号管理，更是打破 API 调用壁垒的终极解决方案。</p>
-  
   <p>
-    <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.7.1-blue?style=flat-square" alt="Version">
+    <a href="https://github.com/lbjlaq/Antigravity-Manager/releases">
+      <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
-    <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
-    <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
+    <a href="https://github.com/lbjlaq/Antigravity-Manager">
+      <img src="https://img.shields.io/badge/Upstream-4.8.3-blue?style=flat-square" alt="Upstream version">
+    </a>
     <img src="https://img.shields.io/badge/Frontend-React-61DAFB?style=flat-square" alt="React">
     <img src="https://img.shields.io/badge/License-CC--BY--NC--SA--4.0-lightgrey?style=flat-square" alt="License">
   </p>
@@ -61,7 +61,7 @@ Codex 账号池默认开启额度切换：上游返回完整 HTTP `429` 错误�
 | 赞助商 (Sponsor) | 简介 (Description) |
 | :---: | :--- |
 | <img src="docs/images/packycode_logo.png" width="200" alt="PackyCode Logo"> | 感谢 **PackyCode** 对本项目的赞助！PackyCode 是一家可靠高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种服务的中转。PackyCode 为本项目的用户提供了特别优惠：使用[此链接](https://www.packyapi.com/register?aff=Ctrler)注册，并在充值时输入 **“Ctrler”** 优惠码即可享受 **九折优惠**。 |
-| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | 感谢 APIKEY.FUN 赞助本项目！APIKEY.FUN 是一家专业的企业级 AI 中转站，致力于为企业和个人开发者提供稳定、高效、低成本的 AI 模型 API 接入服务。平台支持 Claude、OpenAI、Gemini 等主流热门模型，价格低至官方原价的 7%。通过本项目[专属链接](https://apikey.fun/register?aff=Ctrler)注册，还可享受最高 **充值永久 95 折** 专属优惠。 |
+| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | 感谢 APIKEY.FUN 赞助本项目！APIKEY.FUN 是一家专业的企业级 AI 中转站，致力于为企业和个人开发者提供稳定、高效、低成本的 AI 模型 API 接入服务。平台支持 Claude、OpenAI、Gemini 等主流热门模型，价格低至官方原价的 7%。通过本项目[专属链接](https://apikey.fan/register?aff=Ctrler)注册，还可享受最高 **充值永久 95 折** 专属优惠。 |
 | <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | 感谢 **Claude API** 对本项目的支持！claudeapi.com 是一家走**官方与 AWS 渠道**接入的 **Claude API** 中转站，专注 Claude，主打高稳定、低延迟，完整支持 Claude Code。为本项目用户提供专属福利：通过[专属链接](https://console.claudeapi.com/register?source=antigravity)注册即送**免费测试额度，零门槛跑通**；充值再享 **95 折**专属优惠(联系客服）。 |
 | <img src="docs/images/AICodeMirror.jpg" width="200" alt="AICodeMirror Logo"> | 感谢 AICodeMirror 赞助了本项目！AICodeMirror 提供 Claude Code / Codex / Gemini CLI 官方高稳定中转服务，支持企业级高并发、极速开票、7×24 专属技术支持。 Claude Code / Codex / Gemini 官方渠道低至 3.8 / 0.2 / 0.9 折，充值更有折上折！AICodeMirror 为 Antigravity-Manager 的用户提供了特别福利，通过[此链接](https://aicodemirror.ai/register?invitecode=MV5XUM)注册的用户，可享受首充8折，企业客户最高可享 7.5 折！ |
 
@@ -201,10 +201,11 @@ brew install --cask antigravity-tools
 ### 选项 C: Docker 部署 (推荐用于 NAS/服务器)
 如果您希望在容器化环境中运行，我们提供了原生的 Docker 镜像。该镜像内置了对 v4.0.2 原生 Headless 架构的支持，可自动托管前端静态资源，并通过浏览器直接进行管理。
 
+#### 方式 1: 直接运行 (推荐)
+- **API_KEY**: 必填。用于所有协议的 AI 请求鉴权。
+- **WEB_PASSWORD**: 可选。用于管理后台登录。若不设置则默认使用 API_KEY。
+
 ```bash
-# 方式 1: 直接运行 (推荐)
-# - API_KEY: 必填。用于所有协议的 AI 请求鉴定。
-# - WEB_PASSWORD: 可选。用于管理后台登录。若不设置则默认使用 API_KEY。
 docker run -d --name antigravity-manager \
   -p 8045:8045 \
   -e API_KEY=sk-your-api-key \
@@ -214,6 +215,26 @@ docker run -d --name antigravity-manager \
   lbjlaq/antigravity-manager:latest
 
 # 忘记密钥？执行 docker logs antigravity-manager 或 grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json
+```
+
+> [!TIP]
+> 上游镜像不包含本分支的 Codex 通道；不要用它替换本项目的服务。需要 Codex 时请按 [Docker 部署说明](docker/README.md#api-manager-codex-修改版)从本仓库构建镜像。
+> **🧪 Beta / 预览版镜像拉取**：
+> 若需使用最新的 Beta 预发布特性，请直接指定对应的 Beta 版本 Tag（预发布版本独立发布，不会覆盖 `latest` 稳定版标签）：
+> ```bash
+> # 拉取指定 Beta 预发布版本 (可在 Docker Hub 查看所有可用版本)
+> docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
+>
+> # 运行 Beta 容器
+> docker run -d --name antigravity-manager-beta \
+>   -p 8045:8045 \
+>   -e API_KEY=sk-your-api-key \
+>   -e WEB_PASSWORD=your-login-password \
+>   -e ABV_MAX_BODY_SIZE=104857600 \
+>   -v ~/.antigravity_tools:/root/.antigravity_tools \
+>   lbjlaq/antigravity-manager:v4.8.2-beta.0
+> ```
+> 查看所有已发布的 Beta 镜像：[Docker Hub Tags](https://hub.docker.com/r/lbjlaq/antigravity-manager/tags)；若需试用最新 `beta` 分支源码，请先切换至该源码，再构建独立镜像：`docker build -t api-manager:beta -f docker/Dockerfile .`。
 
 #### 🔐 鉴权逻辑说明
 *   **场景 A：仅设置了 `API_KEY`**
@@ -238,12 +259,13 @@ docker run -d --name antigravity-manager \
 >
 > 启动日志不会输出明文密钥或密码。遗忘凭据时，请检查部署环境变量，或数据目录内 `gui_config.json` 的 `proxy.admin_password` / `proxy.api_key`；请勿公开该文件。
 
-# 方式 2: 使用 Docker Compose
-# 1. 进入项目的 docker 目录
+#### 方式 2: 使用 Docker Compose
+1. 进入项目的 `docker` 目录并启动服务：
+```bash
 cd docker
-# 2. 启动服务
 docker compose up -d
 ```
+> **日志轮转**: Compose 默认将 JSON 日志限制为单文件 `100m`、保留 `3` 个文件，避免日志无限增长。
 > **访问地址**: `http://localhost:8045` (管理后台) | `http://localhost:8045/v1` (API Base)
 > **系统要求**:
 > - **内存**: 建议 **1GB** (最小 256MB)。
@@ -291,6 +313,21 @@ env WEBKIT_DISABLE_DMABUF_RENDERER=1 ANTIGRAVITY_FORCE_WAYLAND=1 antigravity-too
 4. 应用会自动继续完成授权并保存账号；如未自动完成，可点击“我已授权，继续”手动完成。
 
 > 提示：授权链接包含一次性回调端口，请始终使用弹窗里生成的最新链接；如果授权时应用未运行或弹窗已关闭，浏览器可能会提示 `localhost refused connection`。
+
+### 如何接入 JeikCode? (推荐)
+[JeikCode](https://github.com/jeikl/JeikCode) 是由本项目核心维护者深度打造的现代终端 AI Coding Agent 工具，原生深度兼容本网关，实现 **95%+ 的超高 KV-Cache 缓存命中率**与深度思维链支持。
+1. **界面一键同步（最推荐）**：
+   - 打开 Antigravity-Manager 并开启 **API 反代** 服务。
+   - 切换至 **`>_ Agent工具一键配置`** 标签页。
+   - 在首个 **JeikCode** 卡片选择默认模型（如 `gemini-3.8-flash-high`），点击 **`🔄 立即同步配置`**。
+   - 终端直接运行 `jeikcode` 即可运行 TUI，**强烈推荐在终端输入 `/webui` 即可打开精美的网页端，开箱即用，享受更棒的可视化编程体验！**
+2. **环境变量临时接入**：
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
+export ANTHROPIC_API_KEY="sk-antigravity"
+jeikcode --model claude-sonnet-4-6-thinking
+```
+> 更多高级配置与排查指南参见：[JeikCode 接入 Antigravity-Manager 指南](./docs/jeikcode_integration.md)
 
 ### 如何接入 Claude Code CLI?
 1.  启动 Antigravity，并在“API 反代”页面开启服务。
@@ -474,7 +511,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.7.1**（API Manager 整合，2026-09-12）：动态请求模式、真实双窗口配额与模型族保护、可配置日志保留、安全代理凭据回退和 OpenCode JSONC 同步。默认日志正文保留 24 小时、元数据 30 天、最多 10 万行；每项设为 `0` 可禁用。升级前请备份日志数据库，详见更新日志。
+> 本分支整合上游 v4.8.3 的工具调用与签名处理、Daily 优先端点、账号优先级及按官方重置时间统计周用量，同时保留独立 Codex 订阅通道。上游应用内自动更新未在此修改版启用；升级前请备份账号、Codex 密钥与日志数据库。详见下方更新日志。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
@@ -482,6 +519,7 @@ response = client.chat.completions.create(
 <summary><b>👥 核心贡献者 (Contributors) - 点击展开</b></summary>
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
+<a href="https://github.com/jeikl"><img src="https://github.com/jeikl.png" width="50px" style="border-radius: 50%;" alt="jeikl"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
 <a href="https://github.com/llsenyue"><img src="https://github.com/llsenyue.png" width="50px" style="border-radius: 50%;" alt="llsenyue"/></a>
 <a href="https://github.com/salacoste"><img src="https://github.com/salacoste.png" width="50px" style="border-radius: 50%;" alt="salacoste"/></a>

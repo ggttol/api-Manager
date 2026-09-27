@@ -24,6 +24,7 @@ export interface ProxyConfig {
     custom_mapping?: Record<string, string>;
     request_timeout: number;
     enable_logging: boolean;
+    capture_health_logs?: boolean;
     log_retention?: LogRetentionConfig;
     debug_logging?: DebugLoggingConfig;
     upstream_proxy: UpstreamProxyConfig;
@@ -40,24 +41,60 @@ export interface ProxyConfig {
     trusted_proxies?: string[];
 }
 
+export interface LogRetentionConfig {
+    max_body_age_hours: number;
+    max_storage_gb: number;
+    max_disk_mb?: number;
+    max_rows: number;
+    max_age_days?: number;
+}
+
+
 // ============================================================================
 // Thinking Budget 配置 (控制 AI 深度思考时的 Token 预算)
 // ============================================================================
 
+/** 思考预算控制权归属 */
+export type ThinkingControlSource = 'gateway' | 'client';
+
 /** Thinking Budget 处理模式 */
-export type ThinkingBudgetMode = 'auto' | 'passthrough' | 'custom' | 'adaptive'; // [NEW] 支持自适应模式
+export type ThinkingBudgetMode = 'default' | 'custom' | 'auto' | 'passthrough' | 'adaptive';
 
 /** Thinking Effort 等级 (仅 adaptive 模式) */
 export type ThinkingEffort = 'low' | 'medium' | 'high';
 
 /** Thinking Budget 配置 */
 export interface ThinkingBudgetConfig {
-    /** 模式选择 */
-    mode: ThinkingBudgetMode;
-    /** 自定义固定值（仅在 mode=custom 时生效），范围 1024-65536 */
-    custom_value: number;
-    /** 思考强度 (仅在 mode=adaptive 时生效) */
+    /** 控制权大选择：网关权威控制 (gateway) vs 客户端直接控制 (client) */
+    control_source?: ThinkingControlSource;
+
+    // --- Gemini Flash 系列配置 ---
+    flash_mode?: ThinkingBudgetMode;
+    flash_low?: number;       // 默认 1000
+    flash_medium?: number;    // 默认 4000
+    flash_high?: number;      // 默认 10000
+    flash_tiered?: number;    // 默认 -1
+
+    // --- Gemini Pro 系列配置（官方仅 Low 与 High 两档） ---
+    pro_mode?: ThinkingBudgetMode;
+    pro_low?: number;         // 默认 1001
+    pro_high?: number;        // 默认 10001
+
+    // --- Claude 系列配置 ---
+    claude_mode?: ThinkingBudgetMode;
+    claude_budget?: number;    // 统一思考预算 (默认 16000, 填 -1 自适应)
+    claude_low?: number;       // 默认 1024
+    claude_medium?: number;    // 默认 4096
+    claude_high?: number;      // 默认 16000
+
+    // --- 旧版兼容字段 ---
+    mode?: ThinkingBudgetMode;
+    custom_value?: number;
     effort?: ThinkingEffort;
+    custom_low?: number;
+    custom_medium?: number;
+    custom_high?: number;
+    custom_tiered?: number;
 }
 
 // ============================================================================
@@ -130,6 +167,11 @@ export interface ExperimentalConfig {
     context_compression_threshold_l1?: number;
     context_compression_threshold_l2?: number;
     context_compression_threshold_l3?: number;
+    payload_storage_mode?: 'simple' | 'full';
+    log_retention_days?: number;
+    thinking_store_enabled?: boolean;
+    thinking_retention_days?: number;
+    thinking_max_memory_turns?: number;
 }
 
 export interface CircuitBreakerConfig {
@@ -151,6 +193,7 @@ export interface AppConfig {
     antigravity_cli_executable?: string; // [NEW] 手动指定的 Antigravity CLI (agy) 路径
     antigravity_args?: string[] | null; // [NEW] Antigravity 启动参数
     auto_launch?: boolean; // 开机自动启动
+
     accounts_page_size?: number; // 账号列表每页显示数量,默认 0 表示自动计算
     hidden_menu_items?: string[]; // 隐藏的菜单项路径列表
     scheduled_warmup: ScheduledWarmupConfig;
@@ -159,6 +202,10 @@ export interface AppConfig {
     circuit_breaker: CircuitBreakerConfig; // [NEW] 熔断器配置
     proxy: ProxyConfig;
     cloudflared: CloudflaredConfig; // [NEW] Cloudflared 配置
+    lightweight_mode?: boolean; // [NEW] 轻量模式：关闭到托盘时释放 WebView
+    suggestion_delete_thinking_store?: boolean; // [NEW] 建议删除历史思考块缓存开关
+    thinking_cleanup_dismissed?: boolean; // [NEW] 用户是否已确认/忽略该建议
+    dismissed_thinking_cleanup_version?: string; // [NEW] 用户已确认或忽略建议的目标版本号
 }
 
 // ============================================================================

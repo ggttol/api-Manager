@@ -8,6 +8,7 @@ import { QuotaItem } from './QuotaItem';
 import { MODEL_CONFIG, sortModels, getModelProtectionKey, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
 
 interface AccountCardProps {
     account: Account;
@@ -152,6 +153,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                         label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (${weeklySuffix})`,
                         percentage: Math.round((b.remaining_fraction || 0) * 100),
                         resetTime: b.reset_time,
+                        cycleTokens: b.cycle_tokens,
                         Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
                     };
                 });
@@ -246,6 +248,9 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 );
                             })()}
                             {/* 自定义标签 */}
+                            <span className="px-1.5 py-0.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-500 dark:text-gray-400 text-[9px] font-bold" title={t('accounts.priority_hint')}>
+                                {t('accounts.priority')}: {account.priority ?? 50}
+                            </span>
                             {account.custom_label && (
                                 <span className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[9px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
                                     <Tag className="w-2.5 h-2.5" />
@@ -294,6 +299,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                     label={item.label}
                                     percentage={item.percentage}
                                     resetTime={item.resetTime}
+                                    weeklyTokens={item.cycleTokens ?? null}
                                     Icon={item.Icon}
                                 />
                             ))
@@ -302,8 +308,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 <QuotaItem
                                     key={model.id}
                                     label={model.label}
-                                    percentage={model.data?.percentage || 0}
-                                    resetTime={model.data?.reset_time}
+                                    {...getModelQuotaDisplay(model.id, model.data, account.quota?.quota_groups)}
                                     isProtected={isModelProtected(model.protectedKey)}
                                     liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                     Icon={model.Icon}

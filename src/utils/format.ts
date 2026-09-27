@@ -46,6 +46,7 @@ export function parseFlexibleDate(value: string | number | undefined | null): Da
 export function formatTimeRemaining(dateStr: string): string {
     const targetDate = parseFlexibleDate(dateStr);
     if (!targetDate) return '0h 0m';
+
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 
@@ -67,6 +68,7 @@ export function getTimeRemainingColor(dateStr: string | undefined): string {
     if (!dateStr) return 'gray';
     const targetDate = parseFlexibleDate(dateStr);
     if (!targetDate) return 'gray';
+
     const now = new Date();
     const diffMs = targetDate.getTime() - now.getTime();
 

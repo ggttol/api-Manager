@@ -1,6 +1,8 @@
 use crate::models::Account;
 use crate::modules::{db, device, process, version};
 use std::fs;
+// Command 仅用于 macos/Linux 分支（security / secret-tool / kill），Windows 裁剪不导入以免 unused
+#[cfg(not(windows))]
 use std::process::Command;
 
 pub trait SystemIntegration: Send + Sync {
@@ -18,9 +20,202 @@ pub trait SystemIntegration: Send + Sync {
     fn show_notification(&self, title: &str, body: &str);
 }
 
+/// 根据目标参数、进程运行态及可执行文件存在性决策最终切换环境
+pub fn resolve_effective_target(
+    target_ide: Option<&str>,
+    classic_running: bool,
+    ide_running: bool,
+    has_classic_exe: bool,
+    ide_exe_path: Option<&str>,
+) -> (bool, Option<&'static str>) {
+    let is_explicit_ide = target_ide == Some("ide");
+    let is_explicit_classic = target_ide == Some("classic");
+
+    if is_explicit_ide {
+        return (true, Some("ide"));
+    }
+    if is_explicit_classic {
+        return (false, Some("classic"));
+    }
+
+    // target_ide 为 None 或未指定时进行智能环境探查（经典版桌面端优先，严禁仅凭静态 IDE 数据库文件劫持经典版目标）
+    let mut is_ide = false;
+    if classic_running {
+        // 原生经典版正在运行，确定目标为经典版
+        is_ide = false;
+    } else if ide_running {
+        // 经典版未运行，但 IDE 正在运行，推导为 IDE
+        is_ide = true;
+    } else if has_classic_exe {
+        // 原生经典版可执行文件存在，优先保持经典版
+        is_ide = false;
+    } else if let Some(exe_str) = ide_exe_path {
+        // 原生经典版不存在，检查是否存在 IDE 可执行文件
+        let path_lower = exe_str.to_lowercase();
+        if path_lower.contains("antigravity ide") || path_lower.contains("antigravity-ide") {
+            is_ide = true;
+        }
+    }
+
+    let effective = if is_ide {
+        Some("ide")
+    } else if is_explicit_classic {
+        Some("classic")
+    } else {
+        None
+    };
+
+    (is_ide, effective)
+}
+
 /// 桌面版实现：包含完整的进程控制 and UI 同步
 pub struct DesktopIntegration {
     pub app_handle: tauri::AppHandle,
+}
+
+/// 写入账号凭据：>= 2.0.0 的原生应用走系统 Keyring，旧架构与定制 IDE 走 SQLite 注入。
+///
+/// 抽成独立函数是为了让「热切号」能在终止 language_server 子进程**之前**完成凭据写入
+/// （见 `on_account_switch` 的顺序说明），同时让完整重启路径保持原有的「先杀后写」顺序。
+fn apply_account_credentials(
+    account: &Account,
+    effective_target: Option<&str>,
+    is_ide: bool,
+    active_exe_path: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut use_keyring = false;
+
+    if !is_ide {
+        // 经典原生版：自动探测版本号（优先使用预快照路径）
+        match version::get_antigravity_version_with_path(
+            effective_target,
+            active_exe_path.as_deref(),
+        ) {
+            Ok(ver) => {
+                // 如果版本号 >= 2.0.0
+                if version::compare_version(&ver.short_version, "2.0.0") != std::cmp::Ordering::Less
+                {
+                    use_keyring = true;
+                    crate::modules::logger::log_info(&format!(
+                        "[Desktop] Detected Antigravity version {} >= 2.0.0, using system Keyring.",
+                        ver.short_version
+                    ));
+                } else {
+                    crate::modules::logger::log_info(&format!(
+                        "[Desktop] Detected Antigravity version {} < 2.0.0, falling back to legacy SQLite injection.",
+                        ver.short_version
+                    ));
+                }
+            }
+            Err(e) => {
+                // 如果探测失败，优先检查本地是否存在可用的 SQLite 数据库 (state.vscdb)
+                // 若存在数据库，说明是经典的 VS Code/IDE 架构，优先使用 SQLite 注入，防止无 secret-tool 时报错
+                let has_sqlite_db = db::get_db_path(effective_target)
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+
+                if has_sqlite_db {
+                    use_keyring = false;
+                    crate::modules::logger::log_info(&format!(
+                        "[Desktop] Failed to detect Antigravity version ({}), but detected existing SQLite database. Falling back to SQLite injection.",
+                        e
+                    ));
+                } else {
+                    use_keyring = true;
+                    crate::modules::logger::log_warn(&format!(
+                        "[Desktop] Failed to detect Antigravity version ({}) and no SQLite database found, defaulting to system Keyring.",
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    if use_keyring {
+        // ================== 最新版 Antigravity 原生应用逻辑 (>= 2.0.0) ==================
+        // 2.1 写入系统 Keychain/Keyring
+        if let Err(keyring_err) = write_to_system_keyring(account) {
+            // 如果写入系统 Keyring 失败（例如 Linux 下未安装 secret-tool 或无桌面会话 D-Bus）
+            // 检查本地是否存在可用的 SQLite 数据库，若存在则自动降级回退到 SQLite 注入，确保账号切换顺利完成
+            let db_fallback = if let Ok(db_path) = db::get_db_path(effective_target) {
+                if db_path.exists() {
+                    crate::modules::logger::log_warn(&format!(
+                        "[Desktop] Keyring write failed ({}), but found SQLite DB at {:?}. Falling back to SQLite token injection.",
+                        keyring_err, db_path
+                    ));
+                    let backup_path = db_path.with_extension("vscdb.backup");
+                    let _ = fs::copy(&db_path, &backup_path);
+                    let _ = db::inject_token(
+                        &db_path,
+                        &account.token.access_token,
+                        &account.token.refresh_token,
+                        account.token.expiry_timestamp,
+                        &account.email,
+                        account.token.is_gcp_tos,
+                        account.token.project_id.as_deref(),
+                        account.token.id_token.as_deref(),
+                        account.token.oauth_client_key.as_deref(),
+                        effective_target,
+                    );
+                    if let Some(ref profile) = account.device_profile {
+                        let _ = db::write_service_machine_id(&db_path, &profile.mac_machine_id);
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !db_fallback {
+                return Err(keyring_err);
+            }
+        }
+
+        // 2.2 原生应用可能没有 storage.json，但如果有的话，我们也可以尝试安全地写入设备 Profile，以兼容指纹信息
+        if let Ok(storage_path) = device::get_storage_path(effective_target) {
+            if let Some(ref profile) = account.device_profile {
+                let _ = device::write_profile(&storage_path, profile);
+            }
+        }
+    } else {
+        // ================== 原有 Antigravity 旧版或定制 IDE 逻辑 (< 2.0.0) ==================
+        // 2.1 获取存储路径
+        let storage_path = device::get_storage_path(effective_target)?;
+
+        // 2.2 写入设备 Profile
+        if let Some(ref profile) = account.device_profile {
+            device::write_profile(&storage_path, profile)?;
+        }
+
+        // 2.3 数据库处理与 Token 注入
+        let db_path = db::get_db_path(effective_target)?;
+        if db_path.exists() {
+            let backup_path = db_path.with_extension("vscdb.backup");
+            let _ = fs::copy(&db_path, &backup_path);
+        }
+
+        db::inject_token(
+            &db_path,
+            &account.token.access_token,
+            &account.token.refresh_token,
+            account.token.expiry_timestamp,
+            &account.email,
+            account.token.is_gcp_tos,
+            account.token.project_id.as_deref(),
+            account.token.id_token.as_deref(),
+            account.token.oauth_client_key.as_deref(),
+            effective_target,
+        )?;
+
+        // 2.4 同步 Service Machine ID 到数据库
+        if let Some(ref profile) = account.device_profile {
+            let _ = db::write_service_machine_id(&db_path, &profile.mac_machine_id);
+        }
+    }
+
+    Ok(())
 }
 
 impl SystemIntegration for DesktopIntegration {
@@ -61,110 +256,142 @@ impl SystemIntegration for DesktopIntegration {
             return Ok(());
         }
 
-        // 1. 先关闭外部正在运行的进程（无论是原生还是IDE，先安全关闭，避免文件或凭据冲突）
-        if process::is_antigravity_running(target_ide) {
-            process::close_antigravity(20, target_ide)?;
+        // 1. 智能决策：判断目标是 Antigravity IDE (VS Code 定制版) 还是 Antigravity 经典版 (原生桌面端)
+        let classic_running = process::is_antigravity_running(None);
+        let ide_running = process::is_antigravity_running(Some("ide"));
+        let classic_exe = process::get_antigravity_executable_path(None);
+        let ide_exe = process::get_antigravity_executable_path(Some("ide"));
+        let ide_exe_str = ide_exe.as_ref().map(|p| p.to_string_lossy().to_string());
+
+        let (is_ide, effective_target) = resolve_effective_target(
+            target_ide,
+            classic_running,
+            ide_running,
+            classic_exe.is_some(),
+            ide_exe_str.as_deref(),
+        );
+
+        if is_ide {
+            crate::modules::logger::log_info(
+                "[Desktop] Determined target environment is Antigravity IDE, using IDE account switch logic.",
+            );
+        } else {
+            crate::modules::logger::log_info(
+                "[Desktop] Determined target environment is Antigravity classic, using classic account switch logic.",
+            );
         }
 
-        // 2. 智能决策：是否使用最新的系统 Keychain 凭据管理器方式存储 Token
-        let mut is_ide = target_ide == Some("ide");
+        // 0. 在关闭外部进程前，预先快照捕获正在运行的客户端可执行文件路径与启动参数
+        // 彻底防止杀死进程后由于安装在非标准路径而丢失路径导致启动失败 (Unable to start)
+        let active_exe_path = process::get_antigravity_executable_path(effective_target);
+        let active_args = process::get_args_from_running_process(effective_target);
 
-        // Auto-detect IDE: if the located executable is the IDE, treat as IDE mode
-        if !is_ide {
-            if let Some(exe_path) = process::get_antigravity_executable_path(target_ide) {
-                let path_lower = exe_path.to_string_lossy().to_lowercase();
-                if path_lower.contains("antigravity ide") || path_lower.contains("antigravity-ide")
-                {
-                    is_ide = true;
-                    crate::modules::logger::log_info(
-                        "[Desktop] Auto-detected Antigravity IDE executable, using IDE account switch logic.",
-                    );
-                }
-            }
-        }
+        // 2. 决定切换模式（热切号 / 完整重启）并处理进程与凭据
+        //
+        //    · 热切号 —— 仅 IDE 目标（issue #3503 方案 A）：只终止 language_server 子进程、保留主窗口，
+        //      IDE 内置 supervisor 会在约 2 秒内原地重建子进程并重载 Webview，从而保住用户的
+        //      未保存缓冲区 / 终端任务 / 断点 / 文件树。顺序是**先写凭据 → 再杀子进程 →（best-effort）再补写一次**：
+        //      supervisor 重启有约 2s 退避窗口，而写入只需毫秒级，"写在前"保证重新拉起的子进程
+        //      必然读到新凭据，不存在"子进程先起来、加载旧账号"的竞态；杀完再补写一次是为了覆盖
+        //      "写 → 杀"这几十毫秒窗口内旧语言服务把旧 token 回写进数据库的极端情况。
+        //      另外写入失败会在杀进程之前返回错误，IDE 保持原样不受影响。
+        //    · 完整重启 —— 经典原生版（或未定位到语言服务子进程）：沿用原顺序「先杀 → 再写 → 再启动」，
+        //      因为旧架构下运行中的应用会在退出时刷盘覆盖刚写入的 Token。
+        let running = process::is_antigravity_running(effective_target);
+        let mut hot_switch = false;
+        let mut credentials_applied = false;
 
-        let mut use_keyring = false;
+        if is_ide && running {
+            apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
+            )?;
+            credentials_applied = true;
 
-        if !is_ide {
-            // 经典原生版：自动探测版本号
-            match version::get_antigravity_version(target_ide) {
-                Ok(ver) => {
-                    // 如果版本号 >= 2.0.0
-                    if version::compare_version(&ver.short_version, "2.0.0")
-                        != std::cmp::Ordering::Less
-                    {
-                        use_keyring = true;
-                        crate::modules::logger::log_info(&format!(
-                            "[Desktop] Detected Antigravity version {} >= 2.0.0, using system Keyring.",
-                            ver.short_version
-                        ));
-                    } else {
-                        crate::modules::logger::log_info(&format!(
-                            "[Desktop] Detected Antigravity version {} < 2.0.0, falling back to legacy SQLite injection.",
-                            ver.short_version
+            match process::kill_language_server_subprocesses(effective_target) {
+                Ok(n) if n > 0 => {
+                    hot_switch = true;
+                    crate::modules::logger::log_info(&format!(
+                        "[Desktop] Hot switch: terminated {} language_server subprocess(es); \
+                         main window kept alive, supervisor will respawn the child with the new credentials.",
+                        n
+                    ));
+
+                    // 补写一次凭据（best-effort）：子进程已被终止，此时数据库不存在竞争写者，
+                    // 这次写入即为权威值 —— 用于覆盖"写凭据 → 杀子进程"这几十毫秒窗口内
+                    // 旧语言服务可能把旧 token 回写进 state.vscdb 的情况，
+                    // 确保 supervisor 约 2s 后重新拉起的子进程读到的一定是新凭据。
+                    // 失败只告警，不使整个切号失败：第一次写入已经就位。
+                    if let Err(e) = apply_account_credentials(
+                        account,
+                        effective_target,
+                        is_ide,
+                        active_exe_path.as_deref(),
+                    ) {
+                        crate::modules::logger::log_warn(&format!(
+                            "[Desktop] Hot switch: post-kill credential re-assert failed ({}); \
+                             the pre-kill write is already in place, continuing.",
+                            e
                         ));
                     }
                 }
-                Err(e) => {
-                    // 如果探测失败，为防止对最新版由于没有 storage.json 造成报错阻断，默认作为新凭据注入
-                    use_keyring = true;
-                    crate::modules::logger::log_warn(&format!(
-                        "[Desktop] Failed to detect Antigravity version ({}), defaulting to system Keyring for robustness.",
-                        e
-                    ));
-                }
+                Ok(_) => crate::modules::logger::log_info(
+                    "[Desktop] Hot switch unavailable: no language_server subprocess found; falling back to full restart.",
+                ),
+                Err(e) => crate::modules::logger::log_warn(&format!(
+                    "[Desktop] Hot switch failed ({}); falling back to full restart.",
+                    e
+                )),
             }
         }
 
-        if use_keyring {
-            // ================== 最新版 Antigravity 原生应用逻辑 (>= 2.0.0) ==================
-            // 2.1 写入系统 Keychain/Keyring
-            write_to_system_keyring(account)?;
+        if !hot_switch && running {
+            process::close_antigravity(20, effective_target)?;
+        }
+        if effective_target != target_ide
+            && target_ide.is_some()
+            && process::is_antigravity_running(target_ide)
+        {
+            process::close_antigravity(20, target_ide)?;
+        }
 
-            // 2.2 原生应用可能没有 storage.json，但如果有的话，我们也可以尝试安全地写入设备 Profile，以兼容指纹信息
-            if let Ok(storage_path) = device::get_storage_path(target_ide) {
-                if let Some(ref profile) = account.device_profile {
-                    let _ = device::write_profile(&storage_path, profile);
-                }
-            }
-        } else {
-            // ================== 原有 Antigravity 旧版或定制 IDE 逻辑 (< 2.0.0) ==================
-            // 2.1 获取存储路径
-            let storage_path = device::get_storage_path(target_ide)?;
-
-            // 2.2 写入设备 Profile
-            if let Some(ref profile) = account.device_profile {
-                device::write_profile(&storage_path, profile)?;
-            }
-
-            // 2.3 数据库处理与 Token 注入
-            let db_path = db::get_db_path(target_ide)?;
-            if db_path.exists() {
-                let backup_path = db_path.with_extension("vscdb.backup");
-                let _ = fs::copy(&db_path, &backup_path);
-            }
-
-            db::inject_token(
-                &db_path,
-                &account.token.access_token,
-                &account.token.refresh_token,
-                account.token.expiry_timestamp,
-                &account.email,
-                account.token.is_gcp_tos,
-                account.token.project_id.as_deref(),
-                account.token.id_token.as_deref(),
-                account.token.oauth_client_key.as_deref(),
-                target_ide,
+        // 凭据写入（热切号已在终止子进程之前完成，避免重复写入；完整重启路径保持「先杀后写」）
+        if !credentials_applied {
+            apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
             )?;
-
-            // 2.4 同步 Service Machine ID 到数据库
-            if let Some(ref profile) = account.device_profile {
-                let _ = db::write_service_machine_id(&db_path, &profile.mac_machine_id);
-            }
         }
 
-        // 3. 重启外部进程
-        process::start_antigravity(target_ide)?;
+        // 3. 重启外部进程（优先使用预快照路径与启动参数）
+        //    热切号路径下主窗口仍然存活：只需等 supervisor 把 language_server 拉起即可，
+        //    绝不能再去启动一次主窗口（否则会变成双实例）。
+        if hot_switch {
+            if process::wait_for_language_server_respawn(effective_target, 15) {
+                crate::modules::logger::log_info(&format!(
+                    "[Desktop] Hot switch completed for {}: language_server respawned with the new credentials.",
+                    account.email
+                ));
+                let _ = crate::modules::tray::update_tray_menus(&self.app_handle);
+                return Ok(());
+            }
+
+            // 子进程迟迟未恢复 → 降级为完整重启，避免留下"窗口活着但 AI 引擎已死"的残状态
+            crate::modules::logger::log_warn(
+                "[Desktop] Hot switch degraded: language_server did not respawn within timeout; performing a full restart.",
+            );
+            process::close_antigravity(20, effective_target)?;
+        }
+
+        process::start_antigravity_with_fallback_path(
+            effective_target,
+            active_exe_path.as_deref(),
+            active_args.as_deref(),
+        )?;
 
         // 4. 更新托盘
         let _ = crate::modules::tray::update_tray_menus(&self.app_handle);
@@ -339,64 +566,107 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
 
     #[cfg(target_os = "linux")]
     {
+        // 2.3 Linux Secret Service API
+        // [FIX #3418] 在 Linux GNOME 环境下，Secret Service 往往同时存在 'login' 集合与 'default' 集合。
+        // agy CLI 读取凭据时严格从 'login' 集合检索。若未指定 --collection，secret-tool 会写入 default 集合，
+        // 导致两个集合内容分叉，agy 持续读取到 login 集合中的旧账号。
+        // 此处封装辅助函数：优先写入 login 集合，同时确保与 default 集合同步。
         use std::io::Write;
         use std::sync::mpsc;
 
-        let store_to_collection = |collection: Option<&str>| -> Result<(), String> {
-            let mut command = Command::new("secret-tool");
-            command.arg("store");
-            if let Some(collection) = collection {
-                command.args([
-                    format!("--collection={collection}"),
-                    "--label=Password for 'antigravity' on 'gemini'".to_string(),
-                ]);
+        let store_to_collection = |collection_opt: Option<&str>,
+                                   payload: &[u8]|
+         -> Result<(), String> {
+            let mut cmd = Command::new("secret-tool");
+            cmd.arg("store");
+            if let Some(col) = collection_opt {
+                cmd.arg(format!("--collection={}", col));
+                cmd.arg("--label=Password for 'antigravity' on 'gemini'");
             } else {
-                command.arg("--label=gemini");
+                cmd.arg("--label=gemini");
             }
-            let mut child = command
-                .args(["service", "gemini", "username", "antigravity"])
-                .stdin(std::process::Stdio::piped())
+            cmd.args(["service", "gemini", "username", "antigravity"]);
+            cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|error| format!("Failed to spawn secret-tool: {error}"))?;
+                .stderr(std::process::Stdio::piped());
 
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| "secret-tool stdin was unavailable".to_string())?
-                .write_all(payload_json.as_bytes())
-                .map_err(|error| format!("Failed to write to secret-tool stdin: {error}"))?;
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        return Err(
+                            "Linux Secret Service utility 'secret-tool' not found (未检测到 secret-tool 工具)。\n\
+                             Please install libsecret-tools to enable Keyring credential storage:\n\
+                             • Ubuntu / Debian: sudo apt install -y libsecret-tools\n\
+                             • Fedora / RHEL: sudo dnf install -y libsecret\n\
+                             • Arch Linux: sudo pacman -S libsecret"
+                                .to_string(),
+                        );
+                    }
+                    return Err(format!("Failed to spawn secret-tool: {}", e));
+                }
+            };
+
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(payload)
+                    .map_err(|e| format!("Failed to write to secret-tool stdin: {}", e))?;
+            }
 
             let child_pid = child.id();
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::channel::<Result<std::process::Output, std::io::Error>>();
             std::thread::spawn(move || {
                 let _ = tx.send(child.wait_with_output());
             });
+
             let output = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(result) => {
-                    result.map_err(|error| format!("Failed to wait for secret-tool: {error}"))?
+                    result.map_err(|e| format!("Failed to wait for secret-tool: {}", e))?
                 }
                 Err(_) => {
                     let _ = Command::new("kill")
                         .args(["-9", &child_pid.to_string()])
                         .output();
-                    return Err("Keyring write timed out (10s). The D-Bus session bus is not reachable from this process.".to_string());
+                    crate::modules::logger::log_error(
+                        "[Desktop] secret-tool store blocked for >10s — D-Bus session bus unreachable.",
+                    );
+                    return Err(
+                        "Keyring write timed out (10s). The D-Bus session bus is not reachable from this process."
+                            .to_string(),
+                    );
                 }
             };
+
             if !output.status.success() {
-                return Err(format!(
-                    "Linux secret-tool failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
+                let err_msg = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Linux secret-tool failed: {}", err_msg.trim()));
             }
+
             Ok(())
         };
 
-        // agy reads the login collection; its write is mandatory and must never be
-        // hidden by a successful default-collection write.
-        store_to_collection(Some("login"))?;
-        store_to_collection(None)?;
+        // 1. 优先尝试写入 'login' 集合（agy CLI 所需）
+        let login_res = store_to_collection(Some("login"), payload_json.as_bytes());
+
+        // 2. 同时写入默认集合（保证其他依赖 default collection 的系统工具也能读取）
+        let default_res = store_to_collection(None, payload_json.as_bytes());
+
+        // 尝试优先同步写入本地文件凭据 (~/.gemini/oauth_creds.json)
+        let _ = write_to_file_credentials(account);
+
+        // 若两者均失败，则返回错误；若至少一个成功，则记录并继续
+        if login_res.is_err() && default_res.is_err() {
+            return Err(login_res.unwrap_err());
+        } else if let Err(e) = login_res {
+            crate::modules::logger::log_warn(&format!(
+                "[Desktop] Failed to write token to 'login' collection, falling back to default collection: {}",
+                e
+            ));
+        } else {
+            crate::modules::logger::log_info(
+                "[Desktop] Successfully synced credential to Secret Service 'login' collection.",
+            );
+        }
     }
 
     crate::modules::logger::log_info(
@@ -504,6 +774,30 @@ fn write_to_file_credentials(account: &crate::models::Account) -> Result<(), Str
     Ok(())
 }
 
+/// 辅助方法：从本地文件凭据 (~/.gemini/oauth_creds.json) 读取 Token 作为跨平台回退
+fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    let home =
+        dirs::home_dir().ok_or_else(|| "Failed to resolve user home directory".to_string())?;
+    let creds_path = home.join(".gemini").join("oauth_creds.json");
+    if !creds_path.exists() {
+        return Err("No ~/.gemini/oauth_creds.json found".to_string());
+    }
+    let content = fs::read_to_string(&creds_path)
+        .map_err(|e| format!("Failed to read oauth_creds.json: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse oauth_creds.json: {}", e))?;
+    let refresh_token = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Refresh token not found in oauth_creds.json".to_string())?
+        .to_string();
+    Ok(crate::modules::migration::ImportedOAuthState {
+        refresh_token,
+        is_gcp_tos: true,
+        project_id: None,
+    })
+}
+
 /// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
 pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
     #[cfg(target_os = "macos")]
@@ -522,6 +816,9 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
             .map_err(|e| format!("Failed to execute security command: {}", e))?;
 
         if !output.status.success() {
+            if let Ok(file_state) = read_from_file_credentials() {
+                return Ok(file_state);
+            }
             return Err("No credential found in macOS Keychain".to_string());
         }
 
@@ -587,6 +884,9 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         unsafe {
             let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
             if res == 0 || cred_ptr.is_null() {
+                if let Ok(file_state) = read_from_file_credentials() {
+                    return Ok(file_state);
+                }
                 return Err("No credential found in Windows Credential Manager".to_string());
             }
 
@@ -604,12 +904,33 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
 
     #[cfg(target_os = "linux")]
     {
-        let output = Command::new("secret-tool")
+        let output = match Command::new("secret-tool")
             .args(["lookup", "service", "gemini", "username", "antigravity"])
             .output()
-            .map_err(|e| format!("Failed to execute secret-tool: {}", e))?;
+        {
+            Ok(out) => out,
+            Err(e) => {
+                if let Ok(file_state) = read_from_file_credentials() {
+                    return Ok(file_state);
+                }
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(
+                        "Linux Secret Service utility 'secret-tool' not found (未检测到 secret-tool 工具)。\n\
+                         Please install libsecret-tools to enable Keyring storage:\n\
+                         • Ubuntu / Debian: sudo apt install -y libsecret-tools\n\
+                         • Fedora / RHEL: sudo dnf install -y libsecret\n\
+                         • Arch Linux: sudo pacman -S libsecret"
+                            .to_string(),
+                    );
+                }
+                return Err(format!("Failed to execute secret-tool: {}", e));
+            }
+        };
 
         if !output.status.success() {
+            if let Ok(file_state) = read_from_file_credentials() {
+                return Ok(file_state);
+            }
             return Err("No credential found in Linux secret-tool".to_string());
         }
 
@@ -756,5 +1077,129 @@ impl SystemIntegration for SystemManager {
 
     fn show_notification(&self, title: &str, body: &str) {
         self.show_notification(title, body);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_keyring_payload_nested_token() {
+        let payload = r#"{
+            "token": {
+                "access_token": "ya29.test",
+                "token_type": "Bearer",
+                "refresh_token": "1//test_refresh_token_123",
+                "expiry": "2026-09-19T10:00:00.000000Z"
+            },
+            "auth_method": "consumer"
+        }"#;
+        let state = parse_keyring_payload(payload).expect("Failed to parse nested keyring payload");
+        assert_eq!(state.refresh_token, "1//test_refresh_token_123");
+        assert!(state.is_gcp_tos);
+    }
+
+    #[test]
+    fn test_parse_keyring_payload_flat_token() {
+        let payload = r#"{
+            "access_token": "ya29.test",
+            "refresh_token": "1//test_refresh_token_flat"
+        }"#;
+        let state = parse_keyring_payload(payload).expect("Failed to parse flat keyring payload");
+        assert_eq!(state.refresh_token, "1//test_refresh_token_flat");
+    }
+
+    #[test]
+    fn test_parse_keyring_payload_missing_token() {
+        let payload = r#"{ "auth_method": "consumer" }"#;
+        let res = parse_keyring_payload(payload);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_resolve_effective_target_explicit_classic() {
+        // 显式指定 classic，即便 IDE 正在运行或只有 IDE exe，也必须严格判定为经典版
+        let (is_ide, effective) = resolve_effective_target(
+            Some("classic"),
+            false,
+            true,
+            false,
+            Some("/Applications/Antigravity IDE.app"),
+        );
+        assert!(!is_ide);
+        assert_eq!(effective, Some("classic"));
+    }
+
+    #[test]
+    fn test_resolve_effective_target_explicit_ide() {
+        // 显式指定 ide，必须判定为 ide
+        let (is_ide, effective) = resolve_effective_target(Some("ide"), true, false, true, None);
+        assert!(is_ide);
+        assert_eq!(effective, Some("ide"));
+    }
+
+    #[test]
+    fn test_resolve_effective_target_autodetect_classic_running() {
+        // target_ide 为 None，经典版正在运行，必须优先保持经典版
+        let (is_ide, effective) = resolve_effective_target(
+            None,
+            true,
+            true,
+            true,
+            Some("/Applications/Antigravity IDE.app"),
+        );
+        assert!(!is_ide);
+        assert_eq!(effective, None);
+    }
+
+    #[test]
+    fn test_resolve_effective_target_autodetect_ide_running_only() {
+        // target_ide 为 None，仅 IDE 正在运行，推导为 IDE
+        let (is_ide, effective) = resolve_effective_target(
+            None,
+            false,
+            true,
+            true,
+            Some("/Applications/Antigravity IDE.app"),
+        );
+        assert!(is_ide);
+        assert_eq!(effective, Some("ide"));
+    }
+
+    #[test]
+    fn test_resolve_effective_target_autodetect_classic_exe_exists() {
+        // target_ide 为 None，两者均未运行，但经典版 exe 存在，优先经典版
+        let (is_ide, effective) = resolve_effective_target(
+            None,
+            false,
+            false,
+            true,
+            Some("/Applications/Antigravity IDE.app"),
+        );
+        assert!(!is_ide);
+        assert_eq!(effective, None);
+    }
+
+    #[test]
+    fn test_resolve_effective_target_autodetect_fallback_ide_exe() {
+        // target_ide 为 None，两者均未运行，无经典版但有 IDE exe，推导为 IDE
+        let (is_ide, effective) = resolve_effective_target(
+            None,
+            false,
+            false,
+            false,
+            Some("/Applications/Antigravity IDE.app"),
+        );
+        assert!(is_ide);
+        assert_eq!(effective, Some("ide"));
+    }
+
+    #[test]
+    fn test_resolve_effective_target_autodetect_default_fallback() {
+        // target_ide 为 None，均未运行且均未检测到 exe，默认保底经典版
+        let (is_ide, effective) = resolve_effective_target(None, false, false, false, None);
+        assert!(!is_ide);
+        assert_eq!(effective, None);
     }
 }

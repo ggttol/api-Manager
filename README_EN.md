@@ -1,15 +1,17 @@
 # Antigravity Tools 🚀
-> Professional AI Account Management & Protocol Proxy System (v4.7.1)
+> Professional AI Account Management & Protocol Proxy System (based on upstream v4.8.3)
 
 <div align="center">
-  <img src="public/icon.png" alt="Antigravity Logo" width="120" height="120" style="border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.15);">
+  <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
+  <h3>Antigravity Tools</h3>
+  <p>Multi-platform automation & multi-account matrix dispatch console</p>
 
-  <h3>Your Personal High-Performance AI Gateway</h3>
-  <p>Not just account management, but the ultimate solution to break API barriers.</p>
-  
   <p>
+    <a href="https://github.com/lbjlaq/Antigravity-Manager/releases">
+      <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
+    </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.7.1-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Upstream-4.8.3-blue?style=flat-square" alt="Upstream version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -42,7 +44,7 @@ By leveraging this app, you can transform common Web Sessions (Google/Anthropic)
 | Sponsor | Description |
 | :---: | :--- |
 | <img src="docs/images/packycode_logo.png" width="200" alt="PackyCode Logo"> | Thanks to **PackyCode** for sponsoring this project! PackyCode is a reliable and efficient API relay service provider, offering relays for various services such as Claude Code, Codex, and Gemini. PackyCode provides a special offer for users of this project: Register using [this link](https://www.packyapi.com/register?aff=Ctrler) and enter the **"Ctrler"** coupon code when topping up to enjoy a **10% discount**. |
-| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | Thanks to **APIKEY.FUN** for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay station, dedicated to providing stable, efficient, and low-cost AI model API access services for enterprise and individual developers. The platform supports mainstream popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official original price. Register through [this exclusive link](https://apikey.fun/register?aff=Ctrler) for this project to enjoy an exclusive offer of up to **permanent 5% off on top-ups**. |
+| <img src="docs/images/APIKEYFUN.png" width="200" alt="APIKEYFUN Logo"> | Thanks to **APIKEY.FUN** for sponsoring this project! APIKEY.FUN is a professional enterprise-grade AI relay station, dedicated to providing stable, efficient, and low-cost AI model API access services for enterprise and individual developers. The platform supports mainstream popular models such as Claude, OpenAI, and Gemini, with prices as low as 7% of the official original price. Register through [this exclusive link](https://apikey.fan/register?aff=Ctrler) for this project to enjoy an exclusive offer of up to **permanent 5% off on top-ups**. |
 | <img src="docs/images/claudeapilogo.png" width="200" alt="Claude API Logo"> | Thanks to **Claude API** for supporting this project! claudeapi.com is a **Claude API** relay station built on **official and AWS channels**, focused exclusively on Claude, delivering high stability and low latency with full support for Claude Code. Exclusive offer: register via this [exclusive link](https://console.claudeapi.com/register?source=antigravity) to get **free trial credits — zero setup, get started instantly**; enjoy an extra **5% off** when you top up（Contact Support). |
 | <img src="docs/images/AICodeMirror.jpg" width="200" alt="AICodeMirror Logo"> | Thanks to **AICodeMirror** for sponsoring this project! AICodeMirror provides official high-stability relay services for Claude Code / Codex / Gemini CLI, supporting enterprise-grade concurrency, fast invoicing, and 24/7 dedicated technical support. Claude Code / Codex / Gemini official channels at 38% / 2% / 9% of original price, with extra discounts on top-ups! AICodeMirror offers special benefits for Antigravity-Manager users: register via [this link](https://aicodemirror.ai/register?invitecode=MV5XUM) to enjoy 20% off your first top-up, and enterprise customers can get up to 25% off! |
 
@@ -183,10 +185,11 @@ Download from [GitHub Releases](https://github.com/lbjlaq/Antigravity-Manager/re
 ### Option C: Docker Deployment (Recommended for NAS/Servers)
 If you prefer running in a containerized environment, we provide a native Docker image. This image supports the v4.0.3 Native Headless architecture, automatically hosts frontend static resources, and allows for direct browser-based management.
 
+#### Option 1: Direct Run (Recommended)
+- **API_KEY**: Required. Used for AI request authentication.
+- **WEB_PASSWORD**: Optional. Used for Web UI login. Defaults to API_KEY if NOT set.
+
 ```bash
-# Option 1: Direct Run (Recommended)
-# - API_KEY: Required. Used for AI request authentication.
-# - WEB_PASSWORD: Optional. Used for Web UI login. Defaults to API_KEY if NOT set.
 docker run -d --name antigravity-manager \
   -p 8045:8045 \
   -e API_KEY=sk-your-api-key \
@@ -196,6 +199,26 @@ docker run -d --name antigravity-manager \
   lbjlaq/antigravity-manager:latest
 
 # Forgot keys? Run `docker logs antigravity-manager` or `grep -E '"api_key"|"admin_password"' ~/.antigravity_tools/gui_config.json`
+```
+
+> [!TIP]
+> Upstream images do not include this fork's Codex gateway. Do not replace this project's service with them; build from this repository as described in the [Docker guide](docker/README.md#api-manager-codex-修改版).
+> **🧪 Pulling Beta / Preview Images**:
+> To test the latest Beta pre-release features, specify the corresponding Beta version tag (pre-releases are published independently and will never overwrite the `latest` stable tag):
+> ```bash
+> # Pull a specific Beta pre-release version (check Docker Hub for all tags)
+> docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
+>
+> # Run Beta container
+> docker run -d --name antigravity-manager-beta \
+>   -p 8045:8045 \
+>   -e API_KEY=sk-your-api-key \
+>   -e WEB_PASSWORD=your-login-password \
+>   -e ABV_MAX_BODY_SIZE=104857600 \
+>   -v ~/.antigravity_tools:/root/.antigravity_tools \
+>   lbjlaq/antigravity-manager:v4.8.2-beta.0
+> ```
+> View published Beta tags on [Docker Hub](https://hub.docker.com/r/lbjlaq/antigravity-manager/tags). To try unreleased `beta` source, switch to that source first, then build a separate image: `docker build -t api-manager:beta -f docker/Dockerfile .`.
 
 #### 🔐 Authentication Scenarios
 *   **Scenario A: Only `API_KEY` is set**
@@ -220,12 +243,13 @@ If you are upgrading from v4.0.1 or earlier, your installation won't have a `WEB
 >
 > Startup logs do not print plaintext keys or passwords. If credentials are forgotten, check deployment environment variables or `proxy.admin_password` / `proxy.api_key` in the data directory's `gui_config.json`. Keep this file private.
 
-# Option 2: Use Docker Compose
-# 1. Enter the Docker directory
+#### Option 2: Use Docker Compose
+1. Enter the `docker` directory and start the service:
+```bash
 cd docker
-# 2. Start the service
 docker compose up -d
 ```
+> **Log rotation**: Compose limits JSON logs to `100m` per file and keeps `3` files by default to prevent unbounded growth.
 > **Access URL**: `http://localhost:8045` (Admin Console) | `http://localhost:8045/v1` (API Base)
 > **System Requirements**:
 > - **RAM**: **1GB** recommended (minimum 256MB).
@@ -264,6 +288,21 @@ env WEBKIT_DISABLE_DMABUF_RENDERER=1 ANTIGRAVITY_FORCE_WAYLAND=1 antigravity-too
 4. The app automatically continues the flow and saves the account; if it doesn’t, click “I already authorized, continue” to finish manually.
 
 > Note: the auth URL contains a one-time local callback port. Always use the latest URL shown in the dialog. If the app isn’t running or the dialog is closed during auth, the browser may show `localhost refused connection`.
+
+### How to use with JeikCode? (Recommended)
+[JeikCode](https://github.com/jeikl/JeikCode) is a modern terminal AI Coding Agent crafted by the core maintainer of this project, featuring native deep integration with Antigravity-Manager, delivering **95%+ KV-Cache hit rate** and seamless reasoning level control.
+1. **One-Click Sync via GUI (Recommended)**:
+   - Launch Antigravity-Manager and ensure the **API Proxy** service is running.
+   - Switch to the **`>_ Agent Tools One-Click Configuration`** tab.
+   - Locate the **JeikCode** card, choose your desired default model (e.g. `gemini-3.8-flash-high`), and click **`🔄 Sync Now`**.
+   - Simply run `jeikcode` in your terminal for the TUI, **and type `/webui` to instantly launch the modern WebUI in your browser for a richer visual coding experience out of the box!**
+2. **Temporary Environment Variables**:
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
+export ANTHROPIC_API_KEY="sk-antigravity"
+jeikcode --model claude-sonnet-4-6-thinking
+```
+> For complete manual configuration and tuning, see the [JeikCode Integration Guide](./docs/jeikcode_integration.md).
 
 ### How to use with Claude Code CLI?
 1. Start Antigravity service in the "API Proxy" tab.
@@ -447,7 +486,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.7.1** (API Manager integration, 2026-09-12): Dynamic request modes, real quota windows and family-level protection, configurable log retention, safe proxy-credential fallback, and OpenCode JSONC synchronization. Defaults retain bodies for 24 hours, metadata for 30 days, and at most 100,000 rows; zero disables each limit. Back up the log database before upgrading; see the changelog for details.
+> This fork integrates upstream v4.8.3 tool/signature handling, Daily-first endpoints, account priority, and weekly usage aligned to the official reset time while retaining its isolated Codex subscription gateway. Upstream in-app auto-update remains disabled in this fork. Back up accounts, the Codex key, and log database before upgrading.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

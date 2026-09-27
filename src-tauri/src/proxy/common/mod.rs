@@ -9,7 +9,5 @@ pub mod model_mapping;
 pub mod schema_cache;
 pub mod session;
 pub mod system_prompt;
-pub mod tool_adapter;
-pub mod tool_adapters;
 pub mod utils; // [ADDED v4.1.24] Tools for deriving stable session identifiers
 pub mod variant_mapping; // Canonical model + variant → real model ID + params

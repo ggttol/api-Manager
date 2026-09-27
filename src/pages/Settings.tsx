@@ -14,6 +14,7 @@ import { useDebugConsole } from '../stores/useDebugConsole';
 import { useTranslation } from 'react-i18next';
 import { isTauri } from '../utils/env';
 
+
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 import { PageHeader } from '../components/common/ConsolePage';
@@ -21,6 +22,22 @@ import { PageHeader } from '../components/common/ConsolePage';
 
 const formatArguments = (args?: string[] | null) => (args ?? []).map(arg => JSON.stringify(arg)).join(' ');
 
+function normalizeDataDirDisplay(path: string): string {
+    const trimmed = path.trim();
+    if (trimmed.startsWith('\\\\?\\UNC\\')) {
+        return `\\\\${trimmed.slice('\\\\?\\UNC\\'.length)}`;
+    }
+    if (trimmed.startsWith('\\\\?\\')) {
+        return trimmed.slice('\\\\?\\'.length);
+    }
+    if (trimmed.startsWith('//?/UNC/')) {
+        return `//${trimmed.slice('//?/UNC/'.length)}`;
+    }
+    if (trimmed.startsWith('//?/')) {
+        return trimmed.slice('//?/'.length);
+    }
+    return trimmed;
+}
 
 function Settings() {
     const { t, i18n } = useTranslation();
@@ -155,8 +172,10 @@ function Settings() {
 
     // Dialog state
     // Dialog state
-    const [isClearLogsOpen, setIsClearLogsOpen] = useState(false);
     const [dataDirPath, setDataDirPath] = useState<string>('~/.antigravity_tools/');
+    const [pendingDataDir, setPendingDataDir] = useState<string>('');
+    const [isMigrateDataDirOpen, setIsMigrateDataDirOpen] = useState(false);
+    const [isMigratingDataDir, setIsMigratingDataDir] = useState(false);
 
     // Antigravity cache clearing state
     const [isClearCacheOpen, setIsClearCacheOpen] = useState(false);
@@ -164,11 +183,13 @@ function Settings() {
     const [isClearingCache, setIsClearingCache] = useState(false);
 
 
+
     useEffect(() => {
         loadConfig();
         invoke<string>('get_data_dir_path')
-            .then(path => setDataDirPath(path))
+            .then(path => setDataDirPath(normalizeDataDirDisplay(path)))
             .catch(err => console.error('Failed to get data dir:', err));
+
         if (isTauri()) {
             invoke<boolean>('is_auto_launch_enabled')
                 .then(enabled => setFormDataState(prev => ({ ...prev, auto_launch: enabled })))
@@ -216,21 +237,52 @@ function Settings() {
         }
     };
 
-    const confirmClearLogs = async () => {
-        try {
-            await invoke('clear_log_cache');
-            showToast(t('settings.advanced.logs_cleared'), 'success');
-        } catch (error) {
-            showToast(`${t('common.error')}: ${error}`, 'error');
-        }
-        setIsClearLogsOpen(false);
-    };
+
 
     const handleOpenDataDir = async () => {
         try {
             await invoke('open_data_folder');
         } catch (error) {
             showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
+    const handleSelectDataDir = async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                multiple: false,
+                title: t('settings.advanced.data_dir_select'),
+            });
+            if (!selected || typeof selected !== 'string') {
+                return;
+            }
+            if (selected === dataDirPath) {
+                return;
+            }
+            setPendingDataDir(selected);
+            setIsMigrateDataDirOpen(true);
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
+    const confirmMigrateDataDir = async () => {
+        if (!pendingDataDir || isMigratingDataDir) {
+            return;
+        }
+        setIsMigratingDataDir(true);
+        try {
+            const newPath = await invoke<string>('set_data_dir', { path: pendingDataDir });
+            setDataDirPath(normalizeDataDirDisplay(newPath));
+            setIsMigrateDataDirOpen(false);
+            setPendingDataDir('');
+            showToast(t('settings.advanced.data_dir_migrated'), 'success');
+            showToast(t('settings.advanced.data_dir_restart_hint'), 'info');
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        } finally {
+            setIsMigratingDataDir(false);
         }
     };
 
@@ -339,6 +391,7 @@ function Settings() {
             showToast(`${t('common.error')}: ${error}`, 'error');
         }
     };
+
 
     // Handle opening cache clear dialog
     const handleOpenClearCacheDialog = async () => {
@@ -487,6 +540,7 @@ function Settings() {
                                 </select>
                                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.auto_launch_desc')}</p>
                             </div>
+
                             )}
 
                                 {/* 菜单显示设置 */}
@@ -794,6 +848,15 @@ function Settings() {
                                                 {t('settings.advanced.open_btn')}
                                             </button>
                                         )}
+                                        {isTauri() && (
+                                            <button
+                                                type="button"
+                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 hover:text-gray-900 dark:hover:text-base-content transition-colors"
+                                                onClick={handleSelectDataDir}
+                                            >
+                                                {t('settings.advanced.data_dir_select')}
+                                            </button>
+                                        )}
                                     </div>
                                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.advanced.data_dir_desc')}</p>
                                 </div>
@@ -981,21 +1044,7 @@ function Settings() {
                                     </p>
                                 </div>
 
-                                {/* 日志缓存清理 */}
-                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
-                                    <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.logs_title')}</h3>
-                                    <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-3 mb-3">
-                                        <p className="text-sm text-gray-600 dark:text-gray-400">{t('settings.advanced.logs_desc')}</p>
-                                    </div>
-                                    <div className="flex items-center gap-4">
-                                        <button
-                                            className="px-4 py-2 border border-gray-300 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors"
-                                            onClick={() => setIsClearLogsOpen(true)}
-                                        >
-                                            {t('settings.advanced.clear_logs')}
-                                        </button>
-                                    </div>
-                                </div>
+
 
                                 {/* Antigravity 缓存清理 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-4">
@@ -1285,19 +1334,29 @@ function Settings() {
                         </div>
                     )}
 
+
                 </div >
 
+
+
                 <ModalDialog
-                    isOpen={isClearLogsOpen}
-                    title={t('settings.advanced.clear_logs_title')}
-                    message={t('settings.advanced.clear_logs_msg')}
+                    isOpen={isMigrateDataDirOpen}
+                    title={t('settings.advanced.data_dir_migrate_title')}
                     type="confirm"
-                    confirmText={t('common.clear')}
+                    confirmText={isMigratingDataDir ? t('common.loading') : t('common.confirm')}
                     cancelText={t('common.cancel')}
-                    isDestructive={true}
-                    onConfirm={confirmClearLogs}
-                    onCancel={() => setIsClearLogsOpen(false)}
-                />
+                    onConfirm={confirmMigrateDataDir}
+                    onCancel={() => {
+                        if (!isMigratingDataDir) {
+                            setIsMigrateDataDirOpen(false);
+                            setPendingDataDir('');
+                        }
+                    }}
+                >
+                    <p className="text-sm text-gray-600 dark:text-gray-400 whitespace-pre-line">
+                        {t('settings.advanced.data_dir_migrate_msg', { path: pendingDataDir })}
+                    </p>
+                </ModalDialog>
 
                 {/* Antigravity Cache Clear Modal */}
                 <ModalDialog
@@ -1336,6 +1395,7 @@ function Settings() {
                         </div>
                     </div>
                 </ModalDialog>
+
 
             </div >
         </div >

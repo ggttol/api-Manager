@@ -142,6 +142,11 @@ where
                             {
                                 current_thinking.push_str(thinking);
                             }
+                            if let Some(signature) =
+                                delta.get("signature").and_then(|value| value.as_str())
+                            {
+                                current_signature = Some(signature.to_string());
+                            }
                         }
                         Some("signature_delta") => {
                             current_signature = delta
@@ -161,9 +166,36 @@ where
                 }
             }
             "content_block_stop" => {
-                if let Some(tool_use) = current_tool_use.take() {
-                    let input =
-                        serde_json::from_str(&current_tool_input).unwrap_or_else(|_| json!({}));
+                // 完成当前块
+                if !current_text.is_empty() {
+                    response.content.push(ContentBlock::Text {
+                        text: current_text.clone(),
+                    });
+                    current_text.clear();
+                } else if !current_thinking.is_empty() || current_signature.is_some() {
+                    response.content.push(ContentBlock::Thinking {
+                        thinking: current_thinking.clone(),
+                        signature: current_signature.take(),
+                        cache_control: None,
+                    });
+                    current_thinking.clear();
+                } else if let Some(tool_use) = current_tool_use.take() {
+                    // 构建 tool_use 块
+                    let id = tool_use
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let name = tool_use
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let input = if !current_tool_input.is_empty() {
+                        serde_json::from_str(&current_tool_input).unwrap_or(json!({}))
+                    } else {
+                        json!({})
+                    };
                     response.content.push(ContentBlock::ToolUse {
                         id: tool_use
                             .get("id")
@@ -324,7 +356,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect_empty_completed_stream_is_not_an_error() {
+    async fn test_collect_thinking_response_with_signature_delta() {
+        // 模拟 Anthropic 官方标准的 signature_delta 独立增量事件流
+        let sse_data = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_think\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-7-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Detailed thinking...\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_from_signature_delta_123\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":10}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let byte_stream = stream::iter(
+            sse_data
+                .into_iter()
+                .map(|s| Ok::<Bytes, io::Error>(Bytes::from(s))),
+        );
+
+        let result = collect_stream_to_json(byte_stream).await;
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        if let ContentBlock::Thinking {
+            thinking,
+            signature,
+            ..
+        } = &response.content[0]
+        {
+            assert_eq!(thinking, "Detailed thinking...");
+            assert_eq!(signature.as_deref(), Some("sig_from_signature_delta_123"));
+        } else {
+            panic!("Expected Thinking block");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_empty_stream_fallback() {
+        // [FIX #3359] 模拟仅包含 message_start 和 message_stop 的空内容流（如单点探测请求）
         let sse_data = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gemini-3.7-flash\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":0}}\n\n",

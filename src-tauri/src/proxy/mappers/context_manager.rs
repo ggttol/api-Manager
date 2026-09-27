@@ -960,6 +960,7 @@ impl ContextManager {
 
     /// Estimate token usage for a Gemini Request represented as serde_json::Value
     pub fn estimate_gemini_token_usage(body: &Value) -> u32 {
+        let body = body.get("request").unwrap_or(body);
         let mut total = 0;
 
         // systemInstruction
@@ -1073,7 +1074,7 @@ impl ContextManager {
                         _tool_indices: Vec::new(),
                         indices: vec![i],
                     });
-                } else if role == "user" && has_function_response {
+                } else if (role == "user" || role == "model") && has_function_response {
                     if let Some(ref mut round) = current_round {
                         round._tool_indices.push(i);
                         round.indices.push(i);
@@ -1148,7 +1149,14 @@ impl ContextManager {
         body: &mut Value,
         protected_last_n: usize,
     ) -> bool {
-        if let Some(contents) = body.get_mut("contents").and_then(|c| c.as_array_mut()) {
+        let contents = if body.get("contents").and_then(|c| c.as_array()).is_some() {
+            body.get_mut("contents").and_then(|c| c.as_array_mut())
+        } else {
+            body.get_mut("request")
+                .and_then(|r| r.get_mut("contents"))
+                .and_then(|c| c.as_array_mut())
+        };
+        if let Some(contents) = contents {
             let total_turns = contents.len();
             if total_turns == 0 {
                 return false;
@@ -1196,6 +1204,27 @@ impl ContextManager {
         } else {
             false
         }
+    }
+
+    /// Re-estimate (and optionally compress) AFTER mapping + thinking restore on the transit body.
+    pub fn apply_post_transit_context_mgmt(body: &mut Value, mapped_model: &str) -> u32 {
+        let estimated = Self::estimate_gemini_token_usage(body);
+        let level = crate::proxy::config::get_global_compression_level();
+        if level != "high" {
+            return estimated;
+        }
+        let context_limit = if mapped_model.to_lowercase().contains("flash") {
+            1_000_000u32
+        } else {
+            2_000_000u32
+        };
+        let ratio = estimated as f32 / context_limit as f32;
+        if ratio > crate::proxy::config::get_global_threshold_l2() {
+            if Self::compress_gemini_thinking_preserve_signature(body, 4) {
+                return Self::estimate_gemini_token_usage(body);
+            }
+        }
+        estimated
     }
 }
 #[cfg(test)]
@@ -1349,6 +1378,7 @@ mod tests {
                     "a very very long chain of reasoning thoughts that exceeds 10 characters"
                         .into(),
                 ),
+                signature: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
                     r#type: "function".into(),
@@ -1356,6 +1386,7 @@ mod tests {
                         name: "read_file".into(),
                         arguments: "{}".into(),
                     }),
+                    signature: None,
                     status: None,
                     call_id: None,
                     operation: None,
@@ -1368,6 +1399,7 @@ mod tests {
                 refusal: None,
                 content: Some(OpenAIContent::String("latest user message".into())),
                 reasoning_content: None,
+                signature: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,

@@ -156,46 +156,59 @@ where
         return Err("Upstream stream ended without a terminal choice".to_string());
     }
 
-    response.choices = choices
-        .into_iter()
-        .map(|(index, accumulator)| {
-            let tool_calls = if accumulator.tool_calls.is_empty() {
-                None
-            } else {
-                Some(
-                    accumulator
-                        .tool_calls
-                        .into_iter()
-                        .map(|(_, (id, kind, name, arguments))| ToolCall {
+    for (index, accumulator) in choices {
+        let final_tool_calls = if accumulator.tool_calls.is_empty() {
+            None
+        } else {
+            let calls = accumulator
+                .tool_calls
+                .into_iter()
+                .map(|(tool_index, (id, tc_type, name, args_parts))| {
+                    (
+                        tool_index,
+                        ToolCall {
                             id,
-                            r#type: kind,
+                            r#type: tc_type,
                             function: Some(ToolFunction {
                                 name,
-                                arguments: arguments.join(""),
+                                arguments: args_parts.join(""),
                             }),
+                            signature: None,
                             status: None,
                             call_id: None,
                             operation: None,
-                        })
-                        .collect(),
-                )
-            };
-            Choice {
-                index,
-                message: OpenAIMessage {
-                    role: accumulator.role.unwrap_or_else(|| "assistant".to_string()),
-                    content: Some(OpenAIContent::String(accumulator.content_parts.join(""))),
-                    reasoning_content: (!accumulator.reasoning_parts.is_empty())
-                        .then(|| accumulator.reasoning_parts.join("")),
-                    tool_calls,
-                    tool_call_id: None,
-                    name: None,
-                    refusal: None,
-                },
-                finish_reason: accumulator.finish_reason,
-            }
-        })
-        .collect();
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            Some(calls.into_iter().map(|(_, call)| call).collect())
+        };
+        let finish_reason = if final_tool_calls.is_some() {
+            Some("tool_calls".to_string())
+        } else {
+            accumulator.finish_reason
+        };
+        let full_content = accumulator.content_parts.concat();
+        let message = OpenAIMessage {
+            role: accumulator.role.unwrap_or_else(|| "assistant".to_string()),
+            content: if full_content.is_empty() && final_tool_calls.is_some() {
+                None
+            } else {
+                Some(OpenAIContent::String(full_content))
+            },
+            reasoning_content: Some(accumulator.reasoning_parts.concat()),
+            signature: None,
+            tool_calls: final_tool_calls,
+            tool_call_id: None,
+            name: None,
+            refusal: None,
+        };
+        response.choices.push(Choice {
+            index,
+            message,
+            finish_reason,
+        });
+    }
 
     Ok(response)
 }

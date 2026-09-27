@@ -56,6 +56,7 @@ import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
 import { QuotaItem } from './QuotaItem';
+import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
 import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
 import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
@@ -372,6 +373,7 @@ function AccountRowContent({
                         label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
                         percentage: Math.round((b.remaining_fraction || 0) * 100),
                         resetTime: b.reset_time,
+                        cycleTokens: b.cycle_tokens,
                         Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
                     };
                 });
@@ -510,6 +512,9 @@ function AccountRowContent({
                             );
                         })()}
                         {/* 自定义标签 */}
+                        <span className="px-2 py-0.5 rounded-md bg-gray-100 dark:bg-base-300 text-gray-500 dark:text-gray-400 text-[10px] font-bold" title={t('accounts.priority_hint')}>
+                            {t('accounts.priority')}: {account.priority ?? 50}
+                        </span>
                         {account.custom_label && !isEditingLabel && (
                             <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[10px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
                                 <Tag className="w-2.5 h-2.5" />
@@ -593,19 +598,20 @@ function AccountRowContent({
                                     label={item.label}
                                     percentage={item.percentage}
                                     resetTime={item.resetTime}
+                                    weeklyTokens={item.cycleTokens ?? null}
                                     Icon={item.Icon}
                                 />
                             ))
                         ) : (
                             displayModels.map((model) => {
                                 const modelData = model.data;
+                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups);
 
                                 return (
                                     <QuotaItem
                                         key={model.id}
                                         label={model.label}
-                                        percentage={modelData?.percentage || 0}
-                                        resetTime={modelData?.reset_time}
+                                        {...display}
                                         isProtected={Boolean(config?.quota_protection?.enabled && isModelProtected(account.protected_models, model.protectedKey))}
                                         liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                         Icon={MODEL_CONFIG[model.id]?.Icon || Bot}

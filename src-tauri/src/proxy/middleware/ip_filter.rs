@@ -116,3 +116,49 @@ fn create_blocked_response(ip: &str, message: &str) -> Response {
     )
         .into_response()
 }
+
+/// Canonicalize common IP spellings for diagnostics and local callers.
+pub fn normalize_ip_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let clean = trimmed.trim_matches(|character| character == '[' || character == ']');
+    if let Ok(address) = clean.parse::<std::net::IpAddr>() {
+        return match address {
+            std::net::IpAddr::V4(address) => address.to_string(),
+            std::net::IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(|mapped| mapped.to_string())
+                .unwrap_or_else(|| address.to_string()),
+        };
+    }
+
+    if let Ok(address) = trimmed.parse::<std::net::SocketAddr>() {
+        return match address.ip() {
+            std::net::IpAddr::V4(address) => address.to_string(),
+            std::net::IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(|mapped| mapped.to_string())
+                .unwrap_or_else(|| address.to_string()),
+        };
+    }
+
+    clean.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_ip_str() {
+        assert_eq!(normalize_ip_str("192.168.1.1"), "192.168.1.1");
+        assert_eq!(normalize_ip_str("192.168.1.1:8080"), "192.168.1.1");
+        assert_eq!(normalize_ip_str("::ffff:192.168.1.1"), "192.168.1.1");
+        assert_eq!(normalize_ip_str("[::ffff:192.168.1.1]:8046"), "192.168.1.1");
+        assert_eq!(normalize_ip_str("::1"), "::1");
+        assert_eq!(normalize_ip_str("[::1]:8046"), "::1");
+        assert_eq!(
+            normalize_ip_str("2409:8a55:a21:2e60:2e2:69ff:fe17:95cb"),
+            "2409:8a55:a21:2e60:2e2:69ff:fe17:95cb"
+        );
+    }
+}

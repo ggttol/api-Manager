@@ -1,59 +1,46 @@
 // OpenAI 协议响应转换模块
 use super::models::*;
+fn extract_apply_patch_input(args: &Value) -> String {
+    if let Some(input) = args.as_str() {
+        return input.to_string();
+    }
+    for key in ["input", "patch", "patch_text", "diff"] {
+        if let Some(input) = args.get(key).and_then(Value::as_str) {
+            return input.to_string();
+        }
+    }
+    serde_json::to_string(args).unwrap_or_default()
+}
+
 use serde_json::Value;
+
+/// 标准化并清洗 shell / PowerShell / DSH (DeepSeek Harness) 等工具参数
+/// 1. 将 cmd / code / script / shell_command / input 等别名重命名为 command
+/// 2. [DSH tool-pwsh / tool-bash & WorkBuddy]：
+///    - DSH 严格校验 `command` (string) 和 `description` (string) 两个字段必须都存在且非空。
+///    - 若模型将实际命令写在 description / text / prompt 中，且 command 缺失，则优先提取恢复为真实 command。
+///    - 若 command 存在但缺失 description，则基于 command 自动推导截取生成 description。
+///    - 若两者皆无，则填充安全占位命令并保证 description 完整，防止客户端崩溃 (Issue #3430 & #3440)。
+/// 3. [DSH tool-workflow]：
+///    - DSH 严格校验 `script` (string) 和 `meta` (object with `name` and `description`)。
+///    - 若模型返回扁平结构的 `name` / `description`，自动归拢装配进 `meta` 对象中，确保运行期校验通过。
+/// 纯透传协议工具参数，不进行任何字段截断、生成或改写
+pub fn normalize_and_sanitize_tool_args(tool_name: &str, args: &mut Value) {
+    if let Some(obj) = args.as_object() {
+        tracing::debug!(
+            "[OpenAI] Tool Call (Passthrough): '{}' Args: {:?}",
+            tool_name,
+            obj
+        );
+    }
+}
 
 pub fn resolve_shell_tool_name(
     model_tool_name: &str,
-    client_tool_names: &std::collections::HashSet<String>,
+    _client_tool_names: &std::collections::HashSet<String>,
 ) -> String {
-    if model_tool_name == "shell"
-        || model_tool_name == "bash"
-        || model_tool_name == "local_shell"
-        || model_tool_name == "local_shell_call"
-    {
-        if client_tool_names.contains(model_tool_name) {
-            return model_tool_name.to_string();
-        }
-        for name in &["local_shell_call", "bash", "shell", "local_shell"] {
-            if client_tool_names.contains(*name) {
-                return name.to_string();
-            }
-        }
-        "local_shell_call".to_string()
-    } else {
-        model_tool_name.to_string()
-    }
-}
-fn extract_apply_patch_input(args: &Value) -> String {
-    if let Some(obj) = args.as_object() {
-        if let Some(input) = obj.get("input").and_then(|v| v.as_str()) {
-            return input.to_string();
-        }
-        if let Some(arr) = obj.get("command").and_then(|v| v.as_array()) {
-            if arr.len() > 1 {
-                if let Some(patch) = arr[1].as_str() {
-                    return patch.to_string();
-                }
-            }
-        }
-        if let Some(cmd_str) = obj.get("command").and_then(|v| v.as_str()) {
-            if let Some(patch) = cmd_str.strip_prefix("apply_patch\n") {
-                return patch.to_string();
-            }
-            if let Some(patch) = cmd_str.strip_prefix("apply_patch ") {
-                return patch.to_string();
-            }
-            return cmd_str.to_string();
-        }
-        for key in ["patch_text", "patch", "diff", "content"] {
-            if let Some(patch) = obj.get(key).and_then(|v| v.as_str()) {
-                return patch.to_string();
-            }
-        }
-    }
-    args.as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default())
+    // 纯透传工具名称，不进行任何改写
+    model_tool_name.to_string()
 }
 
 pub fn transform_openai_response(
@@ -117,11 +104,10 @@ pub fn transform_openai_response(
                         let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let mut args_json =
                             fc.get("args").unwrap_or(&serde_json::json!({})).clone();
-
+                        let is_apply_patch = name == "apply_patch" || name == "apply_patch_v2";
                         let mut arguments_str = args_json.to_string();
 
-                        // [FIX] Codex CLI apply_patch freeform raw string
-                        if name == "apply_patch" || name == "apply_patch_v2" {
+                        if is_apply_patch {
                             let extracted_patch = extract_apply_patch_input(&args_json);
                             let (optimized_patch, _) =
                                 crate::proxy::adapters::apply_patch_preflight::optimize_patch(
@@ -144,7 +130,10 @@ pub fn transform_openai_response(
                                 continue;
                             }
                         }
-
+                        normalize_and_sanitize_tool_args(name, &mut args_json);
+                        if !is_apply_patch {
+                            arguments_str = args_json.to_string();
+                        }
                         let final_name = resolve_shell_tool_name(name, client_tool_names);
 
                         let id = fc
@@ -153,6 +142,15 @@ pub fn transform_openai_response(
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| format!("{}-{}", final_name, uuid::Uuid::new_v4()));
 
+                        if let Some(sig) = part
+                            .get("thoughtSignature")
+                            .or(part.get("thought_signature"))
+                            .and_then(|s| s.as_str())
+                        {
+                            crate::proxy::SignatureCache::global()
+                                .cache_tool_signature(&id, sig.to_string());
+                        }
+
                         tool_calls.push(ToolCall {
                             id,
                             r#type: "function".to_string(),
@@ -160,6 +158,7 @@ pub fn transform_openai_response(
                                 name: final_name.to_string(),
                                 arguments: arguments_str,
                             }),
+                            signature: None,
                             status: None,
                             call_id: None,
                             operation: None,
@@ -208,6 +207,9 @@ pub fn transform_openai_response(
                             ));
                         }
                     }
+                }
+                if let Some(sid) = session_id {
+                    crate::proxy::thinking_store::capture_gemini_parts(sid, parts);
                 }
             }
 
@@ -267,20 +269,28 @@ pub fn transform_openai_response(
                 }
             }
 
-            let finish_reason = candidate
-                .get("finishReason")
-                .and_then(|f| f.as_str())
-                .map(|f| match f {
-                    "STOP" => "stop",
-                    "MAX_TOKENS" => "length",
-                    "SAFETY" => "content_filter",
-                    "RECITATION" => "content_filter",
-                    _ => "stop",
-                })
-                .unwrap_or("stop");
+            let raw_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str());
+
+            // 规范化 finish_reason：若包含工具调用，强制遵循 OpenAI 规范映射为 tool_calls
+            let finish_reason = if !tool_calls.is_empty() {
+                "tool_calls"
+            } else {
+                raw_finish_reason
+                    .map(|f| match f {
+                        "STOP" => "stop",
+                        "MAX_TOKENS" => "length",
+                        "SAFETY" | "RECITATION" => "content_filter",
+                        "MALFORMED_FUNCTION_CALL" => "stop",
+                        _ => "stop",
+                    })
+                    .unwrap_or("stop")
+            };
 
             let refusal_val = if finish_reason == "content_filter" {
-                Some("生成由于安全策略或背诵保护被中止".to_string())
+                Some(
+                    "Generation was terminated due to safety policy or recitation checks."
+                        .to_string(),
+                )
             } else {
                 None
             };
@@ -303,6 +313,7 @@ pub fn transform_openai_response(
                     } else {
                         Some(thought_out)
                     },
+                    signature: None,
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -324,13 +335,17 @@ pub fn transform_openai_response(
                 .get("blockReason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("UNKNOWN");
-            let refusal_msg = format!("请求由于安全策略被拦截 (blockReason: {})", reason);
+            let refusal_msg = format!(
+                "Request was blocked due to safety policy (blockReason: {}).",
+                reason
+            );
             choices.push(Choice {
                 index: 0,
                 message: OpenAIMessage {
                     role: "assistant".to_string(),
                     content: None,
                     reasoning_content: None,
+                    signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -344,72 +359,15 @@ pub fn transform_openai_response(
     // Extract and map usage metadata from Gemini to OpenAI format
     // Supports both legacy v1internal format (promptTokenCount/candidatesTokenCount/totalTokenCount/cachedContentTokenCount)
     // and new Interactions API format (total_input_tokens/total_output_tokens/total_thought_tokens/total_cached_tokens)
-    let usage = raw.get("usageMetadata").and_then(|u| {
-        // 优先使用新格式字段，fallback 到旧格式
-        let prompt_tokens = u
-            .get("total_input_tokens")
-            .or_else(|| u.get("promptTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let raw_output_tokens = u
-            .get("total_output_tokens")
-            .or_else(|| u.get("candidatesTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let raw_total_tokens = u
-            .get("total_tokens")
-            .or_else(|| u.get("totalTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let cached_tokens = u
-            .get("total_cached_tokens")
-            .or_else(|| u.get("cachedContentTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        // [NEW] 从新格式提取 reasoning/thought tokens
-        let reasoning_tokens = u
-            .get("total_thought_tokens")
-            .or_else(|| u.get("totalThoughtTokens"))
-            .or_else(|| u.get("thoughtsTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let tool_use_tokens = u
+    let usage = raw.get("usageMetadata").map(|u| {
+        let canonical = crate::proxy::pipeline::CanonicalUsage::from_gemini(u);
+        let mut usage = super::models::OpenAIUsage::from(&canonical);
+        usage.input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
+        usage.total_tool_use_tokens = u
             .get("total_tool_use_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
-
-        // New Interactions usage keeps thought/tool-use tokens separate from
-        // total_output_tokens. Legacy candidatesTokenCount already includes those.
-        let has_new_format = u.get("total_output_tokens").is_some();
-        let completion_tokens = if has_new_format {
-            raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
-        } else {
-            raw_output_tokens
-        };
-
-        // Keep prompt_tokens as Gemini's raw input token count. cached_tokens is a
-        // subset of the prompt, not an amount to subtract from it.
-        let final_total_tokens = raw_total_tokens.unwrap_or(prompt_tokens + completion_tokens);
-
-        Some(super::models::OpenAIUsage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: final_total_tokens,
-            prompt_tokens_details: cached_tokens.map(|ct| super::models::PromptTokensDetails {
-                cached_tokens: Some(ct),
-            }),
-            completion_tokens_details: reasoning_tokens.map(|rt| {
-                super::models::CompletionTokensDetails {
-                    reasoning_tokens: Some(rt),
-                }
-            }),
-            input_tokens_by_modality,
-            raw_output_tokens: Some(raw_output_tokens),
-            total_thought_tokens: reasoning_tokens,
-            total_tool_use_tokens: tool_use_tokens,
-            gemini_total_tokens: raw_total_tokens,
-        })
+        usage
     });
 
     OpenAIResponse {
@@ -573,5 +531,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 0]
         );
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_passthrough() {
+        let mut args = json!({
+            "cmd": "ls -la /tmp",
+            "description": "Custom description",
+            "arbitrary_field": 123
+        });
+        normalize_and_sanitize_tool_args("shell", &mut args);
+        // 验证纯透传：参数原样保持，没有任何字段被重命名、删除或注入
+        assert_eq!(args["cmd"], "ls -la /tmp");
+        assert_eq!(args["description"], "Custom description");
+        assert_eq!(args["arbitrary_field"], 123);
+        assert!(!args.as_object().unwrap().contains_key("command"));
+    }
+
+    #[test]
+    fn test_malformed_function_call_never_injects_hardcoded_online_prompt() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": []
+                },
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "modelVersion": "gemini-3.7-flash",
+            "responseId": "resp_malformed"
+        });
+
+        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
+        assert_eq!(result.choices.len(), 1);
+        assert_eq!(result.choices[0].finish_reason, Some("stop".to_string()));
+        assert!(result.choices[0].message.content.is_none());
+    }
+
+    #[test]
+    fn test_tool_calls_response_finish_reason_is_tool_calls() {
+        let gemini_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "read_file",
+                            "args": { "path": "src/main.rs" }
+                        }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "modelVersion": "gemini-2.5-flash",
+            "responseId": "resp_tool"
+        });
+
+        let result = transform_openai_response(&gemini_resp, Some("session-123"), 1, None);
+        assert_eq!(result.choices.len(), 1);
+        assert_eq!(
+            result.choices[0].finish_reason,
+            Some("tool_calls".to_string())
+        );
+        assert!(result.choices[0].message.tool_calls.is_some());
     }
 }

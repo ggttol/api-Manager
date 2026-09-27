@@ -13,7 +13,7 @@ pub async fn service_status_middleware(
 ) -> Response {
     let path = request.uri().path();
 
-    // Pause inference, not the management UI or its static assets.
+    // Pause inference routes, but leave management, internal support and auth callback available.
     let inference = path.starts_with("/v1/")
         || path.starts_with("/v1beta/")
         || path.starts_with("/codex/v1/")
@@ -21,7 +21,11 @@ pub async fn service_status_middleware(
         || path.starts_with("/responses/")
         || path.starts_with("/mcp/")
         || path == "/internal/warmup";
-    if !inference {
+    let always_available = path.starts_with("/api/")
+        || (path.starts_with("/internal/") && path != "/internal/warmup")
+        || path == "/auth/callback"
+        || path == "/health";
+    if !inference || always_available {
         return next.run(request).await;
     }
 

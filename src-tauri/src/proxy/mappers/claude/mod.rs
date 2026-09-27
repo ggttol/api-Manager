@@ -14,12 +14,11 @@ pub use collector::collect_stream_to_json;
 pub use models::*;
 pub use request::{
     clean_cache_control_from_messages, merge_consecutive_messages, transform_claude_request_in,
+    transform_claude_request_in_timed,
 };
 pub use response::transform_response;
 pub use streaming::{PartProcessor, StreamingState};
-pub use thinking_utils::{
-    close_tool_loop_for_thinking, filter_invalid_thinking_blocks_with_family,
-}; // [NEW]
+pub use thinking_utils::filter_invalid_thinking_blocks_with_family; // [NEW]
 
 use bytes::Bytes;
 use futures::Stream;
@@ -207,6 +206,11 @@ where
             state.has_content = true;
         }
 
+        if let Some(sid) = state.session_id.clone() {
+            let acc = std::mem::take(&mut state.thinking_acc);
+            acc.commit(&sid);
+        }
+
         if !state.upstream_failed {
             for chunk in emit_force_stop(&mut state) {
                 yield Ok(chunk);
@@ -318,6 +322,7 @@ fn process_sse_line(
         .and_then(|p| p.as_array())
     {
         for part_value in parts {
+            state.thinking_acc.ingest_part(part_value);
             if let Ok(part) = serde_json::from_value::<GeminiPart>(part_value.clone()) {
                 let mut processor = PartProcessor::new(state);
                 chunks.extend(processor.process(&part));

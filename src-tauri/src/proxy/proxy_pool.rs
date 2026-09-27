@@ -819,4 +819,30 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    #[test]
+    fn test_build_proxy_config_fallback_to_url_auth_on_decrypt_failure() {
+        let pool = ProxyPoolManager::new(Arc::new(RwLock::new(ProxyPoolConfig::default())));
+        let entry = ProxyEntry {
+            id: "p3".to_string(),
+            name: "test_fallback_auth".to_string(),
+            url: "http://url_user:url_pass@127.0.0.1:10080".to_string(),
+            auth: Some(ProxyAuth {
+                username: "struct_user".to_string(),
+                password: "ag_enc_v2_failed_decrypt_payload".to_string(),
+            }),
+            enabled: true,
+            priority: 1,
+            tags: vec![],
+            max_accounts: None,
+            health_check_url: None,
+            last_check_time: None,
+            is_healthy: true,
+            latency: None,
+        };
+
+        let res = pool.build_proxy_config(&entry);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().entry_id, "p3");
+    }
 }

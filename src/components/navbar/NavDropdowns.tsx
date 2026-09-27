@@ -10,6 +10,7 @@ interface LanguageDropdownProps {
 
 export function LanguageDropdown({ currentLanguage, languages, onLanguageChange }: LanguageDropdownProps) {
     const { t } = useTranslation();
+
     return (
         <div className="console-language-control">
             <Languages size={17} aria-hidden="true" />

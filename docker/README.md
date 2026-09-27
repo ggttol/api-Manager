@@ -74,6 +74,25 @@ docker run -d \
   lbjlaq/antigravity-manager:latest
 ```
 
+> [!TIP]
+> 以下上游鏡像不包含本修改版的 Codex 通道；需要 Codex 請依照「API Manager Codex 修改版」從本倉庫源碼構建，勿以這些鏡像替換現有服務。
+> **🧪 體驗 Beta / 預覽版鏡像**：
+> 若需使用最新的 Beta 預發布特性，請拉取對應的 Beta 版本 Tag（預發布版本獨立構建發布，不會覆蓋 `latest` 穩定版標籤）：
+> ```bash
+> # 拉取指定 Beta 預發布版本
+> docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
+>
+> # 運行 Beta 容器
+> docker run -d --name antigravity-manager-beta \
+>   -p 8045:8045 \
+>   -e API_KEY=your-api-key \
+>   -e WEB_PASSWORD=your-login-password \
+>   -e ABV_MAX_BODY_SIZE=104857600 \
+>   -v ~/.antigravity_tools:/root/.antigravity_tools \
+>   lbjlaq/antigravity-manager:v4.8.2-beta.0
+> ```
+> 完整版本標籤請查看 [Docker Hub Tags](https://hub.docker.com/r/lbjlaq/antigravity-manager/tags)。若需試用當前 `beta` 分支源碼，應先切換至對應源碼再在本地構建獨立鏡像：`docker build -t api-manager:beta -f docker/Dockerfile .`；該步驟不會更新本修改版的部署。
+
 #### 🔐 鑒權邏輯 (Security Scenarios)
 *   **場景 A：僅設置了 `API_KEY`**
     - **Web 登錄**：使用 `API_KEY` 即可進入後台。
@@ -99,11 +118,28 @@ docker run -d \
 docker compose up -d
 ```
 
-### 3. 手動構建鏡像 (開發者)
+### 3. 手動構建鏡像 (開發者 / 二改版)
 如果您需要修改代碼或自定義構建，請在項目根目錄下執行：
+
+**Windows PowerShell（推薦）**
+```powershell
+# 一鍵構建二改版鏡像（標籤 antigravity-manager:local + 版本-fix）
+.\docker\build.ps1
+
+# 国内網絡加速
+.\docker\build.ps1 -UseMirror
+
+# 構建並推送到你自己的倉庫
+.\docker\build.ps1 -UseMirror -Push -Registry "yourname/antigravity-manager"
+```
+
+**手動 docker build**
 ```bash
 # 默認構建最新標籤
-docker build -t antigravity-manager:latest -f docker/Dockerfile .
+docker build -t antigravity-manager:local -f docker/Dockerfile .
+
+# 二改版 Compose 啟動（Windows 可用端口映射，不用 host 網絡）
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.fork.yml up -d --build
 ```
 
 #### 💡 構建參數

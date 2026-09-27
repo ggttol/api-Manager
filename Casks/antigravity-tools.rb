@@ -1,5 +1,5 @@
 cask "antigravity-tools" do
-  version "4.7.1"
+  version "4.8.3"
   sha256 :no_check
 
   name "Antigravity Tools"
@@ -25,8 +25,6 @@ cask "antigravity-tools" do
       "~/Library/Preferences/com.lbjlaq.antigravity-tools.plist",
       "~/Library/Saved Application State/com.lbjlaq.antigravity-tools.savedState",
     ]
-
-
   end
 
   on_linux do

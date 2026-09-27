@@ -16,6 +16,7 @@ interface ModalDialogProps {
     confirmText?: string;
     cancelText?: string;
     isDestructive?: boolean;
+    isLoading?: boolean;
 }
 
 export default function ModalDialog({
@@ -28,7 +29,8 @@ export default function ModalDialog({
     onCancel,
     confirmText,
     cancelText,
-    isDestructive = false
+    isDestructive = false,
+    isLoading = false
 }: ModalDialogProps) {
     const { t } = useTranslation();
     const finalConfirmText = confirmText || t('common.confirm');
@@ -92,18 +94,21 @@ export default function ModalDialog({
                     <div className="flex gap-3 w-full">
                         {showCancel && (
                             <button
-                                className="console-button flex-1"
+                                disabled={isLoading}
+                                className="console-button flex-1 disabled:opacity-50 disabled:cursor-not-allowed"
                                 onClick={onCancel}
                             >
                                 {finalCancelText}
                             </button>
                         )}
                         <button
-                            className={`console-button-primary flex-1 ${isDestructive && type === 'confirm'
+                            disabled={isLoading}
+                            className={`console-button-primary flex-1 disabled:opacity-50 disabled:cursor-not-allowed ${isDestructive && type === 'confirm'
                                 ? '!bg-red-600 !border-red-600 hover:!bg-red-700'
                                 : ''}`}
                             onClick={onConfirm}
                         >
+                            {isLoading && <span className="loading loading-spinner loading-xs"></span>}
                             {finalConfirmText}
                         </button>
                     </div>

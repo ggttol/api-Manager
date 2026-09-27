@@ -24,6 +24,7 @@ enum TrackerParserMode {
     Baseline,
 }
 
+
 const IMAGE_ACCOUNT_RESELECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_RETRY_POOL_COOLDOWN_SECONDS: u64 = 5;
 
@@ -93,6 +94,7 @@ fn unix_timestamp_ceil(time: std::time::SystemTime) -> Option<i64> {
 #[derive(Debug, Clone)]
 pub struct ProxyToken {
     pub account_id: String,
+    pub priority: u8,
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: i64,
@@ -142,6 +144,10 @@ pub struct TokenManager {
 }
 
 impl TokenManager {
+    fn resolved_data_dir(&self) -> PathBuf {
+        crate::modules::account::get_data_dir().unwrap_or_else(|_| self.data_dir.clone())
+    }
+
     /// 创建新的 TokenManager
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
@@ -230,7 +236,7 @@ impl TokenManager {
 
     /// 从主应用账号目录加载所有账号
     pub async fn load_accounts(&self) -> Result<usize, String> {
-        let accounts_dir = self.data_dir.join("accounts");
+        let accounts_dir = self.resolved_data_dir().join("accounts");
 
         let entries = match std::fs::read_dir(&accounts_dir) {
             Ok(entries) => Some(entries),
@@ -241,7 +247,6 @@ impl TokenManager {
 
         // Reload should reflect current on-disk state (accounts can be added/removed/disabled).
         self.tokens.clear();
-        self.rate_limit_tracker.clear_all();
         self.sync_image_scheduler_accounts();
         self.current_index.store(0, Ordering::SeqCst);
         {
@@ -277,7 +282,7 @@ impl TokenManager {
                     // 跳过无效账号
                 }
                 Err(e) => {
-                    tracing::debug!("加载账号失败 {:?}: {}", path, e);
+                    tracing::warn!("加载账号失败 {:?}: {}", path, e);
                 }
             }
         }
@@ -344,6 +349,13 @@ impl TokenManager {
     /// 根据账号 ID 获取完整的 ProxyToken 对象 (v4.1.29)
     pub fn get_token_by_id(&self, account_id: &str) -> Option<ProxyToken> {
         self.tokens.get(account_id).map(|t| t.clone())
+    }
+
+    /// Apply a saved priority without resetting sessions or live rate limits.
+    pub fn update_account_priority(&self, account_id: &str, priority: u8) {
+        if let Some(mut token) = self.tokens.get_mut(account_id) {
+            token.priority = priority;
+        }
     }
 
     /// Check if an account has been disabled on disk.
@@ -713,11 +725,17 @@ impl TokenManager {
             }
         }
 
-        // [NEW] 同步零配额持续熔断状态（若开启 lock_on_zero_quota 且 5h/周配额为 0，持续熔断至 reset_time）
+        // Weekly availability is mandatory; the optional switch only controls 5h locks.
         self.sync_zero_quota_circuit_breaker(&account_id, &account);
 
         Ok(Some(ProxyToken {
             account_id,
+            priority: crate::models::account::deserialize_priority(
+                account.get("priority").unwrap_or(&serde_json::json!(
+                    crate::models::account::default_priority()
+                )),
+            )
+            .map_err(|e| format!("invalid account priority: {}", e))?,
             access_token,
             refresh_token,
             expires_in,
@@ -1367,7 +1385,7 @@ impl TokenManager {
         use rand::Rng;
 
         // 过滤可用 token
-        let available: Vec<&ProxyToken> = candidates
+        let mut available: Vec<&ProxyToken> = candidates
             .iter()
             .filter(|t| !attempted.contains(&t.account_id))
             .filter(|t| {
@@ -1375,9 +1393,9 @@ impl TokenManager {
             })
             .collect();
 
-        if available.is_empty() {
-            return None;
-        }
+        // Keep lower-priority groups for retries; only this draw is restricted.
+        let priority = available.iter().map(|t| t.priority).min()?;
+        available.retain(|t| t.priority == priority);
         if available.len() == 1 {
             return Some(available[0]);
         }
@@ -1970,8 +1988,10 @@ impl TokenManager {
                                 && bound_token.protected_models.contains(&normalized_target))
                         {
                             // 3. 账号可用且未被标记为尝试失败，优先复用
-                            tracing::debug!("Sticky Session: Successfully reusing bound account {} for session {}", bound_token.email, sid);
+                            tracing::info!("Sticky Session: Successfully reusing bound account {} for session {}", bound_token.email, sid);
                             target_token = Some(bound_token.clone());
+                            need_update_last_used =
+                                Some((bound_token.account_id.clone(), std::time::Instant::now()));
                         } else if quota_protection_enabled
                             && bound_token.protected_models.contains(&normalized_target)
                         {
@@ -2000,43 +2020,50 @@ impl TokenManager {
                 && quota_group != "image_gen"
                 && scheduling.mode != SchedulingMode::PerformanceFirst
             {
-                // 【优化】使用预先获取的快照，不再在循环内加锁
-                if let Some((account_id, last_time)) = &last_used_account_id {
-                    // [FIX #3] 60s 锁定逻辑应检查 `attempted` 集合，避免重复尝试失败的账号
-                    if last_time.elapsed().as_secs() < 60 && !attempted.contains(account_id) {
-                        if let Some(found) =
-                            tokens_snapshot.iter().find(|t| &t.account_id == account_id)
-                        {
-                            // 【修复】检查限流状态和配额保护，避免复用已被锁定的账号
-                            if !self
-                                .is_rate_limited(&found.account_id, Some(&normalized_target))
-                                .await
-                                && !(quota_protection_enabled
-                                    && found.protected_models.contains(&normalized_target))
+                // 仅针对无 session_id 的无状态请求，使用 60s 全局锁定保底避免轮换
+                if session_id.is_none() {
+                    if let Some((account_id, last_time)) = &last_used_account_id {
+                        // [FIX #3] 60s 锁定逻辑应检查 `attempted` 集合，避免重复尝试失败的账号
+                        if last_time.elapsed().as_secs() < 60 && !attempted.contains(account_id) {
+                            if let Some(found) =
+                                tokens_snapshot.iter().find(|t| &t.account_id == account_id)
                             {
-                                tracing::debug!(
-                                    "60s Window: Force reusing last account: {}",
-                                    found.email
-                                );
-                                target_token = Some(found.clone());
-                            } else {
-                                if self
+                                // 【修复】检查限流状态和配额保护，避免复用已被锁定的账号
+                                if !self
                                     .is_rate_limited(&found.account_id, Some(&normalized_target))
                                     .await
+                                    && !(quota_protection_enabled
+                                        && found.protected_models.contains(&normalized_target))
                                 {
                                     tracing::debug!(
-                                        "60s Window: Last account {} is rate-limited, skipping",
+                                        "60s Window: Force reusing last account: {}",
                                         found.email
                                     );
+                                    target_token = Some(found.clone());
+                                    need_update_last_used =
+                                        Some((found.account_id.clone(), std::time::Instant::now()));
                                 } else {
-                                    tracing::debug!("60s Window: Last account {} is quota-protected for model {} [{}], skipping", found.email, normalized_target, target_model);
+                                    if self
+                                        .is_rate_limited(
+                                            &found.account_id,
+                                            Some(&normalized_target),
+                                        )
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            "60s Window: Last account {} is rate-limited, skipping",
+                                            found.email
+                                        );
+                                    } else {
+                                        tracing::debug!("60s Window: Last account {} is quota-protected for model {} [{}], skipping", found.email, normalized_target, target_model);
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // 若无锁定，则使用 P2C 选择账号 (避免热点问题)
+                // 若无锁定或带有 session_id（会话首次分配），使用 P2C 均衡选择账号
                 if target_token.is_none() {
                     // 先过滤出未限流的账号
                     let mut non_limited: Vec<ProxyToken> = Vec::new();
@@ -2058,19 +2085,6 @@ impl TokenManager {
                         target_token = Some(selected.clone());
                         need_update_last_used =
                             Some((selected.account_id.clone(), std::time::Instant::now()));
-
-                        // 如果是会话首次分配且需要粘性，在此建立绑定
-                        if let Some(sid) = session_id {
-                            if scheduling.mode != SchedulingMode::PerformanceFirst {
-                                self.session_accounts
-                                    .insert(sid.to_string(), selected.account_id.clone());
-                                tracing::debug!(
-                                    "Sticky Session: Bound new account {} to session {}",
-                                    selected.email,
-                                    sid
-                                );
-                            }
-                        }
                     }
                 }
             } else if target_token.is_none() {
@@ -2099,6 +2113,21 @@ impl TokenManager {
 
                     if rotate {
                         tracing::debug!("Force Rotation: Switched to account: {}", selected.email);
+                    }
+                }
+            }
+
+            // 【核心固化】凡解析出可用账号且当前为粘性会话调度，确保立即固化绑定，防止轮换或会话漂移
+            if let Some(ref selected) = target_token {
+                if let Some(sid) = session_id {
+                    if scheduling.mode != SchedulingMode::PerformanceFirst && !rotate {
+                        self.session_accounts
+                            .insert(sid.to_string(), selected.account_id.clone());
+                        tracing::info!(
+                            "Sticky Session: Ensured binding account {} to session {}",
+                            selected.email,
+                            sid
+                        );
                     }
                 }
             }
@@ -2389,7 +2418,7 @@ impl TokenManager {
         let path = if let Some(entry) = self.tokens.get(account_id) {
             entry.account_path.clone()
         } else {
-            self.data_dir
+            self.resolved_data_dir()
                 .join("accounts")
                 .join(format!("{}.json", account_id))
         };
@@ -2640,7 +2669,7 @@ impl TokenManager {
     /// 清除所有限流记录
     pub fn clear_all_rate_limits(&self) {
         self.rate_limit_tracker.clear_all();
-        let accounts_dir = self.data_dir.join("accounts");
+        let accounts_dir = self.resolved_data_dir().join("accounts");
         if let Ok(entries) = std::fs::read_dir(accounts_dir) {
             for entry in entries.flatten() {
                 if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
@@ -2973,6 +3002,9 @@ impl TokenManager {
         backoff_steps: &[u64],
         parser_mode: TrackerParserMode,
     ) -> Option<crate::proxy::rate_limit::RateLimitInfo> {
+        if status != 429 && status != 529 {
+            return None;
+        }
         if model
             .and_then(crate::proxy::rate_limit::normalize_image_model_id)
             .is_some()
@@ -3134,6 +3166,23 @@ impl TokenManager {
         model: Option<&str>,
         parser_mode: TrackerParserMode,
     ) {
+        // 关键门禁 1：仅对真正的上游 429 (配额耗尽/速率限制) 和 529 (Overloaded) 记录限流；500/503/404 等绝对不打入冷却池！
+        if status != 429 && status != 529 {
+            return;
+        }
+
+        // 关键门禁 2：内部错误文字（All accounts limited / No accounts available / Token pool is empty 等）严禁递归自锁！
+        let lower_err = error_body.to_lowercase();
+        if lower_err.contains("all accounts limited")
+            || lower_err.contains("no accounts available")
+            || lower_err.contains("all accounts failed")
+            || lower_err.contains("token pool is empty")
+            || lower_err.contains("all accounts exhausted")
+            || lower_err.contains("all accounts unhealthy")
+        {
+            return;
+        }
+
         let normalized_model =
             model.and_then(crate::proxy::common::model_mapping::normalize_to_standard_id);
         let model_to_track = normalized_model.as_deref().or(model);
@@ -3232,7 +3281,7 @@ impl TokenManager {
         let path = if let Some(entry) = self.tokens.get(account_id) {
             entry.account_path.clone()
         } else {
-            self.data_dir
+            self.resolved_data_dir()
                 .join("accounts")
                 .join(format!("{}.json", account_id))
         };
@@ -3283,7 +3332,7 @@ impl TokenManager {
         let path = if let Some(entry) = self.tokens.get(account_id) {
             entry.account_path.clone()
         } else {
-            self.data_dir
+            self.resolved_data_dir()
                 .join("accounts")
                 .join(format!("{}.json", account_id))
         };
@@ -3373,6 +3422,7 @@ impl TokenManager {
         let mut last_used = self.last_used_account.lock().await;
         *last_used = None;
     }
+
 
     /// 清除所有会话的粘性映射
     pub fn clear_all_sessions(&self) {
@@ -3893,14 +3943,9 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
     if reason.len() <= max_len {
         reason.to_string()
     } else {
-        // [FIX] 确保字符截断在有效边界，防止 panic
-        let end = reason
-            .char_indices()
-            .map(|(i, _)| i)
-            .filter(|&i| i <= max_len - 3)
-            .last()
-            .unwrap_or(0);
-        format!("{}...", &reason[..end])
+        let budget = max_len.saturating_sub(3);
+        let end = crate::proxy::mappers::common_utils::safe_truncate_str(reason, budget);
+        format!("{}...", end)
     }
 }
 
@@ -3908,20 +3953,205 @@ fn truncate_reason(reason: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+    use std::time::Duration;
+
+    fn weekly_quota_account(now: i64) -> serde_json::Value {
+        let reset = |seconds| {
+            chrono::DateTime::from_timestamp(now + seconds, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        serde_json::json!({
+            "id": "weekly-test", "email": "quota@test.invalid", "created_at": now, "last_used": now,
+            "token": {"access_token": "test", "refresh_token": "test", "token_type": "Bearer",
+                "expires_in": 3600, "expiry_timestamp": now + 3600, "project_id": "test"},
+            "quota": {"last_updated": now, "models": [
+                {"name": "gemini-3.1-pro-high", "percentage": 0, "reset_time": reset(7200)},
+                {"name": "claude-sonnet-4-6", "percentage": 100, "reset_time": reset(1800)}
+            ], "quota_groups": [
+                {"display_name": "Gemini Models", "buckets": [
+                    {"bucket_id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": reset(7200)},
+                    {"bucket_id": "gemini-5h", "window": "5h", "remaining_fraction": 1.0, "reset_time": reset(1800)}
+                ]},
+                {"display_name": "Claude and GPT models", "buckets": [
+                    {"bucket_id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": reset(7200)}
+                ]}
+            ]}
+        })
+    }
+
+    #[tokio::test]
+    async fn weekly_quota_blocks_by_default_and_survives_reload_and_resets() {
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let data_dir = crate::modules::account::get_data_dir().unwrap();
+        let accounts = data_dir.join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let mut snapshot = weekly_quota_account(chrono::Utc::now().timestamp());
+        snapshot["quota"]["quota_groups"][0]["buckets"][0]["remaining_fraction"] =
+            serde_json::json!(0.0005);
+        std::fs::write(accounts.join("weekly-test.json"), snapshot.to_string()).unwrap();
+        let manager = TokenManager::new(data_dir);
+        manager.load_accounts().await.unwrap();
+        assert!(
+            manager
+                .is_rate_limited("weekly-test", Some("gemini-3-pro-high"))
+                .await
+        );
+        assert!(!manager.is_rate_limited("weekly-test", Some("claude")).await);
+        manager.circuit_breaker_config.write().await.enabled = false;
+        manager.reload_account("weekly-test").await.unwrap();
+        manager.load_accounts().await.unwrap();
+        manager.rate_limit_tracker.clear_for_optimistic_reset();
+        manager.clear_all_rate_limits();
+        assert!(
+            manager
+                .is_rate_limited("weekly-test", Some("gemini-3-pro-high"))
+                .await
+        );
+        assert!(manager
+            .get_token("gemini", false, None, "gemini-3.1-pro-high")
+            .await
+            .is_err());
+        assert!(manager
+            .get_token("claude", false, None, "claude-sonnet-4-6")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn weekly_quota_recovery_requires_new_same_bucket_and_preserves_other_limits() {
+        let manager = TokenManager::new(PathBuf::new());
+        let now = chrono::Utc::now().timestamp();
+        let mut snapshot = weekly_quota_account(now);
+        snapshot["quota"]["quota_groups"][0]["buckets"][0]["remaining_fraction"] =
+            serde_json::json!(0.001);
+        let tracker = &manager.rate_limit_tracker;
+        manager
+            .circuit_breaker_config
+            .write()
+            .await
+            .lock_on_zero_quota = true;
+        snapshot["quota"]["quota_groups"][0]["buckets"][1]["remaining_fraction"] =
+            serde_json::json!(0);
+        manager.sync_zero_quota_circuit_breaker("a", &snapshot);
+        tracker.set_lockout_until_with_cap(
+            "a",
+            std::time::SystemTime::now() + Duration::from_secs(10800),
+            crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+            Some("gemini-3-pro-image".into()),
+            false,
+        );
+        tracker.set_lockout_until(
+            "a",
+            std::time::SystemTime::now() + Duration::from_secs(120),
+            crate::proxy::rate_limit::RateLimitReason::RateLimitExceeded,
+            None,
+        );
+        let mut positive = snapshot.clone();
+        positive["quota"]["quota_groups"][0]["buckets"][0]["remaining_fraction"] =
+            serde_json::json!(0.0011);
+        manager.sync_zero_quota_circuit_breaker("a", &positive); // Same old snapshot cannot unlock.
+        manager.sync_zero_quota_circuit_breaker("a", &serde_json::json!({"quota": {"models": []}}));
+        assert!(tracker.get_quota_wait("a", Some("gemini-3-pro-high"), true) > 7000);
+        for (offset, fraction) in [(1, 0.0005), (2, 0.001)] {
+            positive["quota"]["last_updated"] = serde_json::json!(now + offset);
+            positive["quota"]["quota_groups"][0]["buckets"][0]["remaining_fraction"] =
+                serde_json::json!(fraction);
+            manager.sync_zero_quota_circuit_breaker("a", &positive);
+            assert!(tracker.get_quota_wait("a", Some("gemini-3-pro-high"), true) > 7000);
+        }
+        positive["quota"]["last_updated"] = serde_json::json!(now + 3);
+        positive["quota"]["quota_groups"][0]["buckets"][0]["remaining_fraction"] =
+            serde_json::json!(0.0011);
+        manager.sync_zero_quota_circuit_breaker("a", &positive);
+        assert_eq!(
+            tracker.get_quota_wait("a", Some("gemini-3-pro-high"), true),
+            0
+        );
+        assert!(tracker.get_remaining_wait("a", Some("gemini-3-pro-high")) > 1700); // 5h still exhausted.
+        assert!(tracker.get_remaining_wait("a", Some("gemini-3-pro-image")) > 10000);
+        assert!(tracker.is_rate_limited("a", None)); // Independent account-level upstream limit.
+        manager.sync_zero_quota_circuit_breaker("a", &snapshot); // Older zero must not relock.
+        assert_eq!(
+            tracker.get_quota_wait("a", Some("gemini-3-pro-high"), true),
+            0
+        );
+    }
+
+    #[test]
+    fn weekly_quota_missing_data_persists_for_restart_without_renewing_observation() {
+        let now = chrono::Utc::now().timestamp();
+        let mut account: crate::models::Account =
+            serde_json::from_value(weekly_quota_account(now)).unwrap();
+        let mut refresh = account.quota.clone().unwrap();
+        refresh.last_updated += 1;
+        refresh.quota_groups.as_mut().unwrap()[0].buckets.remove(0); // Partial summary / 5h recovery.
+        account.update_quota(refresh);
+        let mut failed = account.quota.clone().unwrap();
+        failed.last_updated += 1;
+        failed.quota_groups = None;
+        account.update_quota(failed);
+        let snapshot = serde_json::to_value(&account).unwrap();
+        let bucket = &snapshot["quota"]["quota_groups"][0]["buckets"][1];
+        assert_eq!(bucket["bucket_id"], "gemini-weekly");
+        assert_eq!(bucket["observed_at"], now * 1000);
+        let restarted = TokenManager::new(PathBuf::new());
+        restarted.sync_zero_quota_circuit_breaker("a", &snapshot);
+        assert!(restarted
+            .rate_limit_tracker
+            .is_rate_limited("a", Some("gemini-3-pro-high")));
+    }
+
+    #[tokio::test]
+    async fn weekly_quota_windows_are_order_independent_and_expired_snapshots_stay_expired() {
+        let now = chrono::Utc::now().timestamp();
+        for reverse in [false, true] {
+            let manager = TokenManager::new(PathBuf::new());
+            manager
+                .circuit_breaker_config
+                .write()
+                .await
+                .lock_on_zero_quota = true;
+            let mut snapshot = weekly_quota_account(now);
+            let buckets = snapshot["quota"]["quota_groups"][0]["buckets"]
+                .as_array_mut()
+                .unwrap();
+            buckets[1]["remaining_fraction"] = serde_json::json!(0);
+            if reverse {
+                buckets.reverse();
+            }
+            manager.sync_zero_quota_circuit_breaker("a", &snapshot);
+            for model in [
+                "gemini-3-pro-high",
+                "gemini-3-flash",
+                "gemini-3.1-flash-image",
+                "gemini-3-pro-image",
+            ] {
+                assert!(
+                    manager
+                        .rate_limit_tracker
+                        .get_remaining_wait("a", Some(model))
+                        > 7000
+                );
+            }
+            let expired = weekly_quota_account(now - 8000);
+            manager.sync_zero_quota_circuit_breaker("expired", &expired);
+            manager.sync_zero_quota_circuit_breaker("expired", &expired);
+            assert!(!manager
+                .rate_limit_tracker
+                .is_rate_limited("expired", Some("gemini-3-pro-high")));
+        }
+    }
 
     #[tokio::test]
     async fn missing_account_directory_is_empty_but_invalid_storage_is_an_error() {
-        let root = std::env::temp_dir().join(format!(
-            "antigravity-token-manager-empty-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let root = crate::modules::account::get_data_dir().unwrap();
         let manager = TokenManager::new(root.clone());
         assert_eq!(manager.load_accounts().await, Ok(0));
 
-        std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("accounts"), b"not a directory").unwrap();
         let result = manager.load_accounts().await;
-        std::fs::remove_dir_all(&root).unwrap();
         assert!(
             result.is_err(),
             "Invalid storage must not become an empty pool"
@@ -4563,6 +4793,7 @@ mod tests {
     ) -> ProxyToken {
         ProxyToken {
             account_id: email.to_string(),
+            priority: crate::models::account::default_priority(),
             access_token: "test_token".to_string(),
             refresh_token: "test_refresh".to_string(),
             expires_in: 3600,
@@ -4626,10 +4857,27 @@ mod tests {
         // ULTRA > PRO > FREE
         let ultra = create_test_token("ultra@test.com", Some("ULTRA"), 1.0, None, Some(50));
         let pro = create_test_token("pro@test.com", Some("PRO"), 1.0, None, Some(50));
+        let premium = create_test_token(
+            "premium@test.com",
+            Some("Google One AI Premium"),
+            1.0,
+            None,
+            Some(50),
+        );
+        let advanced = create_test_token(
+            "advanced@test.com",
+            Some("Gemini Advanced"),
+            1.0,
+            None,
+            Some(50),
+        );
         let free = create_test_token("free@test.com", Some("FREE"), 1.0, None, Some(50));
 
         assert_eq!(compare_tokens(&ultra, &pro), Ordering::Less);
+        assert_eq!(compare_tokens(&ultra, &premium), Ordering::Less);
         assert_eq!(compare_tokens(&pro, &free), Ordering::Less);
+        assert_eq!(compare_tokens(&premium, &free), Ordering::Less);
+        assert_eq!(compare_tokens(&advanced, &free), Ordering::Less);
         assert_eq!(compare_tokens(&ultra, &free), Ordering::Less);
         assert_eq!(compare_tokens(&free, &ultra), Ordering::Greater);
     }
@@ -4894,6 +5142,7 @@ mod tests {
     ) -> ProxyToken {
         ProxyToken {
             account_id: email.to_string(),
+            priority: crate::models::account::default_priority(),
             access_token: "test_token".to_string(),
             refresh_token: "test_refresh".to_string(),
             expires_in: 3600,
@@ -4933,6 +5182,89 @@ mod tests {
             // 由于只有两个候选，应该总是选择 high_quota
             assert_eq!(result.unwrap().email, "high@test.com");
         }
+    }
+
+    #[test]
+    fn account_priority_p2c_stays_in_highest_available_group() {
+        let manager = TokenManager::new(PathBuf::new());
+        let mut high = create_test_token("high", Some("FREE"), 0.5, None, Some(1));
+        high.priority = 1;
+        let low = create_test_token("low", Some("ULTRA"), 1.0, None, Some(100));
+        let mut candidates = vec![low, high]; // Deliberately unsorted.
+        let mut attempted = HashSet::new();
+        for _ in 0..20 {
+            let selected = manager
+                .select_with_p2c(&candidates, &attempted, "claude", true)
+                .unwrap();
+            assert_eq!(selected.account_id, "high");
+        }
+        attempted.insert("high".to_string());
+        let selected = manager
+            .select_with_p2c(&candidates, &attempted, "claude", true)
+            .unwrap();
+        assert_eq!(selected.account_id, "low");
+        attempted.clear();
+        candidates[1].protected_models.insert("claude".to_string());
+        let selected = manager
+            .select_with_p2c(&candidates, &attempted, "claude", true)
+            .unwrap();
+        assert_eq!(selected.account_id, "low");
+    }
+
+    #[tokio::test]
+    async fn account_priority_save_reselects_preserving_sessions_and_limits() {
+        async fn select(manager: &TokenManager, group: &str, session: Option<&str>) -> String {
+            manager
+                .get_token(group, false, session, "claude-sonnet-4-6")
+                .await
+                .unwrap()
+                .3
+        }
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let data_dir = crate::modules::account::get_data_dir().unwrap();
+        let manager = TokenManager::new(data_dir.clone());
+        for (id, priority) in [("high", 1), ("low", 100)] {
+            let mut account = weekly_quota_account(chrono::Utc::now().timestamp());
+            account["id"] = serde_json::json!(id);
+            account["email"] = serde_json::json!(format!("{id}@test.invalid"));
+            account["priority"] = serde_json::json!(priority);
+            let account: crate::models::Account = serde_json::from_value(account).unwrap();
+            crate::modules::account::save_account(&account).unwrap();
+            manager.reload_account(id).await.unwrap();
+        }
+        assert_eq!(select(&manager, "claude", Some("existing")).await, "high");
+        crate::modules::account::update_account_priority("high", 100).unwrap();
+        manager.update_account_priority("high", 100);
+        crate::modules::account::update_account_priority("low", 1).unwrap();
+        manager.update_account_priority("low", 1);
+        assert_eq!(
+            crate::modules::account::load_account("low")
+                .unwrap()
+                .priority,
+            1
+        );
+        assert_eq!(select(&manager, "claude", Some("existing")).await, "high");
+        assert_eq!(select(&manager, "claude", Some("new")).await, "low");
+        manager
+            .set_preferred_account(Some("high".to_string()))
+            .await;
+        assert_eq!(select(&manager, "image_gen", None).await, "high");
+        manager.set_preferred_account(None).await;
+        manager.rate_limit_tracker.set_lockout_until(
+            "low",
+            std::time::SystemTime::now() + Duration::from_secs(60),
+            crate::proxy::rate_limit::RateLimitReason::QuotaExhausted,
+            Some("claude".to_string()),
+        );
+        manager.update_account_priority("low", 2);
+        assert!(manager
+            .rate_limit_tracker
+            .is_rate_limited("low", Some("claude")));
+        assert_eq!(select(&manager, "image_gen", None).await, "high");
+        manager.rate_limit_tracker.clear("low");
+        // A stale/failed disk candidate must not remove the lower-priority fallback.
+        std::fs::write(data_dir.join("accounts/low.json"), "invalid JSON").unwrap();
+        assert_eq!(select(&manager, "image_gen", None).await, "high");
     }
 
     #[test]
@@ -5063,6 +5395,7 @@ mod tests {
                 ULTRA_REQUIRED_MODELS.iter().any(|m| lower.contains(m))
             };
 
+
             // Priority 0: 高端模型时，订阅等级优先
             if requires_ultra {
                 let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref())
@@ -5153,6 +5486,7 @@ mod tests {
                 ULTRA_REQUIRED_MODELS.iter().any(|m| lower.contains(m))
             };
 
+
             if requires_ultra {
                 let tier_cmp = crate::models::quota::tier_priority(a.subscription_tier.as_deref())
                     .cmp(&crate::models::quota::tier_priority(
@@ -5191,6 +5525,7 @@ mod tests {
             };
 
             tokens.sort_by(|a, b| {
+
                 if requires_ultra {
                     let tier_cmp =
                         crate::models::quota::tier_priority(a.subscription_tier.as_deref()).cmp(

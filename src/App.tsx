@@ -13,7 +13,8 @@ import UserToken from './pages/UserToken';
 import ApiGuide from './pages/ApiGuide';
 import Codex from './pages/Codex';
 import DebugConsole from './components/debug/DebugConsole';
-import { useEffect } from 'react';
+import { useEffect, startTransition } from 'react';
+import SuggestionDeleteThinkingModal from './components/common/SuggestionDeleteThinkingModal';
 import { useConfigStore } from './stores/useConfigStore';
 import { useAccountStore } from './stores/useAccountStore';
 import { useTranslation } from 'react-i18next';
@@ -79,16 +80,13 @@ function App() {
     loadConfig();
   }, [loadConfig]);
 
-  // Sync language from config
+  // Sync language from config (仅在不同步时通过 startTransition 非阻塞调度)
   useEffect(() => {
-    if (config?.language) {
-      i18n.changeLanguage(config.language);
-      // Support RTL
-      if (config.language === 'ar') {
-        document.documentElement.dir = 'rtl';
-      } else {
-        document.documentElement.dir = 'ltr';
-      }
+    if (config?.language && i18n.language !== config.language) {
+      startTransition(() => {
+        i18n.changeLanguage(config.language);
+      });
+      document.documentElement.dir = config.language === 'ar' ? 'rtl' : 'ltr';
     }
   }, [config?.language, i18n]);
 
@@ -132,10 +130,12 @@ function App() {
     };
   }, [fetchCurrentAccount, fetchAccounts]);
 
+
   return (
     <AdminAuthGuard>
       <ThemeManager />
       <DebugConsole />
+      <SuggestionDeleteThinkingModal />
       <RouterProvider router={router} />
     </AdminAuthGuard>
   );

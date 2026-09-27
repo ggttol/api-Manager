@@ -5,7 +5,6 @@ use futures::{Stream, StreamExt};
 use rand::Rng;
 use serde_json::{json, Value};
 use std::pin::Pin;
-use tracing::debug;
 use uuid::Uuid;
 
 /// 保存 thoughtSignature 到会话缓存
@@ -37,78 +36,47 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
 /// - New format: total_output_tokens = text + tool output only; thought tokens are separate (total_thought_tokens)
 /// For Codex, we must sum them back together as `completion_tokens`.
 fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
-    use super::models::{CompletionTokensDetails, OpenAIUsage, PromptTokensDetails};
-
-    // 优先使用新格式字段，fallback 到旧格式
-    let prompt_tokens = u
-        .get("total_input_tokens")
-        .or_else(|| u.get("promptTokenCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let raw_output_tokens = u
-        .get("total_output_tokens")
-        .or_else(|| u.get("candidatesTokenCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let raw_total_tokens = u
-        .get("total_tokens")
-        .or_else(|| u.get("totalTokenCount"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let cached_tokens = u
-        .get("total_cached_tokens")
-        .or_else(|| u.get("cachedContentTokenCount"))
-        .or_else(|| u.get("cachedTokens"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let reasoning_tokens = u
-        .get("total_thought_tokens")
-        .or_else(|| u.get("totalThoughtTokens"))
-        .or_else(|| u.get("thoughtsTokenCount"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let tool_use_tokens = u
+    let canonical = crate::proxy::pipeline::CanonicalUsage::from_gemini(u);
+    let mut usage = super::models::OpenAIUsage::from(&canonical);
+    usage.input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
+    usage.total_tool_use_tokens = u
         .get("total_tool_use_tokens")
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
-    let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
-
-    // 新格式下 output_tokens 不含 thought/tool-use, 需要加回来。旧格式 candidatesTokenCount 已经包含它们
-    let has_new_format = u.get("total_output_tokens").is_some();
-    let completion_tokens = if has_new_format {
-        raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
-    } else {
-        raw_output_tokens
-    };
-
-    // cached_tokens is a subset of prompt_tokens. Keep prompt_tokens in the same
-    // raw-input-token unit as Gemini usageMetadata so downstream logs can reconcile it.
-    let final_total_tokens = raw_total_tokens.unwrap_or(prompt_tokens + completion_tokens);
-
-    Some(OpenAIUsage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: final_total_tokens,
-        prompt_tokens_details: cached_tokens.map(|ct| PromptTokensDetails {
-            cached_tokens: Some(ct),
-        }),
-        completion_tokens_details: reasoning_tokens.map(|rt| CompletionTokensDetails {
-            reasoning_tokens: Some(rt),
-        }),
-        input_tokens_by_modality,
-        raw_output_tokens: Some(raw_output_tokens),
-        total_thought_tokens: reasoning_tokens,
-        total_tool_use_tokens: tool_use_tokens,
-        gemini_total_tokens: raw_total_tokens,
-    })
+    Some(usage)
 }
 
 pub fn create_openai_sse_stream<S, E>(
+    gemini_stream: Pin<Box<S>>,
+    model: String,
+    session_id: String,
+    message_count: usize,
+    client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    create_openai_sse_stream_with_anchor(
+        gemini_stream,
+        model,
+        session_id,
+        message_count,
+        client_tool_names,
+        include_usage,
+        None,
+    )
+}
+
+pub fn create_openai_sse_stream_with_anchor<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     model: String,
     session_id: String,
     message_count: usize,
     client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
+    causal_anchor: Option<String>,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -128,6 +96,12 @@ where
         let mut terminal_candidates = std::collections::HashSet::new();
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut error_occurred = false;
+        let mut tool_call_index = 0;
+        let mut thinking_acc = if let Some(ref a) = causal_anchor {
+            crate::proxy::thinking_store::TurnAccumulator::with_anchor(a)
+        } else {
+            crate::proxy::thinking_store::TurnAccumulator::new()
+        };
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -177,14 +151,17 @@ where
 
                                                     if let Some(parts_list) = parts {
                                                         for part in parts_list {
+                                                            thinking_acc.ingest_part(part);
                                                             let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                                let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
                                                                 if is_thought_part {
                                                                     // thought 内容只写入 thought_out（给支持 reasoning_content 的客户端），防止客户端重复显示思维过程
+                                                                    let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
                                                                     thought_out.push_str(&clean_text);
+                                                                } else {
+                                                                    // 真实正文内容（非思考块）保留原始文本，避免技术讨论或代码反引号中的 `<think>` 标签被粗暴抹除为空
+                                                                    content_out.push_str(text);
                                                                 }
-                                                                else { content_out.push_str(&clean_text); }
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
                                                                 store_thought_signature(sig, &session_id, message_count);
@@ -202,16 +179,25 @@ where
                                                                 if candidate_calls.insert(call_key) {
                                                                     let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                                     let args = func_call.get("args").unwrap_or(&json!({})).clone();
-
-
-                                                                    let final_name = super::response::resolve_shell_tool_name(name, &client_tool_names);
+                                                                    let final_name = name;
 
                                                                     let call_id = func_call
                                                                         .get("id")
-                                                                        .and_then(Value::as_str)
-                                                                        .filter(|id| !id.is_empty())
-                                                                        .map(str::to_owned)
-                                                                        .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                                                                        .and_then(|v| v.as_str())
+                                                                        .map(|s| s.to_string())
+                                                                        .unwrap_or_else(|| {
+                                                                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                                            use std::hash::{Hash, Hasher};
+                                                                            serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
+                                                                            tool_call_index.hash(&mut hasher);
+                                                                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().hash(&mut hasher);
+                                                                            format!("call_{:x}", hasher.finish())
+                                                                        });
+
+                                                                    if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
+                                                                        crate::proxy::SignatureCache::global().cache_tool_signature(&call_id, sig.to_string());
+                                                                    }
+                                                                    thinking_acc.record_tool_id(name, &call_id);
 
                                                                     let args_str = serde_json::to_string(&args).unwrap_or_default();
                                                                     let tool_call_index = tool_call_indices.entry(candidate_index).or_insert(0);
@@ -269,12 +255,15 @@ where
                                                         if !grounding_text.is_empty() { content_out.push_str(&grounding_text); }
                                                     }
 
-                                                    let gemini_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str()).map(|f| match f {
+                                                    let raw_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str());
+
+                                                    let gemini_finish_reason = raw_finish_reason.map(|f| match f {
                                                         "STOP" => "stop",
                                                         "MAX_TOKENS" => "length",
                                                         "SAFETY" => "content_filter",
                                                         "RECITATION" => "content_filter",
-                                                        _ => f,
+                                                        "MALFORMED_FUNCTION_CALL" => "stop",
+                                                        _ => "stop",
                                                     });
 
                                                     let has_candidate_tool_calls = emitted_tool_calls
@@ -305,6 +294,11 @@ where
                                                     }
 
                                                     if !content_out.is_empty() || finish_reason.is_some() {
+                                                        let delta = if !content_out.is_empty() {
+                                                            json!({ "content": content_out })
+                                                        } else {
+                                                            json!({})
+                                                        };
                                                         let openai_chunk = json!({
                                                             "id": &stream_id,
                                                             "object": "chat.completion.chunk",
@@ -312,7 +306,7 @@ where
                                                             "model": &model,
                                                             "choices": [{
                                                                 "index": candidate_index,
-                                                                "delta": { "content": content_out },
+                                                                "delta": delta,
                                                                 "finish_reason": finish_reason
                                                             }]
                                                         });
@@ -364,19 +358,39 @@ where
             }
         }
 
+        thinking_acc.commit(&session_id);
         if !error_occurred {
             if !seen_candidates.is_empty() && seen_candidates != terminal_candidates {
                 let error_chunk = json!({
-                    "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts, "model": &model, "choices": [],
-                    "error": { "type": "server_error", "message": "Upstream stream ended before every candidate finished", "code": "incomplete_stream" }
+                    "id": &stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": &model,
+                    "choices": [],
+                    "error": {
+                        "type": "server_error",
+                        "message": "Upstream stream ended before every candidate finished",
+                        "code": "incomplete_stream"
+                    }
                 });
-                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_chunk).unwrap_or_default())));
-            } else if let Some(usage) = final_usage {
-                let usage_chunk = json!({
-                    "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts,
-                    "model": &model, "choices": [], "usage": usage
-                });
-                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default())));
+                yield Ok::<Bytes, String>(Bytes::from(format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&error_chunk).unwrap_or_default()
+                )));
+            }
+            // Usage is emitted as its own terminal chunk only when requested.
+            if include_usage {
+                if let Some(usage) = final_usage.take() {
+                    let usage_chunk = json!({
+                        "id": &stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": &model,
+                        "choices": [],
+                        "usage": usage
+                    });
+                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&usage_chunk).unwrap_or_default())));
+                }
             }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
@@ -411,6 +425,7 @@ where
         let mut error_occurred = false;
         let mut seen_candidates = std::collections::HashSet::new();
         let mut terminal_candidates = std::collections::HashSet::new();
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -453,10 +468,14 @@ where
                                                     let mut content_out = String::new();
                                                     if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                         for part in parts {
-                                                            let is_thought = part.get("thought").and_then(Value::as_bool).unwrap_or(false);
-                                                            if !is_thought {
-                                                                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                                                    content_out.push_str(&text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", ""));
+                                                            thinking_acc.ingest_part(part);
+                                                            let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                                if is_thought {
+                                                                    let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
+                                                                    content_out.push_str(&clean_text);
+                                                                } else {
+                                                                    content_out.push_str(text);
                                                                 }
                                                             }
                                                             if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(Value::as_str) {
@@ -483,6 +502,7 @@ where
                                                 }
                                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&legacy_chunk).unwrap_or_default())));
                                             }
+
                                         }
                                     }
                                 }
@@ -507,6 +527,7 @@ where
                 _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
             }
         }
+        thinking_acc.commit(&session_id);
         if !error_occurred {
             if !seen_candidates.is_empty() && seen_candidates != terminal_candidates {
                 let error_chunk = json!({
@@ -534,38 +555,6 @@ fn split_namespace_tool_name(qualified_name: &str) -> (String, Option<String>) {
         }
     }
     (name.to_string(), None)
-}
-
-fn extract_apply_patch_input(args: &Value) -> String {
-    if let Some(obj) = args.as_object() {
-        if let Some(input) = obj.get("input").and_then(|v| v.as_str()) {
-            return input.to_string();
-        }
-        if let Some(arr) = obj.get("command").and_then(|v| v.as_array()) {
-            if arr.len() > 1 {
-                if let Some(patch) = arr[1].as_str() {
-                    return patch.to_string();
-                }
-            }
-        }
-        if let Some(cmd_str) = obj.get("command").and_then(|v| v.as_str()) {
-            if let Some(patch) = cmd_str.strip_prefix("apply_patch\n") {
-                return patch.to_string();
-            }
-            if let Some(patch) = cmd_str.strip_prefix("apply_patch ") {
-                return patch.to_string();
-            }
-            return cmd_str.to_string();
-        }
-        for key in ["patch_text", "patch", "diff", "content"] {
-            if let Some(patch) = obj.get(key).and_then(|v| v.as_str()) {
-                return patch.to_string();
-            }
-        }
-    }
-    args.as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default())
 }
 
 fn inject_seq(mut event: Value, seq: &mut u64) -> Value {
@@ -638,6 +627,7 @@ where
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
         let mut accumulated_thinking = String::new();
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
         let mut has_seen_tool_calls = false;
         let mut has_actionable_output = false;
         let mut final_finish_reason: Option<String> = None;
@@ -697,6 +687,7 @@ where
                                                 }
                                                 if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                     for part in parts {
+                                                        thinking_acc.ingest_part(part);
                                                         let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
 
                                                         // Close the reasoning summary before opening normal text
@@ -749,7 +740,11 @@ where
                                                         }
 
                                                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                            let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
+                                                            let clean_text = if is_thought {
+                                                                text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "")
+                                                            } else {
+                                                                text.to_string()
+                                                            };
                                                             if !clean_text.is_empty() {
                                                                 if is_thought && message_item_emitted {
                                                                     // Once ordinary assistant text has started, it is the
@@ -855,37 +850,34 @@ where
                                                                 let name = func_call.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                                                                 let mut args = func_call.get("args").unwrap_or(&json!({})).clone();
 
+                                                                // [FIX #1575 & #3430] 标准化并清洗 shell / PowerShell 等工具参数名称与必填字段
+                                                                super::response::normalize_and_sanitize_tool_args(name, &mut args);
 
                                                                 let args_str = serde_json::to_string(&args).unwrap_or_default();
 
-                                                                let call_id = format!("call_{}", Uuid::new_v4());
+                                                                let call_id = func_call
+                                                                    .get("id")
+                                                                    .and_then(|v| v.as_str())
+                                                                    .map(|s| s.to_string())
+                                                                    .unwrap_or_else(|| {
+                                                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                                        use std::hash::{Hash, Hasher};
+                                                                        call_key.hash(&mut hasher);
+                                                                        sequence_number.hash(&mut hasher);
+                                                                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().hash(&mut hasher);
+                                                                        format!("call_{:x}", hasher.finish())
+                                                                    });
+
+                                                                if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
+                                                                    crate::proxy::SignatureCache::global().cache_tool_signature(&call_id, sig.to_string());
+                                                                }
+                                                                thinking_acc.record_tool_id(name, &call_id);
 
                                                                 let (actual_name, namespace) = split_namespace_tool_name(name);
                                                                 let tool_item_id = format!("item-{}", &Uuid::new_v4().to_string()[..16]);
                                                                 let is_custom_tool = custom_tool_names.contains(&actual_name);
 
-                                                                let mut final_args_str = args_str.clone();
-                                                                let mut apply_patch_repairs_value: Option<Value> = None;
-                                                                let mut apply_patch_validation: Option<(usize, String)> = None;
-                                                                if is_custom_tool && (actual_name == "apply_patch" || actual_name == "apply_patch_v2") {
-                                                                    let extracted_patch = extract_apply_patch_input(&args);
-                                                                    let (optimized_patch, repairs) =
-                                                                        crate::proxy::adapters::apply_patch_preflight::optimize_patch(
-                                                                            &extracted_patch,
-                                                                            None,
-                                                                            true,
-                                                                        );
-                                                                    if !repairs.is_empty() {
-                                                                        apply_patch_repairs_value = Some(
-                                                                            crate::proxy::adapters::apply_patch_preflight::repairs_to_value(&repairs),
-                                                                        );
-                                                                    }
-                                                                    final_args_str = optimized_patch;
-                                                                    apply_patch_validation =
-                                                                        crate::proxy::adapters::apply_patch_preflight::validate_v4a_for_codex(
-                                                                            &final_args_str,
-                                                                        );
-                                                                }
+                                                                let final_args_str = args_str.clone();
 
                                                                 let mut item_obj = json!({
                                                                     "id": &tool_item_id,
@@ -905,31 +897,6 @@ where
 
                                                                 let tool_output_index = next_output_index;
                                                                 next_output_index += 1;
-
-                                                                if let Some((line, message)) = apply_patch_validation.as_ref() {
-                                                                    crate::proxy::adapters::apply_patch_trace::emit(
-                                                                        &crate::proxy::adapters::apply_patch_trace::ApplyPatchTrace {
-                                                                            source: "gemini_native",
-                                                                            model: &model,
-                                                                            call_id: &call_id,
-                                                                            fc_id: &tool_item_id,
-                                                                            args_raw: &args_str,
-                                                                            input: &final_args_str,
-                                                                            interrupted: false,
-                                                                            json_truncation: None,
-                                                                            v4a_truncation: None,
-                                                                            v4a_validation: Some((*line, message.as_str())),
-                                                                            decision: "incomplete",
-                                                                            repairs: apply_patch_repairs_value.as_ref(),
-                                                                        },
-                                                                    );
-                                                                    if accumulated_text.is_empty() {
-                                                                        accumulated_text = format!(
-                                                                            "apply_patch 格式非法，已停止执行以避免重复失败。第 {line} 行：{message}"
-                                                                        );
-                                                                    }
-                                                                    continue;
-                                                                }
 
                                                                 has_seen_tool_calls = true;
 
@@ -985,24 +952,6 @@ where
                                                                 let tc_val = item_obj.clone();
                                                                 if cache_tool_calls {
                                                                     crate::proxy::handlers::openai::insert_cached_tool_call(call_id.clone(), tc_val.clone());
-                                                                }
-                                                                if is_custom_tool && (actual_name == "apply_patch" || actual_name == "apply_patch_v2") {
-                                                                    crate::proxy::adapters::apply_patch_trace::emit(
-                                                                        &crate::proxy::adapters::apply_patch_trace::ApplyPatchTrace {
-                                                                            source: "gemini_native",
-                                                                            model: &model,
-                                                                            call_id: &call_id,
-                                                                            fc_id: &tool_item_id,
-                                                                            args_raw: &args_str,
-                                                                            input: &final_args_str,
-                                                                            interrupted: false,
-                                                                            json_truncation: None,
-                                                                            v4a_truncation: None,
-                                                                            v4a_validation: None,
-                                                                            decision: "completed",
-                                                                            repairs: apply_patch_repairs_value.as_ref(),
-                                                                        },
-                                                                    );
                                                                 }
                                                                 final_outputs_map.insert(tool_output_index, tc_val);
                                                             }
@@ -1253,6 +1202,11 @@ where
                     return;
                 }
             }
+        }
+
+        thinking_acc.clone().commit(&session_id);
+        if session_id != response_id {
+            thinking_acc.commit(&response_id);
         }
 
         let mut completed_ev = json!({
@@ -1802,6 +1756,7 @@ mod tests {
             "test-session".to_string(),
             0,
             None,
+            true,
         );
 
         let mut chunks = Vec::new();
@@ -1848,6 +1803,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_openai_streaming_with_include_usage_true() {
+        let chunk1_json = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Hello" }]
+                }
+            }]
+        });
+
+        let chunk2_json = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{ "text": " world" }]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+        ];
+
+        let gemini_stream = Box::pin(stream::iter(items));
+
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-1.5-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            None,
+            true, // include_usage = true
+        );
+
+        let mut chunks = Vec::new();
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        chunks.push(line.to_string());
+                    }
+                }
+            }
+        }
+
+        // With include_usage: true, the last chunk before [DONE] MUST have choices: [] and usage
+        assert!(
+            chunks.len() >= 3,
+            "Expected at least 3 chunks: partial, finish, usage"
+        );
+        let last_chunk: Value =
+            serde_json::from_str(chunks.last().unwrap().trim_start_matches("data: ").trim())
+                .unwrap();
+        assert_eq!(last_chunk["choices"], json!([]));
+        assert!(
+            last_chunk.get("usage").is_some(),
+            "Standalone usage chunk must contain usage"
+        );
+        let usage = &last_chunk["usage"];
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["completion_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 15);
+    }
+
+    #[tokio::test]
+    async fn test_hermes_stream_without_include_usage_never_emits_empty_choices() {
+        // Simulates real Gemini streaming where finishReason arrives in chunk 1,
+        // and usageMetadata arrives in chunk 2 without candidates.
+        let chunk1_json = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{ "text": "Task complete." }]
+                }
+            }]
+        });
+
+        let chunk2_json = json!({
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 28
+            }
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+        ];
+
+        let gemini_stream = Box::pin(stream::iter(items));
+
+        // Hermes / standard OpenAI Python SDK default: include_usage = false
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-1.5-flash".to_string(),
+            "hermes-session".to_string(),
+            0,
+            None,
+            false,
+        );
+
+        let mut chunks = Vec::new();
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        chunks.push(line.to_string());
+                    }
+                }
+            }
+        }
+
+        // CRITICAL: Ensure NO chunk has empty choices: []!
+        // Hermes iterates `chunk.choices[0]`. An empty choices: [] chunk crashes Hermes with IndexError!
+        for chunk_str in &chunks {
+            let json_str = chunk_str.trim_start_matches("data: ").trim();
+            let json: Value = serde_json::from_str(json_str).unwrap();
+            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                assert!(
+                    !choices.is_empty(),
+                    "Crash hazard! Found empty choices: [] chunk when include_usage=false: {}",
+                    json_str
+                );
+                // Verify choices[0] can be accessed without panic
+                assert!(choices.get(0).is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_openai_streaming_reasoning_content() {
         // Chunk with thought part
         let chunk_json = json!({
@@ -1872,6 +1965,7 @@ mod tests {
             "test-session".to_string(),
             0,
             None,
+            false,
         );
 
         let mut chunks = Vec::new();
@@ -1918,5 +2012,73 @@ mod tests {
 
         assert!(has_reasoning, "Should stream reasoning_content");
         assert!(has_content, "Should stream content");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_malformed_function_call_never_injects_hardcoded_online_prompt() {
+        let chunk_json = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "Reasoning about weather...", "thought": true }
+                    ]
+                },
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from(format!("data: {}\n\n", chunk_json)))];
+
+        let gemini_stream = Box::pin(stream::iter(items));
+
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-3.7-flash".to_string(),
+            "test-malformed-session".to_string(),
+            0,
+            None,
+            false,
+        );
+
+        let mut all_content = String::new();
+        let mut final_finish_reason: Option<String> = None;
+
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        let json_str = line.trim_start_matches("data: ").trim();
+                        if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                if let Some(choice) = choices.first() {
+                                    if let Some(delta) = choice.get("delta") {
+                                        if let Some(c) =
+                                            delta.get("content").and_then(|c| c.as_str())
+                                        {
+                                            all_content.push_str(c);
+                                        }
+                                    }
+                                    if let Some(fr) =
+                                        choice.get("finish_reason").and_then(|f| f.as_str())
+                                    {
+                                        final_finish_reason = Some(fr.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 验证绝对不会被注入任何臆测性的天气/联网假文本
+        assert!(
+            all_content.is_empty(),
+            "Expected empty content, got: {}",
+            all_content
+        );
+        assert_eq!(final_finish_reason, Some("stop".to_string()));
     }
 }

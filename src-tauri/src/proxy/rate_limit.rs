@@ -121,6 +121,15 @@ pub(crate) fn is_active_persisted_long_limit(
         })
 }
 
+pub(crate) fn is_active_persisted_long_image_limit(
+    model_key: &str,
+    status: &crate::models::account::LiveLimitStatus,
+    now: i64,
+) -> bool {
+    normalize_image_model_id(model_key).is_some()
+        && is_active_persisted_long_limit(model_key, status, now)
+}
+
 /// 限流信息
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -153,6 +162,7 @@ struct QuotaBucketLimit {
 const FAILURE_COUNT_EXPIRY_SECONDS: u64 = 3600;
 
 /// 限流跟踪器
+
 pub struct RateLimitTracker {
     limits: DashMap<String, RateLimitInfo>,
     quota_limits: DashMap<(String, String), QuotaBucketLimit>,
@@ -194,7 +204,12 @@ impl RateLimitTracker {
         };
         consider(account_id.to_string());
         if let Some(model) = model {
+            // Canonical key keeps quota-family locks (e.g. all Claude variants share
+            // the `claude` protection group) while the exact key isolates transient
+            // HTTP 429s to the single model that actually failed.
             consider(self.get_limit_key(account_id, Some(model)));
+            let exact_model_key = format!("{}:{}", account_id, model);
+            consider(exact_model_key);
         }
         if longest.is_zero() {
             0
@@ -244,6 +259,7 @@ impl RateLimitTracker {
             self.get_limit_key(account_id, Some(model)),
             bucket_id.to_string(),
         );
+
         self.quota_limits
             .entry(key)
             .and_modify(|current| {
@@ -261,6 +277,7 @@ impl RateLimitTracker {
                 weekly,
             });
     }
+
     /// 标记账号请求成功，重置连续失败计数
     ///
     /// 当账号成功完成请求后调用此方法，将其失败计数归零，
@@ -315,6 +332,20 @@ impl RateLimitTracker {
         };
 
         let key = self.get_limit_key(account_id, model.as_deref());
+
+        // [防倒退保护] 若已有更长、未过期的锁定时间，防止被后续较短的重置时间覆盖（如周配额 5 天不被 5H 窗口覆盖）
+        if let Some(existing) = self.limits.get(&key) {
+            if existing.reset_time > now && existing.reset_time > effective_reset_time {
+                tracing::info!(
+                    "Retaining existing longer lockout for {} (existing: {}s > new: {}s)",
+                    key,
+                    existing.retry_after_sec,
+                    retry_sec
+                );
+                return;
+            }
+        }
+
         self.limits.insert(key, info);
 
         if let Some(m) = &model {
@@ -379,6 +410,19 @@ impl RateLimitTracker {
         let key = self.get_limit_key(account_id, Some(&normalized_model));
         self.limits.insert(key, info);
         true
+    }
+
+    pub fn restore_persisted_long_image_limit(
+        &self,
+        account_id: &str,
+        reset_time: SystemTime,
+        detected_at: SystemTime,
+        model: &str,
+    ) -> bool {
+        if normalize_image_model_id(model).is_none() {
+            return false;
+        }
+        self.restore_persisted_long_limit(account_id, reset_time, detected_at, model)
     }
 
     pub fn set_lockout_until_iso_with_cap(
@@ -480,8 +524,20 @@ impl RateLimitTracker {
         backoff_steps: &[u64],
         parser_mode: RetryParserMode,
     ) -> Option<RateLimitInfo> {
-        // 支持 429 (限流) 以及 500/503/529 (后端故障软避让)
-        if status != 429 && status != 500 && status != 503 && status != 529 && status != 404 {
+        // 关键防御：网关内部自产生的排队/无可用账号错误，绝对禁止解析为上游限流，杜绝自噬死循环
+        let lower_body = body.to_lowercase();
+        if lower_body.contains("all accounts limited")
+            || lower_body.contains("no accounts available")
+            || lower_body.contains("all accounts failed")
+            || lower_body.contains("token pool is empty")
+            || lower_body.contains("all accounts exhausted")
+            || lower_body.contains("all accounts unhealthy")
+        {
+            return None;
+        }
+
+        // 仅对真正的上游限流 429 和过载 529 进行账号冷却跟踪；500/503 属于服务瞬时不可用，绝不打入冷却池！
+        if status != 429 && status != 529 {
             return None;
         }
 
@@ -611,7 +667,7 @@ impl RateLimitTracker {
                         lockout
                     }
                     RateLimitReason::ServerError => {
-                        let lockout = if status == 404 { 5 } else { 8 };
+                        let lockout = 8;
                         tracing::warn!("检测到 {} 错误, 执行 {}s 软避让...", status, lockout);
                         lockout
                     }
@@ -648,9 +704,13 @@ impl RateLimitTracker {
             model: model.clone(),
         };
 
-        let use_model_key = matches!(reason, RateLimitReason::QuotaExhausted) && model.is_some();
+        let use_model_key = status == 429 && model.as_deref().is_some_and(|m| !m.is_empty());
         let key = if use_model_key {
-            self.get_limit_key(account_id, model.as_deref())
+            if reason == RateLimitReason::QuotaExhausted {
+                self.get_limit_key(account_id, model.as_deref())
+            } else {
+                format!("{}:{}", account_id, model.as_deref().unwrap_or_default())
+            }
         } else {
             account_id.to_string()
         };
@@ -667,6 +727,7 @@ impl RateLimitTracker {
 
         Some(info)
     }
+
 
     /// 从错误消息 body 中解析重置时间
     fn parse_retry_time_from_body(&self, body: &str) -> Option<u64> {
@@ -774,6 +835,36 @@ impl RateLimitTracker {
         cleared
     }
 
+    /// 安全释放因配额耗尽产生的持续锁定：
+    /// - 仅清除 reason 为 QuotaExhausted 的记录，严禁误触 429 速率限制 (RateLimitExceeded)、服务器错误等独立限流；
+    /// - 针对直接或标准 ID 均做精确比对；
+    pub fn reconcile_quota_recovery(&self, account_id: &str, model: &str) -> bool {
+        let normalized = crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+            .unwrap_or_else(|| model.to_string());
+
+        let keys = if normalized != model {
+            vec![
+                self.get_limit_key(account_id, Some(&normalized)),
+                self.get_limit_key(account_id, Some(model)),
+            ]
+        } else {
+            vec![self.get_limit_key(account_id, Some(model))]
+        };
+
+        let mut cleared = false;
+        for key in keys {
+            if let Some(entry) = self.limits.get(&key) {
+                if entry.reason == RateLimitReason::QuotaExhausted {
+                    drop(entry);
+                    if self.limits.remove(&key).is_some() {
+                        cleared = true;
+                    }
+                }
+            }
+        }
+        cleared
+    }
+
     /// 检查账号是否仍在限流中
     /// 检查账号是否仍在限流中 (支持模型级)
     pub fn is_rate_limited(&self, account_id: &str, model: Option<&str>) -> bool {
@@ -813,6 +904,13 @@ impl RateLimitTracker {
         }
 
         count
+    }
+
+    /// 只清除账号本身的全局限流（不清除具体的模型级配额耗尽锁定）
+    pub fn clear_account_only(&self, account_id: &str) -> bool {
+        let cleared = self.limits.remove(account_id).is_some();
+        self.failure_counts.remove(account_id);
+        cleared
     }
 
     /// 清除指定账号的限流记录

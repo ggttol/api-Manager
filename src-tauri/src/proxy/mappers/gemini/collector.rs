@@ -119,9 +119,6 @@ where
         }
     }
 
-    if !saw_blocked_prompt && candidates.is_empty() {
-        return Err("Gemini upstream stream ended before a terminal response frame".to_string());
-    }
     if candidates
         .keys()
         .any(|index| !completed_candidates.contains(index))
@@ -140,6 +137,36 @@ where
     }
 
     Ok(Value::Object(response))
+}
+
+/// Collect a response and attach its parts to the causal thinking-store turn.
+pub async fn collect_stream_to_json_with_anchor<S, E>(
+    stream: S,
+    session_id: &str,
+    anchor: Option<&str>,
+) -> Result<Value, String>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let response = collect_stream_to_json(stream, session_id).await?;
+    let anchor = anchor.unwrap_or("root");
+    if let Some(candidates) = response.get("candidates").and_then(Value::as_array) {
+        for candidate in candidates {
+            if let Some(parts) = candidate
+                .get("content")
+                .and_then(|content| content.get("parts"))
+                .and_then(Value::as_array)
+            {
+                crate::proxy::thinking_store::capture_gemini_parts_with_anchor(
+                    session_id,
+                    parts,
+                    anchor,
+                );
+            }
+        }
+    }
+    Ok(response)
 }
 
 fn merge_candidate_metadata(collected: &mut Value, frame: &Value) {
