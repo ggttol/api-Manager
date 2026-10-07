@@ -13,7 +13,7 @@ pub(super) const USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/dev
 pub(super) const POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 pub(super) const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub(super) const MODELS_URL: &str =
-    "https://chatgpt.com/backend-api/codex/models?client_version=0.154.0";
+    "https://chatgpt.com/backend-api/codex/models?client_version=0.160.1";
 pub(super) const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub(super) const JSON_LIMIT: usize = 8 * 1024 * 1024;
 const VERIFY_ATTEMPTS: usize = 2;
@@ -226,7 +226,7 @@ pub(super) fn authorized(
         .bearer_auth(&tokens.access_token)
         .header("ChatGPT-Account-Id", &tokens.account_id)
         .header("originator", "codex_cli_rs")
-        .header("User-Agent", "codex_cli_rs/0.154.0 (API Manager gateway)")
+        .header("User-Agent", "codex_cli_rs/0.160.1 (API Manager gateway)")
 }
 
 pub(super) async fn refresh(client: &Client, old: &Tokens) -> Result<Tokens, CodexError> {

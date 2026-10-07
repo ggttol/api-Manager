@@ -2,6 +2,12 @@
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
+## Codex model catalog version compatibility fix (2026-10-06)
+
+Updated both the Codex upstream catalog `client_version` and request `User-Agent` to official client `0.160.1`. Upstream returns an older catalog for `0.154.0`, so refreshing could omit newer models already authorized for an account. Both existing accounts now return `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-6-luna`, without a local model allowlist or account configuration changes.
+
+The isolated server instance and production service returned matching admin/proxy catalogs with 10 models. Enabled state, preferred account, and the encryption key were preserved; the previous release remains available for rollback. Verification covered model catalogs, not per-model generation requests.
+
 ## API Manager upstream v4.8.3 merge (2026-09-27)
 
 Merged upstream main through v4.8.3 while retaining isolated Codex subscription accounts, Responses/Anthropic compatibility endpoints, persisted session affinity, separate admin/API credentials, and the fork's responsive console. Integrated account-pool priority, weekly statistics aligned to official reset times, Daily-first endpoints, and improved tool/signature handling. Upstream in-app updates and promotional entry points remain disabled.
